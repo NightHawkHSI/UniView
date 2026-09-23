@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "about": "Community compatibility list for UniView. Key = the game's install folder name (e.g. steamapps/common/<this>). status: works | partial | broken. Add or update a game with a pull request, or right-click a game in UniView -> 'Report compatibility...' to open an issue.",
+  "games": {
+    "Robocraft": {
+      "status": "works",
+      "notes": "Models, textures and sprites all load, and most models find their texture automatically. Textures keep mask data in alpha, so leave 'Texture alpha' off.",
+      "uniview": "1.0.0"
+    },
+    "Muck": {
+      "status": "works",
+      "notes": "Everything loads. A few meshes are only lines/points; those are skipped.",
+      "uniview": "1.0.0"
+    }
+  }
+}

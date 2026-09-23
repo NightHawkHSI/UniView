@@ -13,6 +13,8 @@ projects.json
 viewer.log
 viewer.log.*
 crash.log
+settings.json
+compat_cache.json
 
 # Personal notes
 Bugs.txt

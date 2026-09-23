@@ -29,7 +29,7 @@ UNITYPY_PACKAGES = [
 # Files that make up the project (what goes in the GitHub folder).
 SOURCE_FILES = [
     "unity_viewer.py", "requirements.txt", "run.bat", "build.bat", "build.py",
-    "Icon.png", "README.md", ".gitignore", "ScreenShots",
+    "Icon.png", "README.md", ".gitignore", "ScreenShots", "compat.json",
 ]
 
 
@@ -105,6 +105,9 @@ def build_release(version, test_game=None):
     if os.path.isfile(icon_png):
         make_ico(icon_png, ico)
         icon_args = ["--icon", ico, "--add-data", f"{icon_png}{os.pathsep}."]
+    compat = os.path.join(ROOT, "compat.json")
+    if os.path.isfile(compat):
+        icon_args += ["--add-data", f"{compat}{os.pathsep}."]
     else:
         print("  Icon.png not found - building without an icon")
 

@@ -19,7 +19,7 @@
 
 Unzip it and run `UniView.exe`. You don't need Python.
 
-[Download](#download) · [Screenshots](#screenshots) · [Features](#features) · [How to use](#how-to-use) · [Run from source](#run-from-source) · [Build](#build) · [FAQ](#faq)
+[Download](#download) · [Screenshots](#screenshots) · [Features](#features) · [How to use](#how-to-use) · [Compatibility](#game-compatibility-list) · [Build](#build) · [FAQ](#faq)
 
 <img src="ScreenShots/UAV%20Main.png" alt="UniView projects page" width="850">
 
@@ -33,7 +33,7 @@ Unzip it and run `UniView.exe`. You don't need Python.
 |---|---|
 | **What it opens** | Any Unity game folder: `.assets`, `level` files, AssetBundles, `.resS` streams |
 | **What it shows** | Meshes (3D), Texture2D, Sprites, TextAssets |
-| **What it exports** | Models as `.obj` + `.mtl` + `.png` (open textured in Blender), textures as `.png`, text as `.txt` |
+| **What it exports** | Models as `.obj` + `.mtl` + `.png` or a single `.glb` (both open textured in Blender), textures as `.png`, text as `.txt` |
 | **Game files** | Read only. UniView never changes anything |
 | **Tested with** | Robocraft, Muck, Valheim, Trailmakers and other Unity games on Steam |
 | **Built with** | [UnityPy](https://github.com/K0lb3/UnityPy) · [PySide6](https://doc.qt.io/qtforpython-6/) · [PyVista](https://pyvista.org/) |
@@ -58,14 +58,30 @@ Unzip it and run `UniView.exe`. You don't need Python.
 
 ## Features
 
-- **Projects page**: a box for each game. **Green** means its assets are already loaded (it opens instantly); **red** means they aren't loaded yet. Each box shows how many Unity files and assets the game has.
-- **Find Unity games in Steam**: scans all your Steam libraries and lets you add games with one click.
-- **Model viewer**: rotate, and zoom with the mouse wheel or +/−. Wireframe, edges, vertex colors and texture alpha can each be toggled on and off. The model's texture is found automatically.
-- **Model panel**: shows vertex/triangle counts, the source file, the prefab path, what uses the model, and its materials and textures. Click a texture to put it on the model.
+**Finding things**
+- **Search with filters**: type a name, or add filters like `tris>1000`, `size>1mb`, `w>=512` or `type:mesh`. Combine them, e.g. `gun tris>2000 size<5mb`.
+- **Sortable columns**: click Name, Info (triangles or pixel size) or Size to sort. Every asset is measured in the background.
+- **Favorites**: press Ctrl+D (or right-click) to star the good stuff, then pick **★ Favorites** in the type box to see only those. Favorites are saved per game.
+- **Grid view**: big thumbnails you can flip through with the arrow keys (View → Grid, or Ctrl+2).
+- **Jump between related assets**: double-click a model's texture to jump to it. A texture lists every model that uses it (click one to jump back), and a sprite links to its sprite sheet.
+
+**Model viewer**
+- Rotate, and zoom with the mouse wheel or +/−. Wireframe, edges, vertex colors and texture alpha can each be toggled on and off. The model's texture is found automatically.
+- **UV sets**: switch between UV0/UV1/... (UV1 is often the baked-lighting layout), and use **UV layout** to see the UVs drawn over the texture.
+- **Model panel**: vertex/triangle counts, the source file, the prefab path, what uses the model, and its materials and textures.
 - **Texture viewer**: zoom under the mouse, drag to pan, with a checkerboard background for transparency.
-- **Thumbnails** of models and textures in the asset list.
-- **Export**: one asset at a time, a multi-selection, or all models/textures at once.
-- **Console** at the bottom showing what the app is doing, plus `viewer.log` and `crash.log`.
+
+**Export**
+- **OBJ + MTL + PNG** or **GLB** (one file with the textures inside).
+- **Open in Blender** (Ctrl+B): exports the model and opens it in Blender in one click. Blender is found automatically, or you can point to it.
+- **Bulk export** of all models, all textures, everything shown in the list, or a selection. It can **keep the game's folder structure** (e.g. `assets/prefabs/weapons/...`) so big dumps stay easy to browse.
+
+**Projects page**
+- A box for each game. **Green** means its assets are already loaded; **red** means they aren't loaded yet. Each box shows file/asset counts and how well the game works with UniView.
+- **Drag and drop** a game folder onto the page to add it, or use **Find Unity games in Steam**.
+- **Pin** favorite games to the top. The most recently opened games come next.
+- **Notes** for each game (right-click → Notes, or the Notes button in the viewer) for quirks and where the good stuff is.
+- **Progress bar** while a game loads, plus a **console**, `viewer.log` and `crash.log`.
 
 ## How to use
 
@@ -75,7 +91,7 @@ Unzip it and run `UniView.exe`. You don't need Python.
 4. Pick an asset in the list on the left:
    - **Model**: rotate it in 3D and check its textures in the right-hand panel. **Save model + textures** exports it.
    - **Texture**: zoom and pan it. **Save PNG** exports it.
-5. Right-click assets for more options. Use **File → Export all …** for bulk export.
+5. Search, sort and star assets (Ctrl+D). Switch to the grid (Ctrl+2) to flip through thumbnails. Right-click assets for more options. Use **File → Export …** for bulk export.
 6. **← Projects** takes you back. Right-click a game's box to rename it, unload it from memory, or remove it.
 
 ## Run from source
@@ -116,8 +132,17 @@ Leave **Texture alpha** off. Many games store other data in the alpha channel. I
 **Something crashed or didn't load.**
 Check the **Console**, or open `crash.log` / `viewer.log` next to `UniView.exe`. Please attach them when you [open an issue](https://github.com/NightHawkHSI/UniView/issues).
 
+**Why GLB and not FBX?**
+Blender can't import text-format FBX, and there's no simple Python writer for binary FBX. GLB (glTF) opens directly in Blender, Godot, Unity and most other tools, keeps the textures inside, and has room for bones and animation later.
+
 **Does it use a lot of memory?**
 Loaded games stay in memory so they reopen instantly. Right-click a game → **Unload from memory** to free it.
+
+## Game compatibility list
+
+[`compat.json`](compat.json) is a community list of how well UniView works with each game (**works**, **partial** or **broken**, plus notes). UniView downloads the latest version at startup and shows it on each game's box. You can turn this off under **Help**.
+
+To add or update a game, right-click it in UniView → **Report compatibility...**. That opens a GitHub issue already filled in with the game's details. You can also send a pull request that edits `compat.json`. The key is the game's install folder name (e.g. `steamapps/common/Robocraft` → `"Robocraft"`).
 
 ## Notes
 
