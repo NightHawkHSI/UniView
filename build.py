@@ -29,7 +29,7 @@ UNITYPY_PACKAGES = [
 # Files that make up the project (what goes in the GitHub folder).
 SOURCE_FILES = [
     "unity_viewer.py", "requirements.txt", "run.bat", "build.bat", "build.py",
-    "Icon.png", "README.md", ".gitignore",
+    "Icon.png", "README.md", ".gitignore", "ScreenShots",
 ]
 
 
@@ -64,7 +64,10 @@ def build_github():
     clear_folder(dest)
     for name in SOURCE_FILES:
         src = os.path.join(ROOT, name)
-        if os.path.exists(src):
+        if os.path.isdir(src):
+            shutil.copytree(src, os.path.join(dest, name))
+            print(f"  copied {name}/")
+        elif os.path.exists(src):
             shutil.copy2(src, os.path.join(dest, name))
             print(f"  copied {name}")
         else:

@@ -19,9 +19,9 @@
 
 Unzip it and run `UniView.exe`. You don't need Python.
 
-[Download](#download) · [Features](#features) · [How to use](#how-to-use) · [Run from source](#run-from-source) · [Build](#build) · [FAQ](#faq)
+[Download](#download) · [Screenshots](#screenshots) · [Features](#features) · [How to use](#how-to-use) · [Run from source](#run-from-source) · [Build](#build) · [FAQ](#faq)
 
-<img src="Icon.png" alt="UniView projects page" width="850">
+<img src="ScreenShots/UAV%20Main.png" alt="UniView projects page" width="850">
 
 </div>
 
@@ -45,6 +45,16 @@ Unzip it and run `UniView.exe`. You don't need Python.
 3. Unzip it anywhere and run **`UniView.exe`**.
 
 > Windows SmartScreen may warn you the first time because the exe isn't code-signed. Click **More info → Run anyway**.
+
+## Screenshots
+
+**Projects page**: one box per game. Green means loaded, red means not loaded, and each box shows its file count. The console at the bottom shows what the app is doing.
+
+<img src="ScreenShots/UAV%20Main.png" alt="Projects page" width="850">
+
+**Game view**: the asset list with thumbnails on the left, the 3D model in the middle, and model info plus materials/textures on the right.
+
+<img src="ScreenShots/UAV%20Game.png" alt="Game view with 3D model and info panel" width="850">
 
 ## Features
 
