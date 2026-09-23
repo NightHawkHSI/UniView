@@ -1,0 +1,18 @@
+# Build output
+Builds/
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# Per-user app data (created when the app runs)
+projects.json
+viewer.log
+viewer.log.*
+crash.log
+
+# Personal notes
+Bugs.txt

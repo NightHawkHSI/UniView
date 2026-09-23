@@ -1,0 +1,6 @@
+UnityPy>=1.25
+PySide6
+pyvista
+pyvistaqt
+numpy
+Pillow
