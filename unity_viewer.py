@@ -433,7 +433,7 @@ class TextureFinder:
         if reader is None:
             return None
         with UNITY_LOCK:
-            return reader.read().image
+            return asset_image(reader.read())
 
 
 # --------------------------------------------------------------------------- mesh conversion
@@ -525,13 +525,28 @@ def render_mesh_thumbnail(points, tris, size, max_tris=20000):
     return img.resize((size, size), Image.LANCZOS)
 
 
+def asset_image(asset):
+    """PIL image of a Texture2D/Sprite, with a clear error for textures that have no pixels.
+
+    Some textures (e.g. "Font Texture") are generated while the game runs, so the files only
+    hold an empty 0x0 placeholder; UnityPy would otherwise fail with a confusing file error.
+    """
+    width = getattr(asset, "m_Width", None)
+    stream = getattr(asset, "m_StreamData", None)
+    if width is not None and (width == 0 or asset.m_Height == 0 or (
+            not getattr(asset, "image_data", None) and (stream is None or not stream.path))):
+        raise ValueError("Empty texture - it's created while the game runs (e.g. a font), "
+                         "so there are no pixels saved in the game files.")
+    return asset.image
+
+
 def make_thumbnail(type_name, obj, size):
     with UNITY_LOCK:
         asset = obj.read()
         if type_name == "Mesh":
             _, points, tris = mesh_arrays(asset)
         else:
-            img = asset.image
+            img = asset_image(asset)
     if type_name == "Mesh":
         return render_mesh_thumbnail(points, tris, size)
     img = img.convert("RGBA")
@@ -832,7 +847,7 @@ def write_glb(mesh, materials, path):
                 texture_index[key] = None
                 try:
                     png = io.BytesIO()
-                    reader.read().image.convert("RGBA").save(png, "PNG")
+                    asset_image(reader.read()).convert("RGBA").save(png, "PNG")
                     images.append({"bufferView": add_view(png.getvalue()), "mimeType": "image/png",
                                    "name": reader.peek_name() or "texture"})
                     textures.append({"source": len(images) - 1, "sampler": 0})
@@ -2730,7 +2745,7 @@ class MainWindow(QMainWindow):
                 if type_name == "Mesh":
                     self.show_mesh(name, obj, asset)
                 elif type_name in ("Texture2D", "Sprite"):
-                    self.show_texture(name, asset.image, obj, asset)
+                    self.show_texture(name, asset_image(asset), obj, asset)
                 elif type_name == "TextAsset":
                     script = asset.m_Script
                     if isinstance(script, bytes):
@@ -2755,7 +2770,7 @@ class MainWindow(QMainWindow):
         main_reader = TextureFinder.main_texture(materials)
         if main_reader is not None:
             try:
-                tex = main_reader.read().image
+                tex = asset_image(main_reader.read())
             except Exception:
                 pass
         self.stack.setCurrentWidget(self.mesh_view)
@@ -2926,7 +2941,7 @@ class MainWindow(QMainWindow):
     def apply_texture(self, data):
         try:
             with UNITY_LOCK:
-                img = data[2].read().image
+                img = asset_image(data[2].read())
             self.mesh_view.set_texture(img)
             self.stack.setCurrentWidget(self.mesh_view)
         except Exception as e:
@@ -3045,7 +3060,7 @@ class MainWindow(QMainWindow):
                     return write_glb(asset, materials, path)
                 return self.write_mesh(obj, asset, path)
             if type_name in ("Texture2D", "Sprite"):
-                asset.image.save(path)
+                asset_image(asset).save(path)
                 return [path]
             script = asset.m_Script
             mode, enc = ("wb", None) if isinstance(script, bytes) else ("w", "utf-8")
@@ -3074,7 +3089,7 @@ class MainWindow(QMainWindow):
                 try:
                     png_path = os.path.join(folder, png)
                     if png_path not in written:
-                        reader.read().image.save(png_path)
+                        asset_image(reader.read()).save(png_path)
                         written.append(png_path)
                 except Exception:
                     continue
@@ -3229,7 +3244,7 @@ def self_test(game_path=None):
             raise RuntimeError("loading failed (see log above)")
         counts = {}
         for type_name, decode in (("Mesh", lambda o: unity_mesh_to_polydata(o.read())),
-                                  ("Texture2D", lambda o: o.read().image.load())):
+                                  ("Texture2D", lambda o: asset_image(o.read()).load())):
             ok = 0
             items = result["groups"][type_name][:25]
             for name, obj in items:

@@ -2,15 +2,200 @@
   "version": 1,
   "about": "Community compatibility list for UniView. Key = the game's install folder name (e.g. steamapps/common/<this>). status: works | partial | broken. Add or update a game with a pull request, or right-click a game in UniView -> 'Report compatibility...' to open an issue.",
   "games": {
-    "Robocraft": {
+    "Among Us": {
       "status": "works",
-      "notes": "Models, textures and sprites all load, and most models find their texture automatically. Textures keep mask data in alpha, so leave 'Texture alpha' off.",
-      "uniview": "1.0.0"
+      "notes": "Mostly a 2D game: 143k sprites and 2.3k textures all load. The few 3D meshes have no linked textures.",
+      "uniview": "1.1.0",
+      "tested": {
+        "files": 68,
+        "models": 552,
+        "textures": 2286,
+        "sprites": 143333,
+        "load_seconds": 5.8,
+        "auto_textured": "0/40 sampled models"
+      }
+    },
+    "BattleBit Remastered": {
+      "status": "works",
+      "notes": "Loads fully. Only about 1 in 4 models finds its texture automatically, so apply textures from the list by hand.",
+      "uniview": "1.1.0",
+      "tested": {
+        "files": 108,
+        "models": 9432,
+        "textures": 2291,
+        "sprites": 321,
+        "load_seconds": 42.5,
+        "auto_textured": "10/40 sampled models"
+      }
+    },
+    "Car Mechanic Simulator 2018": {
+      "status": "works",
+      "notes": "Loads fully and most models find their textures automatically. A few meshes are stripped (no vertex data).",
+      "uniview": "1.1.0",
+      "tested": {
+        "files": 103,
+        "models": 3811,
+        "textures": 7735,
+        "sprites": 5280,
+        "load_seconds": 36.1,
+        "auto_textured": "30/40 sampled models"
+      }
+    },
+    "Fallout Shelter": {
+      "status": "works",
+      "notes": "Most models find their textures automatically. A few meshes are stripped (no vertex data).",
+      "uniview": "1.1.0",
+      "tested": {
+        "files": 49,
+        "models": 2547,
+        "textures": 1267,
+        "sprites": 7,
+        "load_seconds": 9.3,
+        "auto_textured": "33/40 sampled models"
+      }
+    },
+    "Mage Arena": {
+      "status": "works",
+      "notes": "Loads fully and most models find their textures. A few 'Font Texture' entries are empty (made while the game runs).",
+      "uniview": "1.1.0",
+      "tested": {
+        "files": 20,
+        "models": 368,
+        "textures": 642,
+        "sprites": 63,
+        "load_seconds": 2.1,
+        "auto_textured": "29/40 sampled models"
+      }
+    },
+    "Make Way": {
+      "status": "works",
+      "notes": "Everything loads. About half the models find their texture automatically.",
+      "uniview": "1.1.0",
+      "tested": {
+        "files": 55,
+        "models": 2327,
+        "textures": 967,
+        "sprites": 483,
+        "load_seconds": 20.8,
+        "auto_textured": "19/40 sampled models"
+      }
+    },
+    "Megabonk": {
+      "status": "works",
+      "notes": "Everything loads. About 40% of models find their texture automatically, and a few meshes are stripped.",
+      "uniview": "1.1.0",
+      "tested": {
+        "files": 45,
+        "models": 763,
+        "textures": 1209,
+        "sprites": 716,
+        "load_seconds": 0.5,
+        "auto_textured": "17/40 sampled models"
+      }
     },
     "Muck": {
       "status": "works",
-      "notes": "Everything loads. A few meshes are only lines/points; those are skipped.",
-      "uniview": "1.0.0"
+      "notes": "Everything loads. Some models need their texture applied by hand, and a few meshes are only lines/points (skipped).",
+      "uniview": "1.1.0",
+      "tested": {
+        "files": 15,
+        "models": 192,
+        "textures": 512,
+        "sprites": 176,
+        "load_seconds": 0.8,
+        "auto_textured": "12/40 sampled models"
+      }
+    },
+    "PapersPlease": {
+      "status": "works",
+      "notes": "A 2D game: the textures and sprites are the interesting part. There are only 13 simple meshes.",
+      "uniview": "1.1.0",
+      "tested": {
+        "files": 8,
+        "models": 13,
+        "textures": 42,
+        "sprites": 2,
+        "load_seconds": 0.9,
+        "auto_textured": "0/13 sampled models"
+      }
+    },
+    "Probably Stolen Playtest": {
+      "status": "works",
+      "notes": "Mostly 2D: about 2k sprites and 870 textures load fine.",
+      "uniview": "1.1.0",
+      "tested": {
+        "files": 26,
+        "models": 13,
+        "textures": 870,
+        "sprites": 2059,
+        "load_seconds": 3.2,
+        "auto_textured": "0/13 sampled models"
+      }
+    },
+    "Robocraft": {
+      "status": "works",
+      "notes": "Models, textures and sprites all load, and most models find their texture automatically. Textures keep mask data in alpha, so leave 'Texture alpha' off.",
+      "uniview": "1.1.0",
+      "tested": {
+        "files": 68,
+        "models": 2150,
+        "textures": 1304,
+        "sprites": 6,
+        "load_seconds": 10.7,
+        "auto_textured": "24/40 sampled models"
+      }
+    },
+    "Schedule I": {
+      "status": "works",
+      "notes": "Loads fully. About 40% of models find their texture automatically.",
+      "uniview": "1.1.0",
+      "tested": {
+        "files": 22,
+        "models": 4513,
+        "textures": 3025,
+        "sprites": 591,
+        "load_seconds": 13.2,
+        "auto_textured": "16/40 sampled models"
+      }
+    },
+    "Trailmakers": {
+      "status": "works",
+      "notes": "Big game (447 files, about 33k models), so it takes around 2 minutes to load. A few sprites come from atlases built while the game runs and can't be shown.",
+      "uniview": "1.1.0",
+      "tested": {
+        "files": 447,
+        "models": 32907,
+        "textures": 4441,
+        "sprites": 2545,
+        "load_seconds": 120.6,
+        "auto_textured": "28/40 sampled models"
+      }
+    },
+    "Unturned": {
+      "status": "works",
+      "notes": "Everything loads and most models find their textures automatically.",
+      "uniview": "1.1.0",
+      "tested": {
+        "files": 93,
+        "models": 4793,
+        "textures": 7671,
+        "sprites": 25,
+        "load_seconds": 11.9,
+        "auto_textured": "30/40 sampled models"
+      }
+    },
+    "Valheim": {
+      "status": "works",
+      "notes": "645 files, loads in about a minute. Nearly all models find their textures automatically.",
+      "uniview": "1.1.0",
+      "tested": {
+        "files": 645,
+        "models": 8759,
+        "textures": 2866,
+        "sprites": 1595,
+        "load_seconds": 50.3,
+        "auto_textured": "36/40 sampled models"
+      }
     }
   }
 }
