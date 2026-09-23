@@ -6,7 +6,7 @@ for Unity files; pick an item in the tree and it previews on the right. Meshes r
 can be found through a MeshRenderer), textures show as images.
 """
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 APP_SHORT = "UniView"
 APP_TITLE = "UniView - Unity Asset Viewer"
 
