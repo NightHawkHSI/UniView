@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="Icon.png" alt="UniView icon" width="128">
+
 # UniView - Unity Asset Viewer
 
 **Browse the 3D models, textures, sprites and text assets inside Unity games, including games that have shut down and can't be played anymore.**
