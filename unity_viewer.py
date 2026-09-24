@@ -6,7 +6,7 @@ for Unity files; pick an item in the tree and it previews on the right. Meshes r
 can be found through a MeshRenderer), textures show as images.
 """
 
-__version__ = "1.1.2"
+__version__ = "1.2.0"
 APP_SHORT = "UniView"
 APP_TITLE = "UniView - Unity Asset Viewer"
 
@@ -297,63 +297,194 @@ def obj_key(assets_file, path_id):
 
 
 class TextureFinder:
-    """Finds what uses a mesh and which materials/textures it has (renderer -> material)."""
+    """Finds what uses a mesh and which materials/textures it has (renderer -> material).
+
+    Big games have a million+ MeshFilters/MeshRenderers, so the index only reads the first
+    pointers of each component (its GameObject, and a MeshFilter's mesh) straight from the
+    file bytes; materials are read on demand. The index is built in the background right after
+    a game loads, a chunk at a time under UNITY_LOCK, and whoever needs it first finishes it.
+    """
+
+    CHUNK = 4000      # objects handled per UNITY_LOCK hold (keeps the UI responsive)
+    MAX_USERS = 40    # GameObject names resolved per model
 
     def __init__(self, env):
         self.env = env
-        self._index = None  # mesh key -> [(gameobject name, [material PPtr])]
-        self._tex_users = None  # texture key -> {mesh keys}
+        self._steps = None
+        self._indexed = False   # mesh -> users index done
+        self._finished = False  # texture -> models index done too (or gave up)
+        self._mesh_users = {}   # mesh key -> [(assets file, GameObject path id)]
+        self._renderers = {}    # GameObject key -> MeshRenderer ObjectReader
+        self._skinned = {}      # mesh key -> [SkinnedMeshRenderer ObjectReader]
+        self._files = {}        # (id(assets file), file id) -> target assets file or None
+        self._tex_users = {}    # texture key -> {mesh keys}
 
-    def _build(self):
-        log.info("Indexing which objects use which meshes/materials (first model view only)...")
+    # ---- building
+    def start_background(self):
+        def work():
+            while not self._finished:
+                with UNITY_LOCK:
+                    self._step()
+
+        threading.Thread(target=work, daemon=True, name="mesh-index").start()
+
+    def stop(self):
+        """Give up on the background indexing (the game is being unloaded)."""
+        self._finished = True
+
+    @property
+    def indexed(self):
+        return self._indexed or self._finished
+
+    def _run_until(self, done):
+        with UNITY_LOCK:
+            while not done() and not self._finished:
+                self._step()
+
+    def _step(self):
+        """Advance the index by one chunk. Callers hold UNITY_LOCK."""
+        if self._finished:
+            return
+        if self._steps is None:
+            self._steps = self._build_steps()
+        try:
+            next(self._steps)
+        except StopIteration:
+            self._indexed = self._finished = True
+        except Exception:
+            log.exception("Indexing which models use which materials failed")
+            self._indexed = self._finished = True
+
+    def _build_steps(self):
+        log.info("Indexing which objects use which meshes/materials...")
         started = time.time()
-        self._index = {}
-        for obj in self.env.objects:
+        for n, obj in enumerate(self.env.objects, 1):
+            if n % self.CHUNK == 0:
+                yield
             tname = obj.type.name
-            if tname not in ("MeshFilter", "SkinnedMeshRenderer"):
-                continue
             try:
-                comp = obj.read()
-                mesh_ptr = comp.m_Mesh
-                if mesh_ptr.path_id == 0:
-                    continue
-                go = comp.m_GameObject.deref_parse_as_object()
                 if tname == "MeshFilter":
-                    mats = self._materials_of_gameobject(go)
-                else:
-                    mats = list(comp.m_Materials)
-                key = obj_key(mesh_ptr.assetsfile, mesh_ptr.path_id)
-                self._index.setdefault(key, []).append((go.m_Name, mats))
+                    ptrs = self._read_pptrs(obj, 2)
+                    if ptrs and ptrs[1][1]:
+                        go, mesh = ptrs
+                        self._mesh_users.setdefault(obj_key(*mesh), []).append(go)
+                elif tname == "MeshRenderer":
+                    ptrs = self._read_pptrs(obj, 1)
+                    if ptrs:
+                        self._renderers[obj_key(*ptrs[0])] = obj
+                elif tname == "SkinnedMeshRenderer":
+                    mesh_ptr = obj.read().m_Mesh
+                    if mesh_ptr.path_id:
+                        mesh = mesh_ptr.deref()
+                        self._skinned.setdefault(obj_key(mesh.assets_file, mesh.path_id), []).append(obj)
             except Exception:
                 continue
-        log.info("Indexed %d meshes with renderers in %.1fs", len(self._index), time.time() - started)
+        self._indexed = True
+        log.info("Indexed %d meshes with renderers in %.1fs",
+                 len(set(self._mesh_users) | set(self._skinned)), time.time() - started)
+        yield
 
-    @staticmethod
-    def _materials_of_gameobject(go):
-        for comp in go.m_Component:
-            ptr = comp.component if hasattr(comp, "component") else comp[1]
+        # Second pass for the texture view's "used by": one renderer's materials per model.
+        started = time.time()
+        material_textures = {}
+        for n, mesh_key in enumerate(set(self._mesh_users) | set(self._skinned), 1):
+            if n % 500 == 0:
+                yield
+            for ptr in self._material_ptrs(mesh_key, first_only=True):
+                try:
+                    mat_key = (id(ptr.assetsfile), ptr.path_id)
+                except Exception:
+                    continue
+                if mat_key not in material_textures:
+                    material_textures[mat_key] = self._texture_keys(ptr)
+                for tex_key in material_textures[mat_key]:
+                    self._tex_users.setdefault(tex_key, set()).add(mesh_key)
+        log.info("Indexed which models use which textures (%d textures) in %.1fs",
+                 len(self._tex_users), time.time() - started)
+
+    def _read_pptrs(self, obj, count):
+        """Read the first `count` PPtrs of a component without parsing it: [(assets file, path id)]."""
+        assets_file = obj.assets_file
+        wide = assets_file.header.version >= 14
+        reader = obj.reader
+        obj.reset()
+        out = []
+        for _ in range(count):
+            file_id = reader.read_int()
+            path_id = reader.read_long() if wide else reader.read_int()
+            target = self._file(assets_file, file_id)
+            if target is None:
+                return None
+            out.append((target, path_id))
+        return out
+
+    def _file(self, assets_file, file_id):
+        """Assets file a PPtr's file id points to (same lookup as UnityPy's PPtr.deref)."""
+        key = (id(assets_file), file_id)
+        if key not in self._files:
+            target = assets_file if file_id == 0 else None
+            if 0 < file_id <= len(assets_file.externals):
+                name = assets_file.externals[file_id - 1].path
+                name = (name[9:] if name.startswith("archive:/") else name).rsplit("/", 1)[-1].lower()
+                container = assets_file.parent
+                if container is not None:
+                    target = next((f for k, f in container.files.items() if k.lower() == name), None)
+                if target is None:
+                    try:
+                        target = assets_file.environment.find_file(name)
+                    except Exception:
+                        target = None
+            self._files[key] = target
+        return self._files[key]
+
+    # ---- lookups
+    def _material_ptrs(self, mesh_key, first_only=False):
+        for assets_file, go_id in self._mesh_users.get(mesh_key, []):
+            renderer = self._renderers.get(obj_key(assets_file, go_id))
+            if renderer is not None:
+                try:
+                    return list(renderer.read().m_Materials)
+                except Exception:
+                    if first_only:
+                        break
+        for renderer in self._skinned.get(mesh_key, []):
             try:
-                reader = ptr.deref()
+                return list(renderer.read().m_Materials)
             except Exception:
                 continue
-            if reader.type.name == "MeshRenderer":
-                return list(reader.read().m_Materials)
         return []
 
-    def info(self, mesh_obj):
-        """Return (gameobject names, materials).
+    @staticmethod
+    def _object_name(reader):
+        try:
+            return reader.peek_name() or reader.read().m_Name
+        except Exception:
+            return "?"
 
+    def info(self, mesh_obj):
+        """Return (gameobject names, materials, number of users).
+
+        names: up to MAX_USERS GameObjects using the mesh.
         materials: [{"name": str, "textures": [(property, texture name, ObjectReader)]}],
         one per submesh slot, with albedo textures first.
         """
+        self._run_until(lambda: self._indexed)
         with UNITY_LOCK:
-            if self._index is None:
-                self._build()
-            users = self._index.get(obj_key(mesh_obj.assets_file, mesh_obj.path_id), [])
-            names = [name for name, _ in users]
-            mat_ptrs = next((mats for _, mats in users if mats), [])
+            key = obj_key(mesh_obj.assets_file, mesh_obj.path_id)
+            gos = self._mesh_users.get(key, [])
+            skinned = self._skinned.get(key, [])
+            names = []
+            for assets_file, go_id in gos[:self.MAX_USERS]:
+                reader = assets_file.objects.get(go_id)
+                if reader is not None:
+                    names.append(self._object_name(reader))
+            for renderer in skinned[:max(0, self.MAX_USERS - len(names))]:
+                try:
+                    names.append(self._object_name(renderer.read().m_GameObject.deref()))
+                except Exception:
+                    pass
             materials = []
-            for ptr in mat_ptrs:
+            for ptr in self._material_ptrs(key):
                 try:
                     mat = ptr.deref_parse_as_object()
                     tex_envs = mat.m_SavedProperties.m_TexEnvs
@@ -374,34 +505,12 @@ class TextureFinder:
                         continue
                 textures.sort(key=lambda t: t[0] not in ALBEDO_PROPS)
                 materials.append({"name": mat.m_Name, "textures": textures})
-            return names, materials
+            return names, materials, len(gos) + len(skinned)
 
     def texture_users(self, tex_obj):
         """Keys of the meshes whose materials use this texture."""
-        with UNITY_LOCK:
-            if self._index is None:
-                self._build()
-            if self._tex_users is None:
-                self._build_texture_users()
+        self._run_until(lambda: False)
         return self._tex_users.get(obj_key(tex_obj.assets_file, tex_obj.path_id), set())
-
-    def _build_texture_users(self):
-        started = time.time()
-        self._tex_users = {}
-        material_textures = {}
-        for mesh_key, users in self._index.items():
-            for _go, mats in users:
-                for ptr in mats:
-                    try:
-                        mat_key = (id(ptr.assetsfile), ptr.path_id)
-                    except Exception:
-                        continue
-                    if mat_key not in material_textures:
-                        material_textures[mat_key] = self._texture_keys(ptr)
-                    for tex_key in material_textures[mat_key]:
-                        self._tex_users.setdefault(tex_key, set()).add(mesh_key)
-        log.info("Indexed which models use which textures (%d textures) in %.1fs",
-                 len(self._tex_users), time.time() - started)
 
     @staticmethod
     def _texture_keys(mat_ptr):
@@ -414,7 +523,8 @@ class TextureFinder:
             ptr = tex_env.m_Texture
             if ptr.path_id:
                 try:
-                    keys.append(obj_key(ptr.assetsfile, ptr.path_id))
+                    reader = ptr.deref()
+                    keys.append(obj_key(reader.assets_file, reader.path_id))
                 except Exception:
                     pass
         return keys
@@ -1016,6 +1126,7 @@ def compat_report_url(project):
             f"**Install folder name:** {os.path.basename(os.path.normpath(project['path']))}\n"
             f"**Status:** works / partial / broken  (keep one)\n"
             f"**UniView version:** {__version__}\n"
+            f"**Unity version:** {unity_info_text(project) or '?'}\n"
             f"**Unity files / assets:** {project.get('file_count', '?')} / {project.get('asset_count', '?')}\n\n"
             f"**What works / what doesn't:**\n\n")
     query = urllib.parse.urlencode({"title": f"Compatibility: {name}", "body": body, "labels": "compatibility"})
@@ -1575,6 +1686,79 @@ def find_steam_unity_games():
     return games
 
 
+UNITY_VERSION_RE = re.compile(rb"\d{1,4}\.\d+\.\d+[a-zA-Z]?\d*")
+VERSION_FILES = ("globalgamemanagers", "mainData", "data.unity3d", "level0")
+
+
+def read_unity_version(path):
+    """Unity editor version stored in a serialized file's or bundle's header (e.g. '2019.4.40f1')."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(256)
+    except OSError:
+        return None
+    if head.startswith(BUNDLE_MAGICS):
+        # magic\0, uint32 format, player version\0, engine version\0
+        strings = head[head.index(b"\0") + 5:].split(b"\0")
+        candidates = strings[1:2] + strings[:1]
+    else:
+        if len(head) < 48:
+            return None
+        version = int.from_bytes(head[8:12], "big")
+        if version < 9:
+            return None  # older files keep the version at the end of the file
+        candidates = [head[48 if version >= 22 else 20:].split(b"\0")[0]]
+    for text in candidates:
+        if UNITY_VERSION_RE.fullmatch(text) and not text.startswith(b"0.0"):
+            return text.decode()
+    return None
+
+
+def detect_unity_info(game_dir):
+    """{'unity_version': '2019.4.40f1' or '', 'backend': 'IL2CPP' / 'Mono' / ''} without loading the game."""
+    data = unity_data_dir(game_dir) if os.path.isdir(game_dir) else None
+    version = None
+    for name in VERSION_FILES if data else ():
+        version = read_unity_version(os.path.join(data, name))
+        if version:
+            break
+    if not version:
+        # Loose asset folder or a single file: try the first few Unity files found.
+        for path in find_unity_files(game_dir)[:50]:
+            version = read_unity_version(path)
+            if version:
+                break
+    backend = ""
+    if os.path.isfile(os.path.join(game_dir, "GameAssembly.dll")) or (
+            data and os.path.isdir(os.path.join(data, "il2cpp_data"))):
+        backend = "IL2CPP"
+    elif data and os.path.isdir(os.path.join(data, "Managed")):
+        backend = "Mono"
+    return {"unity_version": version or "", "backend": backend}
+
+
+def unity_version_key(version):
+    return tuple(int(n) for n in re.findall(r"\d+", version or ""))
+
+
+def unity_branch(version):
+    """'2019.4.40f1' -> 'Unity 2019.4', '6000.0.58f2' -> 'Unity 6.0'."""
+    nums = unity_version_key(version)
+    if len(nums) < 2:
+        return "Unknown Unity version"
+    major = nums[0] // 1000 if nums[0] >= 6000 else nums[0]
+    return f"Unity {major}.{nums[1]}"
+
+
+def unity_info_text(project):
+    parts = []
+    if project.get("unity_version"):
+        parts.append(f"Unity {project['unity_version']}")
+    if project.get("backend"):
+        parts.append(project["backend"])
+    return " · ".join(parts)
+
+
 class ProjectStore:
     """List of saved games, persisted to projects.json."""
 
@@ -1608,6 +1792,15 @@ class ProjectStore:
             project["asset_count"] = assets
         self.save()
 
+    def update(self, path, **fields):
+        project = self.get(path)
+        if project is not None:
+            project.update(fields)
+            self.save()
+
+    def all_tags(self):
+        return sorted({t for p in self.projects for t in p.get("tags", [])}, key=str.lower)
+
     def add(self, name, path):
         if not self.has(path):
             self.projects.append({"name": name, "path": path, "last_opened": 0})
@@ -1622,10 +1815,17 @@ class ProjectStore:
         project["last_opened"] = time.time()
         self.save()
 
-    def sorted(self):
-        """Pinned games first, then most recently opened."""
-        return sorted(self.projects, key=lambda p: (not p.get("pinned"), -p.get("last_opened", 0),
-                                                    p["name"].lower()))
+    SORTS = {
+        "recent": lambda p: (-p.get("last_opened", 0), p["name"].lower()),
+        "name": lambda p: p["name"].lower(),
+        "unity": lambda p: tuple(-n for n in unity_version_key(p.get("unity_version"))) or (1,),
+        "assets": lambda p: (-(p.get("asset_count") or 0), -(p.get("file_count") or 0)),
+    }
+
+    def sorted(self, by="recent"):
+        """Pinned games first, then by the chosen order (most recently opened by default)."""
+        key = self.SORTS.get(by, self.SORTS["recent"])
+        return sorted(self.projects, key=lambda p: (not p.get("pinned"), key(p), p["name"].lower()))
 
 
 class SteamPickDialog(QDialog):
@@ -1675,20 +1875,24 @@ class CardDelegate(QStyledItemDelegate):
     SUB_ROLE = Qt.UserRole + 2
     PIN_ROLE = Qt.UserRole + 3
     NOTES_ROLE = Qt.UserRole + 4
+    TAGS_ROLE = Qt.UserRole + 5
     STYLES = {  # state: (border, fill)
         "loaded": ("#43a047", QColor(67, 160, 71, 60)),
         "unloaded": ("#e53935", QColor(229, 57, 53, 40)),
         "missing": ("#888888", QColor(128, 128, 128, 35)),
         "action": ("#666666", QColor(0, 0, 0, 0)),
     }
-    SIZE = QSize(176, 222)
+    SIZE = QSize(176, 244)
     ICON = 80
 
     def sizeHint(self, option, index):
-        return self.SIZE
+        return index.data(Qt.SizeHintRole) or self.SIZE  # group headers set their own (full-width) size
 
     def paint(self, painter, option, index):
         state = index.data(self.STATE_ROLE) or "action"
+        if state == "header":
+            self._paint_header(painter, option, index)
+            return
         border, fill = self.STYLES[state]
         hover = bool(option.state & QStyle.State_MouseOver)
         rect = option.rect.adjusted(5, 5, -5, -5)
@@ -1728,15 +1932,97 @@ class CardDelegate(QStyledItemDelegate):
         name = index.data(Qt.DisplayRole) or ""
         painter.drawText(text_rect, flags, name)
 
+        small = QFont(option.font)
+        small.setPointSizeF(max(7.0, option.font.pointSizeF() * 0.9))
+        tags = index.data(self.TAGS_ROLE)
+        tag_height = 0
+        if tags:
+            # Tags sit on the bottom line of the box, cut short with "..." if they don't fit.
+            metrics = QFontMetrics(small)
+            tag_height = metrics.height() + 2
+            tag_rect = QRect(text_rect.left(), text_rect.bottom() - metrics.height(),
+                             text_rect.width(), metrics.height())
+            painter.setFont(small)
+            painter.setPen(QColor("#5aa0e6"))
+            text = "  ".join(f"#{t}" for t in tags)
+            painter.drawText(tag_rect, Qt.AlignHCenter | Qt.AlignVCenter,
+                             metrics.elidedText(text, Qt.ElideRight, tag_rect.width()))
+
         sub = index.data(self.SUB_ROLE)
         if sub:
             used = QFontMetrics(name_font).boundingRect(text_rect, flags, name).height()
-            small = QFont(option.font)
-            small.setPointSizeF(max(7.0, option.font.pointSizeF() * 0.9))
             painter.setFont(small)
             painter.setPen(QColor("#a0a0a0"))
-            painter.drawText(text_rect.adjusted(0, used + 4, 0, 0), flags, sub)
+            painter.drawText(text_rect.adjusted(0, used + 4, 0, -tag_height), flags, sub)
         painter.restore()
+
+    def _paint_header(self, painter, option, index):
+        rect = option.rect.adjusted(4, 0, -4, 0)
+        painter.save()
+        font = QFont(option.font)
+        font.setBold(True)
+        font.setPointSizeF(option.font.pointSizeF() * 1.15)
+        painter.setFont(font)
+        painter.setPen(option.palette.color(QPalette.Text))
+        text = index.data(Qt.DisplayRole) or ""
+        painter.drawText(rect.adjusted(0, 0, 0, -4), Qt.AlignLeft | Qt.AlignBottom, text)
+        painter.setPen(QPen(QColor("#555555"), 1))
+        y = rect.bottom() - 1
+        painter.drawLine(rect.left(), y, rect.right(), y)
+        painter.restore()
+
+
+GAME_FILTER_HELP = (
+    "Type words to match a game's name, tags, notes or Unity version.\n"
+    "Narrow it down with:\n"
+    "  tag:lowpoly      has this tag\n"
+    "  unity:2019       Unity version starts with 2019 (unity:2019.4, unity:6000 ...)\n"
+    "  backend:il2cpp   IL2CPP or Mono\n"
+    "  status:works     community compatibility (works / partial / broken)\n"
+    "Combine them, e.g.  tag:fps unity:2022 mono"
+)
+
+
+def clean_tag(text):
+    return " ".join(text.replace("#", " ").split()).strip(" ,")
+
+
+class TagsDialog(QDialog):
+    """Tick existing tags or type new ones for a game."""
+
+    def __init__(self, project, known_tags, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Tags - {project['name']}")
+        self.resize(340, 420)
+        current = set(project.get("tags", []))
+        self.list = QListWidget()
+        for tag in sorted(set(known_tags) | current, key=str.lower):
+            item = QListWidgetItem(tag)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if tag in current else Qt.Unchecked)
+            self.list.addItem(item)
+        self.new = QLineEdit(placeholderText="New tags, separated by commas")
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Tags group and filter games on the Projects page\n"
+                             "(genre, art style, 'dead game', 'has good models'...)."))
+        lay.addWidget(self.list)
+        lay.addWidget(self.new)
+        lay.addWidget(buttons)
+        self.new.setFocus()
+
+    def tags(self):
+        tags = [self.list.item(i).text() for i in range(self.list.count())
+                if self.list.item(i).checkState() == Qt.Checked]
+        known = {self.list.item(i).text().lower(): self.list.item(i).text() for i in range(self.list.count())}
+        for text in self.new.text().split(","):
+            tag = clean_tag(text)
+            tag = known.get(tag.lower(), tag)  # reuse the existing spelling
+            if tag and tag.lower() not in {t.lower() for t in tags}:
+                tags.append(tag)
+        return sorted(tags, key=str.lower)
 
 
 class HomePage(QWidget):
@@ -1745,8 +2031,17 @@ class HomePage(QWidget):
     open_requested = Signal(str)  # project path
     unload_requested = Signal(str)
     _counted = Signal(str, int)
+    _detected = Signal(str, object)
     _compat_fetched = Signal(int)
     ADD, FIND = "__add__", "__find__"
+    UNTAGGED = "__untagged__"
+    GROUPS = (("No grouping", ""), ("Group by tag", "tag"), ("Group by Unity version", "unity"),
+              ("Group by scripting backend", "backend"), ("Group by compatibility", "status"),
+              ("Group by loaded / not loaded", "state"))
+    SORTS = (("Recently opened", "recent"), ("Name", "name"), ("Unity version (newest)", "unity"),
+             ("Most assets", "assets"))
+    HEADER_HEIGHT = 34
+    SPACING = 6
 
     def __init__(self, store, is_loaded, settings, parent=None):
         super().__init__(parent)
@@ -1756,8 +2051,14 @@ class HomePage(QWidget):
         self.icons = QFileIconProvider()
         self.compat = load_compat()
         self._counting = set()
+        self._detecting = set()
+        self._headers = []
         self._counted.connect(self._on_counted)
+        self._detected.connect(self._on_detected)
         self._compat_fetched.connect(self._on_compat_fetched)
+        # Background counts/version checks finish in bursts - redraw once per burst.
+        self.refresh_timer = QTimer(self, singleShot=True, interval=150)
+        self.refresh_timer.timeout.connect(self.refresh)
 
         title = QLabel(APP_TITLE)
         title.setStyleSheet("font-size: 22px; font-weight: bold;")
@@ -1767,12 +2068,42 @@ class HomePage(QWidget):
                       "Drag a game folder here to add it.")
         hint.setStyleSheet("color: gray;")
 
+        # Catalog bar: search, tag filter, grouping and sort order.
+        self.search = QLineEdit(placeholderText="Search games...  e.g.  shooter tag:lowpoly unity:2019 il2cpp")
+        self.search.setClearButtonEnabled(True)
+        self.search.setToolTip(GAME_FILTER_HELP)
+        self.search.textChanged.connect(lambda _: self.refresh_timer.start())
+        self.tag_combo = QComboBox()
+        self.tag_combo.setMinimumWidth(130)
+        self.tag_combo.setToolTip("Show only games with this tag (right-click a game → Tags... to tag it)")
+        self.tag_combo.currentIndexChanged.connect(lambda _: self.refresh())
+        self.group_combo = QComboBox()
+        for label, value in self.GROUPS:
+            self.group_combo.addItem(label, value)
+        self.group_combo.setCurrentIndex(max(0, self.group_combo.findData(settings.get("home_group", ""))))
+        self.group_combo.currentIndexChanged.connect(lambda _: self._catalog_changed("home_group",
+                                                                                     self.group_combo))
+        self.sort_combo = QComboBox()
+        for label, value in self.SORTS:
+            self.sort_combo.addItem(label, value)
+        self.sort_combo.setCurrentIndex(max(0, self.sort_combo.findData(settings.get("home_sort", "recent"))))
+        self.sort_combo.currentIndexChanged.connect(lambda _: self._catalog_changed("home_sort",
+                                                                                    self.sort_combo))
+        self.count_label = QLabel()
+        self.count_label.setStyleSheet("color: gray;")
+        bar = QHBoxLayout()
+        bar.addWidget(self.search, 1)
+        bar.addWidget(self.tag_combo)
+        bar.addWidget(self.group_combo)
+        bar.addWidget(QLabel("Sort:"))
+        bar.addWidget(self.sort_combo)
+        bar.addWidget(self.count_label)
+
         self.grid = QListWidget()
         self.grid.setViewMode(QListView.IconMode)
         self.grid.setResizeMode(QListView.Adjust)
         self.grid.setMovement(QListView.Static)
-        self.grid.setGridSize(QSize(188, 234))
-        self.grid.setUniformItemSizes(True)
+        self.grid.setSpacing(self.SPACING)
         self.grid.setFocusPolicy(Qt.NoFocus)
         self.grid.setMouseTracking(True)
         self.grid.setItemDelegate(CardDelegate(self.grid))
@@ -1790,6 +2121,7 @@ class HomePage(QWidget):
         lay.setContentsMargins(24, 20, 24, 20)
         lay.addWidget(title)
         lay.addWidget(hint)
+        lay.addLayout(bar)
         lay.addWidget(self.grid, 1)
         self.refresh()
         if self.settings.get("online_compat", True):
@@ -1828,6 +2160,8 @@ class HomePage(QWidget):
     def eventFilter(self, obj, event):
         if obj is self.grid.viewport():
             kind = event.type()
+            if kind == QEvent.Resize:
+                self._resize_headers()
             if kind in (QEvent.DragEnter, QEvent.DragMove) and self._dropped_folders(event.mimeData()):
                 event.acceptProposedAction()
                 return True
@@ -1858,43 +2192,168 @@ class HomePage(QWidget):
         item.setData(CardDelegate.STATE_ROLE, "action")
         return item
 
+    def _catalog_changed(self, key, combo):
+        self.settings[key] = combo.currentData()
+        self.settings.save()
+        self.refresh()
+
+    def _update_tag_combo(self):
+        current = self.tag_combo.currentData()
+        tags = self.store.all_tags()
+        with QSignalBlocker(self.tag_combo):
+            self.tag_combo.clear()
+            self.tag_combo.addItem("All tags", "")
+            for tag in tags:
+                n = sum(tag in p.get("tags", []) for p in self.store.projects)
+                self.tag_combo.addItem(f"#{tag}  ({n})", tag)
+            self.tag_combo.addItem("Untagged", self.UNTAGGED)
+            self.tag_combo.setCurrentIndex(max(0, self.tag_combo.findData(current)))
+
+    def _card_item(self, project):
+        path = project["path"]
+        exe = game_exe(path) if os.path.isdir(path) else None
+        icon = (self.icons.icon(QFileInfo(exe)) if exe
+                else self.style().standardIcon(QStyle.SP_DirIcon))
+        item = QListWidgetItem(icon, project["name"])
+        item.setData(Qt.UserRole, path)
+        compat = self.compat_entry(path)
+        unity = unity_info_text(project)
+        tip = [path]
+        if not os.path.isdir(path):
+            state, lines = "missing", ["Folder missing"]
+        else:
+            state = "loaded" if self.is_loaded(path) else "unloaded"
+            files = project.get("file_count")
+            parts = [f"{files:,} files" if files is not None else "counting files..."]
+            if project.get("asset_count") is not None:
+                parts.append(f"{project['asset_count']:,} assets")
+            lines = [" · ".join(parts), "Loaded" if state == "loaded" else "Not loaded",
+                     unity or ("checking Unity version..." if "unity_version" not in project
+                               else "Unknown Unity version")]
+        if unity:
+            tip.append(unity)
+        if compat and compat.get("status") in COMPAT_STATUS:
+            lines.append(COMPAT_STATUS[compat["status"]])
+            if compat.get("notes"):
+                tip.append(f"Community notes: {compat['notes']}")
+        if project.get("tags"):
+            tip.append("Tags: " + ", ".join(project["tags"]))
+        if project.get("notes"):
+            tip.append(f"Your notes: {project['notes']}")
+        if project.get("last_opened"):
+            tip.append(f"Last opened: {datetime.fromtimestamp(project['last_opened']):%Y-%m-%d %H:%M}")
+        item.setToolTip("\n\n".join(tip))
+        item.setData(CardDelegate.STATE_ROLE, state)
+        item.setData(CardDelegate.SUB_ROLE, "\n".join(lines))
+        item.setData(CardDelegate.PIN_ROLE, bool(project.get("pinned")))
+        item.setData(CardDelegate.NOTES_ROLE, bool(project.get("notes")))
+        item.setData(CardDelegate.TAGS_ROLE, project.get("tags") or None)
+        return item
+
+    def _header_width(self):
+        return max(100, self.grid.viewport().width() - 2 * self.SPACING - 2)
+
+    def _header_item(self, text):
+        item = QListWidgetItem(text)
+        item.setFlags(Qt.NoItemFlags)
+        item.setData(CardDelegate.STATE_ROLE, "header")
+        item.setSizeHint(QSize(self._header_width(), self.HEADER_HEIGHT))
+        self._headers.append(item)
+        return item
+
+    def _resize_headers(self):
+        width = self._header_width()
+        for item in self._headers:
+            if item.sizeHint().width() != width:
+                item.setSizeHint(QSize(width, self.HEADER_HEIGHT))
+
+    def _groups_of(self, project, group_by):
+        """[(sort key, group title)] a game belongs to (a game with several tags is in several groups)."""
+        if group_by == "tag":
+            return [((0, t.lower()), f"#{t}") for t in project.get("tags", [])] or [((1,), "Untagged")]
+        if group_by == "unity":
+            version = project.get("unity_version")
+            if not version:
+                return [((1,), "Unknown Unity version")]
+            return [((0, tuple(-n for n in unity_version_key(version)[:2])), unity_branch(version))]
+        if group_by == "backend":
+            backend = project.get("backend")
+            return [((0, backend), backend)] if backend else [((1,), "Unknown scripting backend")]
+        if group_by == "status":
+            status = (self.compat_entry(project["path"]) or {}).get("status")
+            order = list(COMPAT_STATUS)
+            if status in COMPAT_STATUS:
+                return [((order.index(status),), COMPAT_STATUS[status])]
+            return [((len(order),), "Not rated yet")]
+        if group_by == "state":
+            if not os.path.isdir(project["path"]):
+                return [((2,), "Folder missing")]
+            if self.is_loaded(project["path"]):
+                return [((0,), "Loaded")]
+            return [((1,), "Not loaded")]
+        return [((0,), "")]
+
+    def _matches(self, project, terms):
+        """Plain words match anywhere (name, tags, notes, version...); tag:/unity:/backend:/status: narrow it."""
+        compat = self.compat_entry(project["path"]) or {}
+        tags = [t.lower() for t in project.get("tags", [])]
+        fields = {
+            "tag": tags,
+            "unity": [(project.get("unity_version") or "").lower()],
+            "backend": [(project.get("backend") or "").lower()],
+            "status": [(compat.get("status") or "").lower()],
+        }
+        haystack = " ".join([project["name"], os.path.basename(os.path.normpath(project["path"])),
+                             project.get("notes", ""), unity_info_text(project), compat.get("status", ""),
+                             " ".join("#" + t for t in tags)]).lower()
+        for term in terms:
+            key, sep, value = term.partition(":")
+            if sep and key in fields:
+                if not any(v.startswith(value) for v in fields[key] if v):
+                    return False
+            elif term not in haystack:
+                return False
+        return True
+
     def refresh(self):
+        self.refresh_timer.stop()
+        self._update_tag_combo()
         self.grid.clear()
-        for project in self.store.sorted():
+        self._headers = []
+        group_by = self.group_combo.currentData()
+        tag = self.tag_combo.currentData()
+        terms = self.search.text().lower().split()
+        shown = []
+        for project in self.store.sorted(self.sort_combo.currentData()):
             path = project["path"]
-            exe = game_exe(path) if os.path.isdir(path) else None
-            icon = (self.icons.icon(QFileInfo(exe)) if exe
-                    else self.style().standardIcon(QStyle.SP_DirIcon))
-            item = QListWidgetItem(icon, project["name"])
-            item.setData(Qt.UserRole, path)
-            compat = self.compat_entry(path)
-            tip = [path]
-            if not os.path.isdir(path):
-                state, lines = "missing", ["Folder missing"]
-            else:
-                state = "loaded" if self.is_loaded(path) else "unloaded"
-                files = project.get("file_count")
-                if files is None:
+            if os.path.isdir(path):
+                if project.get("file_count") is None:
                     self._count_files(path)
-                parts = [f"{files:,} files" if files is not None else "counting files..."]
-                if project.get("asset_count") is not None:
-                    parts.append(f"{project['asset_count']:,} assets")
-                lines = [" \u00b7 ".join(parts), "Loaded" if state == "loaded" else "Not loaded"]
-            if compat and compat.get("status") in COMPAT_STATUS:
-                lines.append(COMPAT_STATUS[compat["status"]])
-                if compat.get("notes"):
-                    tip.append(f"Community notes: {compat['notes']}")
-            if project.get("notes"):
-                tip.append(f"Your notes: {project['notes']}")
-            if project.get("last_opened"):
-                tip.append(f"Last opened: {datetime.fromtimestamp(project['last_opened']):%Y-%m-%d %H:%M}")
-            item.setToolTip("\n\n".join(tip))
-            item.setData(CardDelegate.STATE_ROLE, state)
-            item.setData(CardDelegate.SUB_ROLE, "\n".join(lines))
-            item.setData(CardDelegate.PIN_ROLE, bool(project.get("pinned")))
-            item.setData(CardDelegate.NOTES_ROLE, bool(project.get("notes")))
-            self.grid.addItem(item)
-        self.grid.addItem(self._action_item("\uff0b Add game", QStyle.SP_FileDialogNewFolder, self.ADD))
+                if "unity_version" not in project:
+                    self._detect_unity(path)
+            if tag == self.UNTAGGED and project.get("tags"):
+                continue
+            if tag and tag != self.UNTAGGED and tag not in project.get("tags", []):
+                continue
+            if self._matches(project, terms):
+                shown.append(project)
+
+        if group_by:
+            groups = {}  # title -> (sort key, [projects])
+            for project in shown:
+                for order, title in self._groups_of(project, group_by):
+                    groups.setdefault(title, (order, []))[1].append(project)
+            for title, (_order, projects) in sorted(groups.items(), key=lambda kv: (kv[1][0], kv[0].lower())):
+                self.grid.addItem(self._header_item(f"{title}   ({len(projects)})"))
+                for project in projects:
+                    self.grid.addItem(self._card_item(project))
+            self.grid.addItem(self._header_item("Add more"))
+        else:
+            for project in shown:
+                self.grid.addItem(self._card_item(project))
+        total = len(self.store.projects)
+        self.count_label.setText(f"{len(shown)} of {total} games" if len(shown) != total else f"{total} games")
+        self.grid.addItem(self._action_item("＋ Add game", QStyle.SP_FileDialogNewFolder, self.ADD))
         self.grid.addItem(self._action_item("Find Unity games in Steam",
                                             QStyle.SP_FileDialogContentsView, self.FIND))
 
@@ -1918,7 +2377,30 @@ class HomePage(QWidget):
         self._counting.discard(path)
         log.info("Counted %d Unity files in %s", n, path)
         self.store.set_counts(path, files=n)
-        self.refresh()
+        self.refresh_timer.start()
+
+    def _detect_unity(self, path):
+        """Read the game's Unity version from a file header in the background."""
+        if path in self._detecting:
+            return
+        self._detecting.add(path)
+
+        def work():
+            try:
+                info = detect_unity_info(path)
+            except Exception:
+                log.exception("Checking the Unity version of %s failed", path)
+                info = {"unity_version": "", "backend": ""}
+            self._detected.emit(path, info)
+
+        threading.Thread(target=work, daemon=True, name="unity-version").start()
+
+    def _on_detected(self, path, info):
+        self._detecting.discard(path)
+        log.info("%s: %s", os.path.basename(os.path.normpath(path)),
+                 unity_info_text(info) or "Unity version not found")
+        self.store.update(path, **info)
+        self.refresh_timer.start()
 
     def on_activate(self, item):
         data = item.data(Qt.UserRole)
@@ -1992,6 +2474,9 @@ class HomePage(QWidget):
             menu.addAction("Unload from memory", lambda: self.unload_requested.emit(path))
         menu.addAction("Unpin" if project.get("pinned") else "Pin to top", lambda: self.toggle_pin(project))
         menu.addAction("Notes...", lambda: self.edit_notes(project))
+        menu.addAction("Tags...", lambda: self.edit_tags(project))
+        for tag in project.get("tags", []):
+            menu.addAction(f"Show only #{tag}", lambda t=tag: self.show_tag(t))
         menu.addAction("Rename...", lambda: self.rename(project))
         menu.addSeparator()
         menu.addAction("Report compatibility...", lambda: self.report_compat(project))
@@ -2012,13 +2497,31 @@ class HomePage(QWidget):
             self.store.save()
             self.refresh()
 
+    def edit_tags(self, project):
+        dlg = TagsDialog(project, self.store.all_tags(), self)
+        if dlg.exec():
+            tags = dlg.tags()
+            if tags != project.get("tags", []):
+                if tags:
+                    project["tags"] = tags
+                else:
+                    project.pop("tags", None)
+                self.store.save()
+                log.info("Tags for '%s': %s", project["name"], ", ".join(tags) or "(none)")
+                self.refresh()
+
+    def show_tag(self, tag):
+        self.refresh()  # make sure the tag is in the list
+        self.tag_combo.setCurrentIndex(max(0, self.tag_combo.findData(tag)))
+
     def report_compat(self, project):
         url = compat_report_url(project)
         log.info("Opening a compatibility report for '%s' on GitHub", project["name"])
         webbrowser.open(url)
 
     def _recount(self, project):
-        project.pop("file_count", None)
+        for key in ("file_count", "unity_version", "backend"):
+            project.pop(key, None)
         self.refresh()
 
     def rename(self, project):
@@ -2286,6 +2789,9 @@ class MainWindow(QMainWindow):
         self.progress.setMaximumWidth(260)
         self.progress.hide()
         self.statusBar().addPermanentWidget(self.progress)
+        self.unity_label = QLabel()
+        self.unity_label.setStyleSheet("color: gray; padding: 0 6px;")
+        self.statusBar().addPermanentWidget(self.unity_label)
 
         self.console = None
         if log_handler is not None:
@@ -2310,6 +2816,7 @@ class MainWindow(QMainWindow):
         entry = self.loaded.pop(norm_path(path), None)
         if entry is None:
             return
+        entry["tex_finder"].stop()
         if self.env is entry["env"]:
             self._reset_viewer()
             self.placeholder.setText("This game was unloaded. Go back to Projects to open it again.")
@@ -2324,6 +2831,12 @@ class MainWindow(QMainWindow):
         self.home.refresh()
         self.pages.setCurrentWidget(self.home)
         self.setWindowTitle(APP_TITLE)
+        self.unity_label.clear()
+
+    def focus_search(self):
+        search = self.home.search if self.pages.currentWidget() is self.home else self.search
+        search.setFocus()
+        search.selectAll()
 
     def open_project(self, path):
         if self.thread is not None and self.thread.isRunning():
@@ -2331,8 +2844,12 @@ class MainWindow(QMainWindow):
             return
         project = self.store.get(path)
         name = project["name"] if project else os.path.basename(path)
-        self.setWindowTitle(f"{APP_SHORT} - {name}")
-        log.info("Opening game '%s'", name)
+        if project is not None and "unity_version" not in project:
+            self.store.update(path, **detect_unity_info(path))  # only reads a file header
+        info = unity_info_text(project) if project else ""
+        self.setWindowTitle(f"{APP_SHORT} - {name}" + (f"  ({info})" if info else ""))
+        self.unity_label.setText(info)
+        log.info("Opening game '%s'%s", name, f" ({info})" if info else "")
         self.load(path)
 
     def edit_current_notes(self):
@@ -2378,7 +2895,7 @@ class MainWindow(QMainWindow):
         add(a, "Open model in Blender", self.open_in_blender, "Ctrl+B")
         add(a, "Show UV layout", self.show_uv_layout, "Ctrl+U")
         a.addSeparator()
-        add(a, "Find (search box)", lambda: (self.search.setFocus(), self.search.selectAll()), "Ctrl+F")
+        add(a, "Find (search box)", self.focus_search, "Ctrl+F")
         add(a, "Set Blender location...", self.choose_blender)
 
         view = self.menuBar().addMenu("&View")
@@ -2451,6 +2968,8 @@ class MainWindow(QMainWindow):
         self.placeholder.setText("Loading...")
         self.loading_path = path
         self._update_notes_button()
+        if self.current_project() is None:
+            self.unity_label.clear()
         entry = self.loaded.get(norm_path(path))
         if entry is not None:
             log.info("Already loaded - reusing assets in memory for %s", path)
@@ -2477,6 +2996,7 @@ class MainWindow(QMainWindow):
         if entry is None or entry["env"] is not env:
             entry = {"env": env, "groups": groups, "files": file_count,
                      "tex_finder": TextureFinder(env), "thumbs": {}, "stats": {}, "favorites": set()}
+            entry["tex_finder"].start_background()
             self.loaded[key] = entry
         self.env = env
         self.tex_finder = entry["tex_finder"]
@@ -2527,6 +3047,13 @@ class MainWindow(QMainWindow):
         self.stats_worker.start(jobs)
 
         self.store.set_counts(self.loading_path, files=file_count, assets=total)
+        if project is not None and not project.get("unity_version"):
+            # Header check found nothing (old format / odd folder): ask the loaded files instead.
+            version = next((v for v in (getattr(f, "unity_version", "") for f in getattr(env, "assets", []))
+                            if v and UNITY_VERSION_RE.fullmatch(v.encode()) and not v.startswith("0.0")), "")
+            if version:
+                self.store.update(self.loading_path, unity_version=version)
+                self.unity_label.setText(unity_info_text(project))
         self.placeholder.setText("Pick something from the list on the left.")
         self.statusBar().showMessage(f"Loaded {total:,} assets from {file_count} file(s)")
         self.grid_dirty = True
@@ -2761,11 +3288,16 @@ class MainWindow(QMainWindow):
 
     def show_mesh(self, name, obj, mesh):
         poly = unity_mesh_to_polydata(mesh)
-        users, materials = [], []
-        try:
-            users, materials = self.tex_finder.info(obj)
-        except Exception:
-            pass
+        users, materials, n_users = [], [], 0
+        if not self.tex_finder.indexed:
+            # Still indexing in the background: show the bare model now, textures once it's done.
+            self.statusBar().showMessage("Finding materials and textures (first time for this game)...")
+            self._retry_when_indexed(self.current)
+        else:
+            try:
+                users, materials, n_users = self.tex_finder.info(obj)
+            except Exception:
+                log.exception("Finding the materials of '%s' failed", name)
         tex = None
         main_reader = TextureFinder.main_texture(materials)
         if main_reader is not None:
@@ -2792,13 +3324,27 @@ class MainWindow(QMainWindow):
         if getattr(obj, "container", None):
             rows.append(f"<b>Path:</b> {obj.container}")
         if users:
-            shown = ", ".join(sorted(set(users))[:8])
-            more = f" (+{len(set(users)) - 8} more)" if len(set(users)) > 8 else ""
-            rows.append(f"<b>Used by:</b> {shown}{more}")
+            names = sorted(set(users))
+            shown = ", ".join(names[:8]) + (", ..." if len(names) > 8 or n_users > len(users) else "")
+            rows.append(f"<b>Used by {n_users:,} object(s):</b> {shown}")
         if asset_id(obj) in self.favorites:
             rows.insert(0, "<span style='color:#f4c542'>\u2605 Favorite</span>")
         jobs = self.mesh_view.panel.set_info(name, "<br>".join(rows), materials, self.blank_big)
         self._request_icons(jobs, self.mesh_view.panel.set_icon)
+
+    def _retry_when_indexed(self, data):
+        finder = self.tex_finder
+
+        def check():
+            if self.current is not data or self.tex_finder is not finder:
+                return  # user moved on
+            if not finder.indexed:
+                QTimer.singleShot(250, check)
+                return
+            self.statusBar().clearMessage()
+            self.show_asset(data)
+
+        QTimer.singleShot(250, check)
 
     def show_texture(self, name, img, obj=None, asset=None):
         log.info("Texture '%s': %dx%d %s", name, img.width, img.height, img.mode)

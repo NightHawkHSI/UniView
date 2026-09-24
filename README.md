@@ -81,6 +81,8 @@ Unzip it and run `UniView.exe`. You don't need Python.
 **Projects page**
 - A box for each game. **Green** means its assets are already loaded; **red** means they aren't loaded yet. Each box shows file/asset counts and how well the game works with UniView.
 - **Drag and drop** a game folder onto the page to add it, or use **Find Unity games in Steam**.
+- **Unity version**: each box shows the game's Unity version (e.g. `2019.4.40f1`) and scripting backend (Mono or IL2CPP), read from the game files without loading them.
+- **Catalog your library**: tag games (right-click → Tags..., e.g. `lowpoly`, `fps`, `dead game`), then search, filter by tag, group by tag / Unity version / backend / compatibility / loaded, and sort by name, Unity version or asset count. The search box takes filters like `tag:lowpoly unity:2019 il2cpp`.
 - **Pin** favorite games to the top. The most recently opened games come next.
 - **Notes** for each game (right-click → Notes, or the Notes button in the viewer) for quirks and where the good stuff is.
 - **Progress bar** while a game loads, plus a **console**, `viewer.log` and `crash.log`.
@@ -142,7 +144,7 @@ Loaded games stay in memory so they reopen instantly. Right-click a game → **U
 
 ## Game compatibility list
 
-[`compat.json`](compat.json) is a community list of how well UniView works with each game (**works**, **partial** or **broken**, plus notes). UniView downloads the latest version at startup and shows it on each game's box. You can turn this off under **Help**.
+[`compat.json`](compat.json) is a community list of how well UniView works with each game (**works**, **partial** or **broken**, plus notes and the Unity version it was built with). UniView downloads the latest version at startup and shows it on each game's box. You can turn this off under **Help**.
 
 To add or update a game, right-click it in UniView → **Report compatibility...**. That opens a GitHub issue already filled in with the game's details. You can also send a pull request that edits `compat.json`. The key is the game's install folder name (e.g. `steamapps/common/Robocraft` → `"Robocraft"`).
 

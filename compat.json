@@ -5,6 +5,8 @@
     "Among Us": {
       "status": "works",
       "notes": "Mostly a 2D game: 143k sprites and 2.3k textures all load. The few 3D meshes have no linked textures.",
+      "unity": "2022.3.44f1",
+      "backend": "IL2CPP",
       "uniview": "1.1.0",
       "tested": {
         "files": 68,
@@ -17,7 +19,9 @@
     },
     "BattleBit Remastered": {
       "status": "works",
-      "notes": "Loads fully. Only about 1 in 4 models finds its texture automatically, so apply textures from the list by hand.",
+      "notes": "Loads fully. Since 1.2.0 about 7 in 10 models find their texture automatically (was 1 in 4); apply the rest from the list by hand.",
+      "unity": "2019.4.40f1",
+      "backend": "IL2CPP",
       "uniview": "1.1.0",
       "tested": {
         "files": 108,
@@ -31,6 +35,8 @@
     "Car Mechanic Simulator 2018": {
       "status": "works",
       "notes": "Loads fully and most models find their textures automatically. A few meshes are stripped (no vertex data).",
+      "unity": "2017.4.24f1",
+      "backend": "Mono",
       "uniview": "1.1.0",
       "tested": {
         "files": 103,
@@ -44,6 +50,8 @@
     "Fallout Shelter": {
       "status": "works",
       "notes": "Most models find their textures automatically. A few meshes are stripped (no vertex data).",
+      "unity": "6000.0.58f2",
+      "backend": "Mono",
       "uniview": "1.1.0",
       "tested": {
         "files": 49,
@@ -57,6 +65,8 @@
     "Mage Arena": {
       "status": "works",
       "notes": "Loads fully and most models find their textures. A few 'Font Texture' entries are empty (made while the game runs).",
+      "unity": "2023.2.22f1",
+      "backend": "Mono",
       "uniview": "1.1.0",
       "tested": {
         "files": 20,
@@ -70,6 +80,8 @@
     "Make Way": {
       "status": "works",
       "notes": "Everything loads. About half the models find their texture automatically.",
+      "unity": "2022.3.62f2",
+      "backend": "IL2CPP",
       "uniview": "1.1.0",
       "tested": {
         "files": 55,
@@ -83,6 +95,8 @@
     "Megabonk": {
       "status": "works",
       "notes": "Everything loads. About 40% of models find their texture automatically, and a few meshes are stripped.",
+      "unity": "2023.2.22f1",
+      "backend": "IL2CPP",
       "uniview": "1.1.0",
       "tested": {
         "files": 45,
@@ -96,6 +110,8 @@
     "Muck": {
       "status": "works",
       "notes": "Everything loads. Some models need their texture applied by hand, and a few meshes are only lines/points (skipped).",
+      "unity": "2019.4.19f1",
+      "backend": "Mono",
       "uniview": "1.1.0",
       "tested": {
         "files": 15,
@@ -109,6 +125,8 @@
     "PapersPlease": {
       "status": "works",
       "notes": "A 2D game: the textures and sprites are the interesting part. There are only 13 simple meshes.",
+      "unity": "2020.3.34f1",
+      "backend": "IL2CPP",
       "uniview": "1.1.0",
       "tested": {
         "files": 8,
@@ -122,6 +140,8 @@
     "Probably Stolen Playtest": {
       "status": "works",
       "notes": "Mostly 2D: about 2k sprites and 870 textures load fine.",
+      "unity": "2021.3.16f1",
+      "backend": "IL2CPP",
       "uniview": "1.1.0",
       "tested": {
         "files": 26,
@@ -135,6 +155,8 @@
     "Robocraft": {
       "status": "works",
       "notes": "Models, textures and sprites all load, and most models find their texture automatically. Textures keep mask data in alpha, so leave 'Texture alpha' off.",
+      "unity": "2017.4.9f1",
+      "backend": "Mono",
       "uniview": "1.1.0",
       "tested": {
         "files": 68,
@@ -148,6 +170,8 @@
     "Schedule I": {
       "status": "works",
       "notes": "Loads fully. About 40% of models find their texture automatically.",
+      "unity": "2022.3.62f2",
+      "backend": "IL2CPP",
       "uniview": "1.1.0",
       "tested": {
         "files": 22,
@@ -161,6 +185,8 @@
     "Trailmakers": {
       "status": "works",
       "notes": "Big game (447 files, about 33k models), so it takes around 2 minutes to load. A few sprites come from atlases built while the game runs and can't be shown.",
+      "unity": "2022.3.62f2",
+      "backend": "IL2CPP",
       "uniview": "1.1.0",
       "tested": {
         "files": 447,
@@ -174,6 +200,8 @@
     "Unturned": {
       "status": "works",
       "notes": "Everything loads and most models find their textures automatically.",
+      "unity": "2022.3.62f3",
+      "backend": "Mono",
       "uniview": "1.1.0",
       "tested": {
         "files": 93,
@@ -187,6 +215,8 @@
     "Valheim": {
       "status": "works",
       "notes": "645 files, loads in about a minute. Nearly all models find their textures automatically.",
+      "unity": "6000.0.61f1",
+      "backend": "Mono",
       "uniview": "1.1.0",
       "tested": {
         "files": 645,
