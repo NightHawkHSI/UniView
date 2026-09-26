@@ -15,9 +15,11 @@ viewer.log.*
 crash.log
 settings.json
 compat_cache.json
+cache/
 
 # Personal notes
 Bugs.txt
 
 # Old icon (a screenshot) kept locally
 Icon_old_screenshot.png
+tools/

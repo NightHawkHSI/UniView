@@ -2,9 +2,9 @@
 
 <img src="Icon.png" alt="UniView icon" width="128">
 
-# UniView - Unity Asset Viewer
+# UniView - Game Asset Viewer
 
-**Browse the 3D models, textures, sprites and text assets inside Unity games, including games that have shut down and can't be played anymore.**
+**Browse the 3D models, maps, textures, sprites, sounds, animations and text inside Unity, Source, Source 2, Unreal and Fallout 1/2 games, including games that have shut down and can't be played anymore. Any other game's loose files open too, and new engines can be added with plugins.**
 
 [![Views](https://hits.sh/github.com/NightHawkHSI/UniView.svg?label=views&color=4c1)](https://hits.sh/github.com/NightHawkHSI/UniView/)
 [![Downloads](https://img.shields.io/github/downloads/NightHawkHSI/UniView/total?label=downloads&color=blue)](https://github.com/NightHawkHSI/UniView/releases)
@@ -21,7 +21,7 @@
 
 Unzip it and run `UniView.exe`. You don't need Python.
 
-[Download](#download) · [Screenshots](#screenshots) · [Features](#features) · [How to use](#how-to-use) · [Compatibility](#game-compatibility-list) · [Build](#build) · [FAQ](#faq)
+[Download](#download) · [Screenshots](#screenshots) · [Engines](#supported-engines) · [Features](#features) · [How to use](#how-to-use) · [Plugins](#engine-plugins) · [Compatibility](#game-compatibility-list) · [Build](#build) · [FAQ](#faq)
 
 <img src="ScreenShots/UAV%20Main.png" alt="UniView projects page" width="850">
 
@@ -33,11 +33,11 @@ Unzip it and run `UniView.exe`. You don't need Python.
 
 | | |
 |---|---|
-| **What it opens** | Any Unity game folder: `.assets`, `level` files, AssetBundles, `.resS` streams |
-| **What it shows** | Meshes (3D), Texture2D, Sprites, TextAssets |
-| **What it exports** | Models as `.obj` + `.mtl` + `.png` or a single `.glb` (both open textured in Blender), textures as `.png`, text as `.txt` |
+| **What it opens** | Unity, Source, Source 2, Unreal and Fallout 1/2 game folders; loose files and zip archives of any game; any engine that has a [plugin](#engine-plugins) |
+| **What it shows** | Models and maps (3D), textures, sprites, sounds (built-in player), animations (played on their models), text files; everything else can be exported as-is |
+| **What it exports** | Models as `.obj` + `.mtl` + `.png` or a single `.glb` (both open textured in Blender), textures as `.png`, sounds as `.wav`/`.mp3`/`.ogg`, animations as JSON keyframes, text as-is |
 | **Game files** | Read only. UniView never changes anything |
-| **Tested with** | Robocraft, Muck, Valheim, Trailmakers and other Unity games on Steam |
+| **Tested with** | Robocraft, Muck, Valheim (Unity) · Team Fortress 2, Portal (Source) · CS2, Deadlock (Source 2) · Satisfactory, Headliners, Dead as Disco (Unreal) · Fallout 1 & 2 · Project Zomboid, Serious Sam 2 (loose files) |
 | **Built with** | [UnityPy](https://github.com/K0lb3/UnityPy) · [PySide6](https://doc.qt.io/qtforpython-6/) · [PyVista](https://pyvista.org/) |
 
 ## Download
@@ -58,6 +58,32 @@ Unzip it and run `UniView.exe`. You don't need Python.
 
 <img src="ScreenShots/UAV%20Game.png" alt="Game view with 3D model and info panel" width="850">
 
+## Supported engines
+
+Each game is read by an **engine plugin**. UniView picks the plugin automatically. To choose one yourself, right-click a game and use **Read with engine**.
+
+| Engine | Games (examples) | Models | Textures | Sound | Other |
+|---|---|---|---|---|---|
+| **Unity** | Valheim, Muck, Among Us, Robocraft | ✔ with materials | ✔ + sprites | ✔ AudioClips | ✔ text; animations play on their skinned models, export as JSON |
+| **Source** | TF2, HL2, Portal, CS:S, L4D2, GMod | ✔ `.mdl` with `.vmt` materials; ✔ **maps** (`.bsp`) with terrain and static props | ✔ `.vtf` | ✔ wav/mp3 | ✔ text |
+| **Source 2** | CS2, Dota 2, Deadlock, HL: Alyx | ✔ `.vmdl_c` with materials | ✔ `.vtex_c` | ✔ `.vsnd_c` | ✔ text |
+| **Unreal 4/5** | Satisfactory, Dead as Disco, Headliners | ✔ static + skeletal meshes, textures found through their materials | ✔ incl. virtual textures | ✔ Ogg/WAV SoundWaves, Wwise `.wem`, FMOD `.bank`* (not Bink Audio yet) | ✔ ini/json/csv...; raw export of the rest |
+| **Fallout 1/2** | Fallout, Fallout 2 | – | ✔ FRM sprites (whole animation strip), RIX images | ✔ ACM* | ✔ MSG text |
+| **Loose files & archives** | any other game (Project Zomboid, Serious Sam 2...) | ✔ `.obj`, DirectX `.x` | ✔ png/jpg/tga/dds/bmp... | ✔ wav/mp3/ogg, plus anything vgmstream* plays | ✔ text; files inside `.zip`/`.gro`/`.pk3` archives |
+
+\* Needs the free **vgmstream** decoder: **Help → Install sound decoder (vgmstream)** downloads it once (from its official GitHub releases) into `tools/` next to UniView.
+
+- **Textures per part**: models with several materials show each part with its own texture.
+- **Maps**: Source `.bsp` maps show the whole level with textures, terrain (displacements) and all static props; the 3D skybox is left out.
+- **Sounds** play in a built-in player (play/pause, seek, volume, autoplay) and save as `.wav`/`.mp3`/`.ogg`.
+- **Animations** (Unity): each clip lists the bones it moves; pick a model with a matching skeleton and press **Play on model** to watch it (play/pause and a time slider), or save the keyframes as JSON. Humanoid (muscle) clips can't be played yet.
+
+Unreal notes:
+- Both `.pak` files and IoStore containers (`.utoc`/`.ucas`) are read. Packages are sorted into models, textures and other files by the class stored in their headers. The first time a game opens, this takes a few seconds; the result is cached in `cache/`.
+- **Encrypted games** need the game's AES key: right-click the game → **Engine settings (Unreal)...** and paste it (one per line if there are several). Without it, UniView tells you which containers were skipped.
+- Oodle-compressed files work if an `oo2core_*_win64.dll` is found. Many games ship one, and UniView looks in the game's folder, next to `UniView.exe` and in your Steam libraries.
+- Models and textures are found by their data layout instead of the game's property schema, so no `.usmap` mappings file is needed. Nanite-only meshes and UE3 games (`.upk`) aren't supported.
+
 ## Features
 
 **Finding things**
@@ -71,6 +97,7 @@ Unzip it and run `UniView.exe`. You don't need Python.
 - Rotate, and zoom with the mouse wheel or +/−. Wireframe, edges, vertex colors and texture alpha can each be toggled on and off. The model's texture is found automatically.
 - **UV sets**: switch between UV0/UV1/... (UV1 is often the baked-lighting layout), and use **UV layout** to see the UVs drawn over the texture.
 - **Model panel**: vertex/triangle counts, the source file, the prefab path, what uses the model, and its materials and textures.
+- **Animation playback**: play Unity animation clips on their skinned models.
 - **Texture viewer**: zoom under the mouse, drag to pan, with a checkerboard background for transparency.
 
 **Export**
@@ -80,9 +107,9 @@ Unzip it and run `UniView.exe`. You don't need Python.
 
 **Projects page**
 - A box for each game. **Green** means its assets are already loaded; **red** means they aren't loaded yet. Each box shows file/asset counts and how well the game works with UniView.
-- **Drag and drop** a game folder onto the page to add it, or use **Find Unity games in Steam**.
-- **Unity version**: each box shows the game's Unity version (e.g. `2019.4.40f1`) and scripting backend (Mono or IL2CPP), read from the game files without loading them.
-- **Catalog your library**: tag games (right-click → Tags..., e.g. `lowpoly`, `fps`, `dead game`), then search, filter by tag, group by tag / Unity version / backend / compatibility / loaded, and sort by name, Unity version or asset count. The search box takes filters like `tag:lowpoly unity:2019 il2cpp`.
+- **Drag and drop** a game folder onto the page to add it, or use **Find games in Steam**, which lists every game an engine plugin recognizes.
+- **Engine and version**: each box shows the engine and what UniView can tell about it without loading the game, e.g. `Unity 2019.4.40f1 · IL2CPP`, `Source · tf, hl2`, `UE 4.26-5.2 · pak v11 · Oodle`.
+- **Catalog your library**: tag games (right-click → Tags..., e.g. `lowpoly`, `fps`, `dead game`), then search, filter by tag, group by tag / engine / engine version / compatibility / loaded, and sort by name, engine version or asset count. The search box takes filters like `tag:lowpoly engine:unity version:2019 il2cpp`.
 - **Pin** favorite games to the top. The most recently opened games come next.
 - **Notes** for each game (right-click → Notes, or the Notes button in the viewer) for quirks and where the good stuff is.
 - **Progress bar** while a game loads, plus a **console**, `viewer.log` and `crash.log`.
@@ -90,13 +117,25 @@ Unzip it and run `UniView.exe`. You don't need Python.
 ## How to use
 
 1. Start UniView. The **Projects** page opens.
-2. Click **Find Unity games in Steam**, or **＋ Add game** and pick a game's install folder (e.g. `...\steamapps\common\Robocraft`).
+2. Click **Find games in Steam**, or **＋ Add game** and pick a game's install folder (e.g. `...\steamapps\common\Robocraft`).
 3. Click a game's box to load it.
 4. Pick an asset in the list on the left:
    - **Model**: rotate it in 3D and check its textures in the right-hand panel. **Save model + textures** exports it.
    - **Texture**: zoom and pan it. **Save PNG** exports it.
+   - **Sound**: press Play (or turn on Autoplay). **Save sound...** exports it.
+   - **Animation**: pick a model and press **Play on model**.
 5. Search, sort and star assets (Ctrl+D). Switch to the grid (Ctrl+2) to flip through thumbnails. Right-click assets for more options. Use **File → Export …** for bulk export.
 6. **← Projects** takes you back. Right-click a game's box to rename it, unload it from memory, or remove it.
+
+## Engine plugins
+
+Is there a game UniView can't read? You can teach it a new engine without touching UniView's code:
+
+1. Copy `plugins/_template.py` (next to `UniView.exe`) to `plugins/my_engine.py`.
+2. Fill in how to recognize the game's folder and how to read its models and textures.
+3. Restart UniView. **Help → Engine plugins** shows what loaded.
+
+The template is already a working "loose files" plugin (images, text and `.obj` models), so you can start from something that runs. [**PLUGINS.md**](PLUGINS.md) explains the API: assets, mesh conventions, materials and the helpers for Valve VPK and Unreal pak archives. A plugin with the same id as a built-in one replaces it, so you can also fix or extend the built-in engines. Pull requests for new engines are welcome.
 
 ## Run from source
 

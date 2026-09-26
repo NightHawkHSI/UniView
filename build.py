@@ -1,4 +1,4 @@
-"""Build UniView - Unity Asset Viewer.
+"""Build UniView - Game Asset Viewer.
 
     py build.py            -> both outputs
     py build.py github     -> Builds/GitHub   : clean copy of the source, ready to push to a repo
@@ -30,6 +30,7 @@ UNITYPY_PACKAGES = [
 SOURCE_FILES = [
     "unity_viewer.py", "requirements.txt", "run.bat", "build.bat", "build.py",
     "Icon.png", "README.md", ".gitignore", "ScreenShots", "compat.json",
+    "engines", "plugins", "PLUGINS.md",
 ]
 
 
@@ -65,7 +66,7 @@ def build_github():
     for name in SOURCE_FILES:
         src = os.path.join(ROOT, name)
         if os.path.isdir(src):
-            shutil.copytree(src, os.path.join(dest, name))
+            shutil.copytree(src, os.path.join(dest, name), ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
             print(f"  copied {name}/")
         elif os.path.exists(src):
             shutil.copy2(src, os.path.join(dest, name))
@@ -121,6 +122,8 @@ def build_release(version, test_game=None):
         # (fmod.dll, archspec's CPU json, decoder binaries...). Missing any = crash on launch.
         *[arg for pkg in UNITYPY_PACKAGES for arg in ("--collect-all", pkg)],
         "--collect-submodules", "vtkmodules",
+        # Built-in engine plugins are imported by name at runtime, so list them explicitly.
+        "--paths", ROOT, "--collect-submodules", "engines",
         # The app uses PySide6; other Qt bindings on the machine would break the build.
         # IPython/jedi get dragged in by optional imports and just add size.
         *[arg for mod in ("PyQt5", "PyQt6", "PySide2", "IPython", "jedi", "parso")
@@ -140,6 +143,12 @@ def build_release(version, test_game=None):
     readme = os.path.join(ROOT, "README.md")
     if os.path.isfile(readme):
         shutil.copy2(readme, out_dir)
+    # User plugins live next to the exe: ship the template and the guide.
+    os.makedirs(os.path.join(out_dir, "plugins"), exist_ok=True)
+    for name, target in (("plugins/_template.py", "plugins/_template.py"), ("PLUGINS.md", "PLUGINS.md")):
+        src = os.path.join(ROOT, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(out_dir, target))
 
     step("Self-testing the packaged exe")
     exe = os.path.join(out_dir, f"{APP_NAME}.exe")
