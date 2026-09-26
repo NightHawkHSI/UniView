@@ -13,6 +13,7 @@ from .unity_skin import trs
 log = logging.getLogger("viewer.unity")
 
 MAX_TRIANGLES = 6_000_000
+TERRAIN_GRID = 257  # heightmap vertices per side for terrains inside scenes
 FLIP = np.diag([-1.0, 1.0, 1.0, 1.0])  # Unity is left-handed; UniView meshes are x-flipped
 SCENE_FILE = re.compile(r"^(level\d+|BuildPlayer-.*)$", re.I)
 
@@ -60,6 +61,7 @@ class SceneBuilder:
         self.triangles = 0
         self.objects = self.renderers = self.skipped = 0
         self.lod_skip = set()
+        self.terrains = 0
 
     def _mesh(self, key, reader):
         if key not in self.meshes:
@@ -95,27 +97,63 @@ class SceneBuilder:
         m = FLIP @ matrix @ FLIP
         rot, pos = m[:3, :3], m[:3, 3]
         mirrored = np.linalg.det(rot) < 0
-        pts = (md.points.astype(np.float64) @ rot.T + pos).astype(np.float32)
-        uv = next(iter(md.uvs.values()), None)
-        added = False
+        picked = []  # (triangles, material slot)
         for j, tris in enumerate(md.submeshes):
             slot = md.material_slots[j] if j < len(md.material_slots) else j
             if submesh_filter is not None:
                 if not submesh_filter[0] <= slot < submesh_filter[0] + submesh_filter[1]:
                     continue
                 slot -= submesh_filter[0]
-            if self.triangles + len(tris) > MAX_TRIANGLES:
-                return False
+            picked.append((tris, slot))
+        n_tris = sum(len(t) for t, _s in picked)
+        if not n_tris:
+            return True
+        if self.triangles + n_tris > MAX_TRIANGLES:
+            return False
+        points = md.points
+        uv = next(iter(md.uvs.values()), None)
+        if submesh_filter is not None:
+            # A static batch holds many objects' vertices: keep only this renderer's.
+            used = np.unique(np.concatenate([t for t, _s in picked]))
+            remap = np.zeros(len(points), np.int64)
+            remap[used] = np.arange(len(used))
+            points = points[used]
+            uv = uv[used] if uv is not None else None
+            picked = [(remap[t], s) for t, s in picked]
+        pts = (points.astype(np.float64) @ rot.T + pos).astype(np.float32)
+        for tris, slot in picked:
             self.subs.append((tris[:, ::-1] if mirrored else tris) + self.count)
             mat = materials[min(slot, len(materials) - 1)] if materials else None
             self.slots.append(mat if mat is not None else self._default_material())
-            self.triangles += len(tris)
-            added = True
-        if added:
-            self.points.append(pts)
-            self.uvs.append(uv if uv is not None else np.zeros((len(pts), 2), np.float32))
-            self.count += len(pts)
+        self.triangles += n_tris
+        self.points.append(pts)
+        self.uvs.append(uv if uv is not None else np.zeros((len(pts), 2), np.float32))
+        self.count += len(pts)
         return True
+
+    def _terrain(self, reader, matrix):
+        """A Terrain component: its heightmap mesh with the blended layers, at the object's position."""
+        try:
+            terrain = reader.read()
+            if not getattr(terrain, "m_Enabled", True):
+                return
+            found = _ptr_key(terrain.m_TerrainData)
+            if found is None:
+                return
+            md, material, _info, _res = self.session.terrain(found[1], grid=TERRAIN_GRID)
+        except Exception as e:
+            log.debug("Scene terrain: %s", e)
+            return
+        key = ("terrain",) + found[0]
+        if key not in self.material_index:
+            self.material_index[key] = len(self.material_list)
+            self.material_list.append(material)
+        # Terrains only move (Unity ignores their rotation and scale).
+        move = np.eye(4)
+        move[:3, 3] = matrix[:3, 3]
+        if self._add(md, move, [self.material_index[key]]):
+            self.renderers += 1
+            self.terrains += 1
 
     def _default_material(self):
         if None not in self.material_index:
@@ -152,6 +190,9 @@ class SceneBuilder:
                     except Exception:
                         pass
             for name, reader in comps:
+                if name == "Terrain":
+                    self._terrain(reader, matrix)
+                    continue
                 if name not in ("MeshRenderer", "SkinnedMeshRenderer"):
                     continue
                 if (id(reader.assets_file), reader.path_id) in self.lod_skip:
@@ -213,6 +254,8 @@ def build(session, roots, name):
     md, materials = builder.result(name)
     info = [("Objects", f"{builder.objects:,}"), ("Mesh renderers", f"{builder.renderers:,}"),
             ("Distinct meshes", f"{sum(1 for m in builder.meshes.values() if m is not None):,}")]
+    if builder.terrains:
+        info.append(("Terrains", f"{builder.terrains:,}"))
     if builder.skipped:
         info.append(("Skipped", f"{builder.skipped:,} lower-detail LOD renderers"))
     if builder.triangles >= MAX_TRIANGLES:

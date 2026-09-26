@@ -31,15 +31,18 @@ def _streamed_frames(words):
 
 
 def _bindings(tree):
-    """[(path hash, attribute, curve count, property name)] in curve order."""
+    """[(path hash, attribute, curve count, property name, is object curve, class id)] in curve order."""
     out = []
     for b in (tree.get("m_ClipBindingConstant") or {}).get("genericBindings") or []:
         attribute, type_id = b.get("attribute", 0), b.get("typeID", 0)
+        pptr = bool(b.get("isPPtrCurve"))
         if type_id == 4 and attribute in TRANSFORM_ATTRIBUTES:
             name, count = TRANSFORM_ATTRIBUTES[attribute]
+        elif pptr and type_id == 212:
+            name, count = "sprite", 1
         else:
             name, count = f"property {attribute} (class {type_id})", 1
-        out.append((b.get("path", 0), attribute, count, name))
+        out.append((b.get("path", 0), attribute, count, name, pptr, type_id))
     return out
 
 
@@ -55,9 +58,10 @@ def decode_clip(tree, path_names=None):
     n_streamed = streamed.get("curveCount", 0) or 0
     n_dense = dense.get("m_CurveCount", 0) or 0
     keys = {}  # curve index -> [(t, v)]
+    start = float(muscle.get("m_StartTime", 0.0) or 0.0)
     for time, frame_keys in _streamed_frames(streamed.get("data") or []):
         if not math.isfinite(time) or time < -1e30:
-            continue
+            time = start  # the first frame is stored at -infinity: the value at the start
         for index, value in frame_keys:
             keys.setdefault(index, []).append((round(time, 6), value))
     samples = np.asarray(dense.get("m_SampleArray") or [], dtype=np.float32)
@@ -74,12 +78,15 @@ def decode_clip(tree, path_names=None):
     curves = []
     index = 0
     component_names = {3: "xyz", 4: "xyzw"}
-    for path_hash, _attr, count, prop in _bindings(tree):
-        path = path_names.get(path_hash, f"#{path_hash:08x}")
+    for path_hash, _attr, count, prop, pptr, class_id in _bindings(tree):
+        path = path_names.get(path_hash, f"#{path_hash:08x}") if path_hash else ""
         for k in range(count):
             comp = component_names.get(count, "")[k] if count > 1 else ""
             if index in keys:
-                curves.append({"path": path, "property": prop, "component": comp, "keys": keys[index]})
+                curve = {"path": path, "property": prop, "component": comp, "keys": keys[index]}
+                if pptr:
+                    curve.update(object_curve=True, class_id=class_id)  # values index pptrCurveMapping
+                curves.append(curve)
             index += 1
     # Legacy clips keep readable curves directly.
     for field, prop in (("m_PositionCurves", "position"), ("m_RotationCurves", "rotation"),

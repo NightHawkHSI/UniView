@@ -282,6 +282,14 @@ class GameSession:
         """(bytes, extension) of a video the player can open (mp4, webm, mov, avi, mkv...)."""
         return self.raw(asset), (asset.ext or "mp4").lower()
 
+    def sprite_frames(self, asset):
+        """2D (flipbook) animation: ([(time, sprite/texture Asset)], length in seconds), or ([], 0)."""
+        return [], 0.0
+
+    def sprite_rects(self, asset):
+        """Sprites cut from a texture (sprite sheet): [(x, y, w, h)] in pixels, y measured from the BOTTOM."""
+        return []
+
     def animation_targets(self, asset):
         """Models an animation clip can play on, best match first ([Asset])."""
         return []

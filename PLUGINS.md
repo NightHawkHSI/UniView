@@ -66,6 +66,10 @@ leave out raises a clear "not supported" message in the viewer.
 * **`animation_targets(clip)` / `animate(model, clip)`**: for `animation` assets, list the models a clip fits,
   and return an object with `.length` and `.points_at(t)` giving the posed vertices (same order as `mesh(model)`).
   The viewer then plays the animation on the model.
+* **`sprite_frames(clip)`**: for 2D animations, `([(time, sprite Asset)], length)`. The viewer shows a
+  **Play sprite animation** button and flips through the sprites' images.
+* **`sprite_rects(texture)`**: `[(x, y, w, h)]` of the sprites cut from a sprite sheet (y measured from the
+  bottom, like Unity). The texture viewer outlines them.
 * **`materials_ready()`**: return `False` while a background index is still building. The viewer
   then shows the bare model and adds its textures once the index is ready.
 

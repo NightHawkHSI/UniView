@@ -514,6 +514,39 @@ class TextureFinder:
 
 # --------------------------------------------------------------------------- scripts (MonoBehaviour data)
 
+UNDER_READ = re.compile(r"Expected to read (\d+) bytes, but only read (\d+) bytes")
+
+
+def _aligned_nodes(gen):
+    """get_nodes_up for a TypeTreeGenerator, with MonoBehaviour's m_Enabled marked as 4-byte aligned.
+
+    The IL2CPP (AssetStudio) backend leaves the flag off, so every field after it was read 3 bytes
+    early. The C field reader copies nodes when first used, so they're rebuilt rather than patched.
+    """
+    from UnityPy.helpers.TypeTreeNode import TypeTreeNode
+    original = gen.get_nodes_up
+    cache = {}
+
+    def get_nodes_up(assembly, fullname):
+        key = (assembly, fullname)
+        if key not in cache:
+            root = original(assembly, fullname)
+            flat = []
+
+            def walk(node):
+                flag = node.m_MetaFlag or 0
+                if node.m_Level == 1 and node.m_Name == "m_Enabled" and node.m_Type == "UInt8":
+                    flag |= 0x4000
+                flat.append(TypeTreeNode(node.m_Level, node.m_Type, node.m_Name, 0, 0, m_MetaFlag=flag))
+                for child in node.m_Children or []:
+                    walk(child)
+
+            walk(root)
+            cache[key] = TypeTreeNode.from_list(flat)
+        return cache[key]
+    return get_nodes_up
+
+
 class ScriptReader:
     """Reads MonoBehaviour fields. Cooked games don't store script field layouts, so they're generated
     from the game's code (Managed/*.dll for Mono, GameAssembly.dll + metadata for IL2CPP) with
@@ -540,6 +573,7 @@ class ScriptReader:
             try:
                 gen = TypeTreeGenerator(version, backend)
                 gen.load_local_game(self.game_dir)
+                gen.get_nodes_up = _aligned_nodes(gen)
                 self.generators.append(gen)
             except Exception as e:
                 self.error = f"Couldn't load the game's code: {e}"
@@ -551,13 +585,33 @@ class ScriptReader:
         """(dict of fields, note)"""
         self._setup()
         previous = self.env.typetree_generator
+        best = None  # (bytes read, generator) of the layout that got furthest without overrunning
         try:
             for gen in self.generators:
                 self.env.typetree_generator = gen
                 try:
                     return obj.read_typetree(), ""
+                except Exception as e:
+                    m = UNDER_READ.search(str(e))
+                    if m and (best is None or int(m.group(2)) > best[0]):
+                        best = (int(m.group(2)), gen)
+            if best is not None:
+                # The generated layout ends before the data does: usually the registry of
+                # [SerializeReference] objects Unity appends at the end, which the generators leave out.
+                read, gen = best
+                self.env.typetree_generator = gen
+                try:
+                    tree = obj.read_typetree(check_read=False)
                 except Exception:
-                    continue
+                    tree = None
+                if tree is not None:
+                    tail = bytes(obj.get_raw_data())[read:]
+                    if len(tail) == 8 and tail[4:] == bytes(4) and tail[:4] in (b"\1\0\0\0", b"\2\0\0\0"):
+                        tree["references"] = {"version": tail[0], "RefIds": []}
+                        return tree, ""
+                    return tree, (f"The last {len(tail):,} bytes of this object couldn't be decoded (objects "
+                                  "stored by [SerializeReference], or fields the reader doesn't know); "
+                                  "every field above them is shown.")
         finally:
             self.env.typetree_generator = previous
         # Only the fields every MonoBehaviour has.
@@ -608,7 +662,9 @@ class UnitySession(GameSession):
         self._hierarchy_done = False
         self._scenes = {}
         self._script_reader = None
+        self._sheets = None
         self._skins = {}
+        self._terrains = {}
 
     def _asset_for(self, obj, type_name="Texture2D", name=None):
         """Asset for an ObjectReader (the listed one if we have it)."""
@@ -626,13 +682,67 @@ class UnitySession(GameSession):
     def close(self):
         self.finder.stop()
 
+    # ------------------------------------------------------------------ terrains
+
+    @staticmethod
+    def _is_terrain(asset):
+        return isinstance(asset.ref, dict) and asset.ref.get("type") in ("terrain", "terrain_tex")
+
+    def terrain(self, obj, grid=None):
+        """(MeshData, Material, info rows, heightmap resolution) of a TerrainData reader, cached."""
+        from . import unity_terrain
+        key = (obj_key(obj.assets_file, obj.path_id), grid)
+        if key not in self._terrains:
+            with self.lock:
+                tree = obj.read_typetree()
+            if grid:
+                old, unity_terrain.MAX_GRID = unity_terrain.MAX_GRID, grid
+            try:
+                md, size = unity_terrain.terrain_mesh(tree)
+            finally:
+                if grid:
+                    unity_terrain.MAX_GRID = old
+            name = tree.get("m_Name") or "Terrain"
+            md.name = name
+            tex = Asset("texture", f"{name} (blended terrain layers)", ("terrain_tex",) + key[0],
+                        uid=f"terrain_tex:{obj.assets_file.name}:{obj.path_id}", source=obj.assets_file.name,
+                        ref={"type": "terrain_tex", "obj": obj, "tree": tree, "size": size})
+            hm = tree["m_Heightmap"]
+            splat = tree.get("m_SplatDatabase") or {}
+            layers = len(splat.get("m_TerrainLayers") or splat.get("m_Splats") or [])
+            res = hm.get("m_Resolution") or hm.get("m_Width")
+            info = [("Heightmap", f"{res}\u00d7{res}"),
+                    ("Size", f"{size[0]:g} \u00d7 {size[1]:g} m, {hm['m_Scale']['y']:g} m high"),
+                    ("Terrain layers", str(layers))]
+            if splat.get("m_AlphaTextures") and layers:
+                material = Material(f"{name} layers", [TextureRef("_Splat", tex.name, tex, ALBEDO)])
+            else:  # never painted (or drawn by a custom material): plain ground color
+                material = Material(f"{name} layers", [], color=(0.42, 0.5, 0.3, 1.0))
+            self._terrains[key] = (md, material, info, res)
+        return self._terrains[key]
+
+    def _terrain_image(self, ref):
+        from .unity_terrain import terrain_texture
+        if "image" not in ref:
+            with self.lock:
+                ref["image"] = terrain_texture(self, ref["obj"], ref["tree"], ref["size"])
+        if ref["image"] is None:
+            raise ValueError("This terrain has no painted layers.")
+        return ref["image"]
+
     def image(self, asset):
+        if self._is_terrain(asset):
+            return self._terrain_image(asset.ref)
         if asset.kind == "font":
             from .sdk import font_preview
             return font_preview(self.raw(asset), asset.name)
         return asset_image(asset.ref.read())
 
     def mesh(self, asset):
+        if self._is_terrain(asset):
+            md = self.terrain(asset.ref["obj"])[0]
+            asset.ref["resolution"] = self.terrain(asset.ref["obj"])[3]
+            return md
         if asset.kind == "scene":
             return self._scene(asset)[0]
         return mesh_to_meshdata(asset.ref.read())
@@ -697,6 +807,8 @@ class UnitySession(GameSession):
         if asset.kind == "data":
             import json
             tree, note = self._data(asset)
+            with self.lock:
+                tree = self._label_refs(asset.ref, tree)
             header = f"{asset.name}   ({script_class(asset.ref) or 'script'})\n"
             if note:
                 header += f"\nNote: {note}\n"
@@ -706,6 +818,38 @@ class UnitySession(GameSession):
             return summary_text(self._clip(asset))
         script = asset.ref.read().m_Script
         return script.decode("utf-8", "replace") if isinstance(script, bytes) else script
+
+    def _label_refs(self, obj, tree):
+        """Copy of a data tree where object references also say what they point to."""
+        names = {}
+
+        def label(file_id, path_id):
+            key = (file_id, path_id)
+            if key not in names:
+                names[key] = None
+                try:
+                    target = self.finder._file(obj.assets_file, file_id)
+                    reader = target.objects.get(path_id) if target is not None else None
+                    if reader is not None:
+                        name = reader.peek_name() if reader.type.name != "MonoBehaviour" else (
+                            reader.peek_name() or script_class(reader))
+                        names[key] = f"{reader.type.name} '{name}'" if name else reader.type.name
+                except Exception:
+                    pass
+            return names[key]
+
+        def walk(value, depth=0):
+            if depth > 60:
+                return value
+            if isinstance(value, dict):
+                if set(value) == {"m_FileID", "m_PathID"} and value["m_PathID"]:
+                    target = label(value["m_FileID"], value["m_PathID"])
+                    return {**value, "points_to": target} if target else value
+                return {k: walk(v, depth + 1) for k, v in value.items()}
+            if isinstance(value, list):
+                return [walk(v, depth + 1) for v in value]
+            return value
+        return walk(tree)
 
     def _path_names(self):
         """CRC32 path hash -> transform path, from every Avatar's table (animations name bones by hash)."""
@@ -857,6 +1001,78 @@ class UnitySession(GameSession):
             raise ValueError("None of this animation's bones are in this model's skeleton.")
         return animator
 
+    # ---- sprites: sheets and flipbook animations
+    def _sprite_sheets(self):
+        """texture key -> [(sprite Asset, (x, y, w, h))] (y from the bottom), built on first use."""
+        if self._sheets is None:
+            sheets = {}
+            started = time.time()
+            with self.lock:
+                for a in self.assets:
+                    if a.kind != "sprite":
+                        continue
+                    try:
+                        tree = a.ref.read_typetree()
+                        rd = tree["m_RD"]
+                        tex = rd["texture"]
+                        if not tex.get("m_PathID"):
+                            continue
+                        target = self.finder._file(a.ref.assets_file, tex.get("m_FileID", 0))
+                        if target is None:
+                            continue
+                        r = rd.get("textureRect") or tree["m_Rect"]
+                        sheets.setdefault(obj_key(target, tex["m_PathID"]), []).append(
+                            (a, (r["x"], r["y"], r["width"], r["height"])))
+                    except Exception:
+                        continue
+            self._sheets = sheets
+            log.info("Indexed which textures %d sprites come from in %.1fs",
+                     sum(len(v) for v in sheets.values()), time.time() - started)
+        return self._sheets
+
+    def sprite_rects(self, asset):
+        if asset.kind != "texture":
+            return []
+        return [rect for _a, rect in self._sprite_sheets().get(asset.key, [])]
+
+    def sprite_frames(self, asset):
+        if asset.kind != "animation":
+            return [], 0.0
+        clip = self._clip(asset)
+        length = clip.get("length") or 0.0
+        with self.lock:
+            obj = asset.ref.read()
+            curves = [c for c in clip["curves"] if c.get("object_curve")]
+            if curves:
+                mapping = list(obj.m_ClipBindingConstant.pptrCurveMapping or [])
+                for curve in sorted(curves, key=lambda c: c.get("class_id") != 212):
+                    frames = []
+                    for t, v in curve["keys"]:
+                        i = int(round(v))
+                        if not 0 <= i < len(mapping) or not mapping[i].path_id:
+                            continue
+                        try:
+                            reader = mapping[i].deref()
+                        except Exception:
+                            continue
+                        if reader.type.name in ("Sprite", "Texture2D"):
+                            frames.append((t, self._asset_for(reader, reader.type.name)))
+                    if frames:
+                        return frames, max(length, frames[-1][0])
+            for pc in getattr(obj, "m_PPtrCurves", None) or []:  # legacy clips
+                if getattr(pc, "attribute", "") != "m_Sprite":
+                    continue
+                frames = []
+                for key in pc.curve:
+                    try:
+                        reader = key.value.deref()
+                        frames.append((key.time, self._asset_for(reader, reader.type.name)))
+                    except Exception:
+                        continue
+                if frames:
+                    return frames, max(length, frames[-1][0])
+        return [], 0.0
+
     def _clip(self, asset):
         from .unity_anim import decode_clip
         with self.lock:
@@ -903,6 +1119,13 @@ class UnitySession(GameSession):
         return bytes(data), "wav"
 
     def stats(self, asset):
+        if self._is_terrain(asset):
+            obj = asset.ref["obj"]
+            if asset.ref["type"] == "terrain_tex":
+                return {"size": 0, "info": "blended", "sort": 0}
+            res = int(asset.ref.get("resolution") or 0)
+            return {"size": obj.byte_size, "info": f"terrain {res}\u00d7{res}" if res else "terrain",
+                    "sort": res * res * 2}
         if asset.kind == "scene":
             n = len(asset.ref.get("transforms", [])) if asset.ref["type"] == "scene" else 0
             return {"size": asset.size, "info": f"{n:,} objects" if n else "prefab", "sort": n}
@@ -953,6 +1176,8 @@ class UnitySession(GameSession):
         return self.finder.info(asset.ref)
 
     def materials(self, asset):
+        if self._is_terrain(asset):
+            return [self.terrain(asset.ref["obj"])[1]]
         if asset.kind == "scene":
             return list(self._scene(asset)[1])
         _names, mats, _n = self._info(asset)
@@ -966,6 +1191,11 @@ class UnitySession(GameSession):
         return out
 
     def describe(self, asset):
+        if self._is_terrain(asset):
+            rows = [("File", asset.source)]
+            if asset.ref["type"] == "terrain":
+                rows += self.terrain(asset.ref["obj"])[2]
+            return rows
         if asset.kind == "scene":
             rows = [("File", asset.source)] + ([("Path", asset.path)] if asset.path else [])
             if asset.key in self._scenes:
@@ -986,6 +1216,8 @@ class UnitySession(GameSession):
         return rows
 
     def related(self, asset):
+        if self._is_terrain(asset):
+            return "", [], ""
         if asset.kind == "sprite":
             # A sprite is a piece of a texture (sprite sheet): link to it.
             links = []
@@ -1002,7 +1234,12 @@ class UnitySession(GameSession):
                 log.exception("Finding models that use %s failed", asset.name)
                 keys = set()
             links = sorted((self.by_key[k] for k in keys if k in self.by_key), key=lambda a: a.name.lower())
-            return (f"Used by {len(links)} model(s)", links,
+            sprites = [sa for sa, _r in self._sprite_sheets().get(asset.key, [])]
+            title = f"Used by {len(links)} model(s)"
+            if sprites:
+                title += f" · {len(sprites)} sprite(s) cut from this sheet"
+                links = links + sorted(sprites, key=lambda a: a.name.lower())[:1000]
+            return (title, links,
                     "No models found that use this texture (UI images and sprites often aren't on models).")
         return "", [], ""
 
@@ -1063,6 +1300,17 @@ class UnityPlugin(EnginePlugin):
         return {"text": "txt", "audio": "wav", "animation": "json", "data": "json"}.get(kind, "")
 
     MAX_PREFAB_SCAN = 200_000
+
+    @staticmethod
+    def _add_terrain(session, obj):
+        try:
+            name = obj.peek_name() or f"Terrain #{obj.path_id % 100000:05d}"
+        except Exception:
+            name = "Terrain"
+        key = ("terrain",) + obj_key(obj.assets_file, obj.path_id)
+        session.assets.append(Asset("model", f"Terrain: {name}", key, uid=f"terrain:{obj.assets_file.name}:{obj.path_id}",
+                                    size=obj.byte_size, path=getattr(obj, "container", None) or "",
+                                    source=obj.assets_file.name, ref={"type": "terrain", "obj": obj}))
 
     def _scenes_and_prefabs(self, env, session, transforms_by_file, prefab_containers, renderer_readers):
         """Add 'scene' assets: one per level file, one per prefab (bundle container or root object)."""
@@ -1190,6 +1438,9 @@ class UnityPlugin(EnginePlugin):
                 continue
             if type_name in ("MeshFilter", "SkinnedMeshRenderer"):
                 renderer_readers.append(obj)
+            if type_name == "TerrainData":
+                self._add_terrain(session, obj)
+                continue
             kind = TYPE_KINDS.get(type_name)
             if kind is None:
                 continue

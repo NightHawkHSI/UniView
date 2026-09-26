@@ -8,7 +8,7 @@ the right. Models render in 3D with their texture when the plugin can find it, t
 show as images.
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 APP_SHORT = "UniView"
 APP_TITLE = "UniView - Game Asset Viewer"
 
@@ -380,6 +380,7 @@ class StatsWorker(QObject):
                 except Exception as e:
                     log.debug("No stats for %s '%s': %s", asset.kind, asset.name, e)
                     batch.append((key, {"size": asset.size, "info": "?", "sort": -1}))
+                time.sleep(0)  # hand the GIL to the window thread if it's waiting (keeps the UI smooth)
             with self._cv:
                 if gen != self._gen:
                     continue  # a different game was opened meanwhile
@@ -1256,9 +1257,15 @@ class ImageView(QWidget):
         self.info = QLabel()
         save = QPushButton("Save PNG...")
         save.clicked.connect(self.save_requested)
+        self.outlines = QCheckBox("Sprite outlines")
+        self.outlines.setToolTip("Outline the sprites cut from this texture (sprite sheet)")
+        self.outlines.setChecked(True)
+        self.outlines.toggled.connect(lambda _on: self._refresh_pixmap())
+        self.outlines.hide()
+        self.rects = []
 
         bar = QHBoxLayout()
-        for w in (fit, actual, zoom_in, zoom_out, self.zoom_label):
+        for w in (fit, actual, zoom_in, zoom_out, self.zoom_label, self.outlines):
             bar.addWidget(w)
         bar.addStretch()
         bar.addWidget(self.info)
@@ -1317,13 +1324,32 @@ class ImageView(QWidget):
         if key is not None:
             self.goto_requested.emit(key)
 
-    def show_image(self, img, name=""):
+    def show_image(self, img, name="", rects=None, fit=True):
+        """rects: sprites cut from this image [(x, y from bottom, w, h)] - drawn as outlines."""
         self.image = img
-        pix = pil_to_pixmap(img)
+        self.rects = list(rects or [])
+        self.outlines.setVisible(bool(self.rects))
+        self._refresh_pixmap()
+        self.info.setText(f"{name}  {img.width}x{img.height}" + (f"  \u00b7 {len(self.rects)} sprites"
+                                                                 if self.rects else ""))
+        if fit:
+            QTimer.singleShot(0, self.fit)  # after the view has its final size
+
+    def _refresh_pixmap(self):
+        if self.image is None:
+            return
+        pix = pil_to_pixmap(self.image)
+        if self.rects and self.outlines.isChecked():
+            painter = QPainter(pix)
+            pen = QPen(QColor(0, 255, 140, 220))
+            pen.setWidth(max(1, round(max(self.image.size) / 1024)))
+            painter.setPen(pen)
+            h = self.image.height
+            for x, y, w, rh in self.rects:
+                painter.drawRect(QRectF(x, h - y - rh, w, rh))
+            painter.end()
         self.pix_item.setPixmap(pix)
-        self.scene.setSceneRect(pix.rect())
-        self.info.setText(f"{name}  {img.width}x{img.height}")
-        QTimer.singleShot(0, self.fit)  # after the view has its final size
+        self.scene.setSceneRect(QRectF(pix.rect()))
 
     def fit(self):
         self.view.resetTransform()
@@ -1578,6 +1604,7 @@ class AnimationView(QWidget):
     """An animation clip: its summary, and the models it can be played on."""
 
     play_requested = Signal(object)  # model Asset
+    flipbook_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1587,20 +1614,28 @@ class AnimationView(QWidget):
         self.targets.setMinimumWidth(320)
         self.play = QPushButton("\u25b6 Play on model")
         self.play.clicked.connect(self._play)
+        self.flipbook = QPushButton("\u25b6 Play sprite animation")
+        self.flipbook.clicked.connect(self.flipbook_requested)
+        self.flipbook.hide()
         self.note = QLabel()
         self.note.setStyleSheet("color: gray;")
         row = QHBoxLayout()
         row.addWidget(QLabel("Model:"))
         row.addWidget(self.targets, 1)
         row.addWidget(self.play)
+        row.addWidget(self.flipbook)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addLayout(row)
         lay.addWidget(self.note)
         lay.addWidget(self.text, 1)
 
-    def show_clip(self, text, targets, note=""):
+    def show_clip(self, text, targets, note="", flipbook=0):
         self.text.setPlainText(text)
+        self.flipbook.setVisible(bool(flipbook))
+        self.flipbook.setText(f"\u25b6 Play sprite animation ({flipbook} frames)")
+        if flipbook and not targets:
+            note = note or "A 2D sprite animation: press Play sprite animation to watch it."
         self.targets.clear()
         for model in targets:
             self.targets.addItem(model.name, model)
@@ -2967,6 +3002,10 @@ class MainWindow(QMainWindow):
         self.text_view = QPlainTextEdit(readOnly=True)
         self.anim_view = AnimationView()
         self.anim_view.play_requested.connect(self.play_animation)
+        self.anim_view.flipbook_requested.connect(self.play_flipbook)
+        self.flipbook_timer = QTimer(self, interval=15)
+        self.flipbook_timer.timeout.connect(self._flipbook_tick)
+        self._flipbook = None
         self.audio_view = AudioView(self.settings)
         self.video_view = VideoView(self.settings)
         self.video_view.save_requested.connect(lambda: self.current and self.export_item(self.current))
@@ -3517,6 +3556,7 @@ class MainWindow(QMainWindow):
         session = self.session
         self.audio_view.stop()
         self.video_view.stop()
+        self.flipbook_timer.stop()
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             with session.lock:
@@ -3555,7 +3595,12 @@ class MainWindow(QMainWindow):
                     except Exception:
                         log.exception("Finding models for animation '%s' failed", asset.name)
                         targets = []
-                    self.anim_view.show_clip(text, targets)
+                    try:
+                        frames, _length = session.sprite_frames(asset)
+                    except Exception:
+                        log.exception("Reading the sprite frames of '%s' failed", asset.name)
+                        frames = []
+                    self.anim_view.show_clip(text, targets, flipbook=len(frames))
                     self.stack.setCurrentWidget(self.anim_view)
                 elif asset.kind == "text":
                     text = session.text(asset)
@@ -3600,6 +3645,62 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Install sound decoder", f"Download failed: {e}")
         finally:
             QApplication.restoreOverrideCursor()
+
+    def play_flipbook(self):
+        """Play the current clip's sprite frames in the image view."""
+        clip, session = self.current, self.session
+        if clip is None or session is None:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            with session.lock:
+                frames, length = session.sprite_frames(clip)
+                cache = {}
+                images = []
+                for t, sprite in frames:
+                    if sprite.key not in cache:
+                        cache[sprite.key] = session.image(sprite)
+                    images.append((t, cache[sprite.key]))
+        except Exception as e:
+            log.exception("Playing the sprite animation '%s' failed", clip.name)
+            QMessageBox.warning(self, "Sprite animation", str(e))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not images:
+            return
+        # Frames have different sizes: pad them all to one canvas so the animation doesn't jump.
+        w = max(img.width for _t, img in images)
+        h = max(img.height for _t, img in images)
+        padded = []
+        for t, img in images:
+            canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            canvas.paste(img.convert("RGBA"), ((w - img.width) // 2, h - img.height))
+            padded.append((t, canvas))
+        step = length / len(padded) if length > 0 else 1 / 12
+        self._flipbook = {"frames": padded, "length": max(length, padded[-1][0] + step), "start": time.time(),
+                          "index": -1, "name": clip.name}
+        self.stack.setCurrentWidget(self.image_view)
+        self.image_view.set_links("Sprite animation", [], f"{len(padded)} frames, {self._flipbook['length']:.2f} s "
+                                                        "(select another asset to stop)")
+        self._flipbook_tick()
+        self.image_view.fit()
+        self.flipbook_timer.start()
+
+    def _flipbook_tick(self):
+        fb = self._flipbook
+        if fb is None or self.stack.currentWidget() is not self.image_view:
+            self.flipbook_timer.stop()
+            return
+        t = (time.time() - fb["start"]) % fb["length"]
+        index = 0
+        for i, (ft, _img) in enumerate(fb["frames"]):
+            if ft <= t:
+                index = i
+        if index != fb["index"]:
+            fb["index"] = index
+            self.image_view.show_image(fb["frames"][index][1],
+                                       f"{fb['name']}  frame {index + 1}/{len(fb['frames'])}", fit=False)
 
     def play_animation(self, model):
         """Show `model` and play the current animation clip on it."""
@@ -3716,7 +3817,12 @@ class MainWindow(QMainWindow):
     def show_texture(self, asset, img):
         name = asset.name
         log.info("Texture '%s': %dx%d %s", name, img.width, img.height, img.mode)
-        self.image_view.show_image(img, ("\u2605 " if asset.uid in self.favorites else "") + name)
+        try:
+            rects = self.session.sprite_rects(asset) if self.session is not None else []
+        except Exception:
+            log.exception("Finding the sprites of '%s' failed", name)
+            rects = []
+        self.image_view.show_image(img, ("\u2605 " if asset.uid in self.favorites else "") + name, rects)
         self.stack.setCurrentWidget(self.image_view)
         self.statusBar().showMessage(f"{name}  {img.width}x{img.height}")
         try:

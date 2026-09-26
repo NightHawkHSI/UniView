@@ -64,7 +64,7 @@ Each game is read by an **engine plugin**. UniView picks the plugin automaticall
 
 | Engine | Games (examples) | Models | Textures | Sound | Other |
 |---|---|---|---|---|---|
-| **Unity** | Valheim, Muck, Among Us, Robocraft, Megabonk | ✔ with materials and their colors; ✔ **scenes & prefabs** (every object placed) | ✔ + sprites | ✔ AudioClips | ✔ text; fonts (.ttf/.otf); videos; **scripts & data** (item stats, configs...); animations play on their skinned models |
+| **Unity** | Valheim, Muck, Among Us, Robocraft, Megabonk | ✔ with materials and their colors; ✔ **scenes & prefabs** (every object placed); ✔ **terrains** | ✔ + sprites, sprite sheets, 2D animations | ✔ AudioClips | ✔ text; fonts (.ttf/.otf); videos; **scripts & data** (item stats, configs...); animations play on their skinned models |
 | **Source** | TF2, HL2, Portal, CS:S, L4D2, GMod | ✔ `.mdl` with `.vmt` materials; ✔ **maps** (`.bsp`) with terrain and static props | ✔ `.vtf` | ✔ wav/mp3 | ✔ text |
 | **Source 2** | CS2, Dota 2, Deadlock, HL: Alyx | ✔ `.vmdl_c` with materials | ✔ `.vtex_c` | ✔ `.vsnd_c` | ✔ text |
 | **Unreal 4/5** | Satisfactory, Dead as Disco, Headliners | ✔ static + skeletal meshes, textures found through their materials | ✔ incl. virtual textures | ✔ Ogg/WAV SoundWaves, Wwise `.wem`, FMOD `.bank`* (not Bink Audio yet) | ✔ ini/json/csv...; raw export of the rest |
@@ -74,8 +74,10 @@ Each game is read by an **engine plugin**. UniView picks the plugin automaticall
 \* Needs the free **vgmstream** decoder: **Help → Install sound decoder (vgmstream)** downloads it once (from its official GitHub releases) into `tools/` next to UniView.
 
 - **Textures per part**: models with several materials show each part with its own texture. Materials without a texture show their color (and export it in GLB/OBJ); the info panel shows each material's color swatch, and hovering a material lists its shader values.
-- **Fonts, videos, scripts & data** (Unity): fonts preview as a sample sheet and save as `.ttf`/`.otf`; VideoClips play in a built-in video player; named MonoBehaviours / ScriptableObjects (item stats, loot tables, dialogue, configs) show every field as readable text and save as JSON. Script fields are read from the game's own code (Mono or IL2CPP); a few IL2CPP classes only show their common fields. Games that use Addressables (`StreamingAssets/aa`) load too, and models find textures stored in other bundles.
+- **Fonts, videos, scripts & data** (Unity): fonts preview as a sample sheet and save as `.ttf`/`.otf`; VideoClips play in a built-in video player; named MonoBehaviours / ScriptableObjects (item stats, loot tables, dialogue, configs) show every field as readable text and save as JSON. Script fields are read from the game's own code (Mono, or IL2CPP's `GameAssembly.dll` + `global-metadata.dat`), each asset is labeled with its class, and references to other objects say what they point to (e.g. `icon → Texture2D 'ItemBattery'`). Games that use Addressables (`StreamingAssets/aa`) load too, and models find textures stored in other bundles.
 - **Scenes & prefabs** (Unity): open a level or a prefab to see every object in place, with static batching, hidden objects and lower-detail LODs handled.
+- **Terrains** (Unity): terrain heightmaps show as 3D ground (listed as `Terrain: name`, and inside their scenes), painted with the terrain layers blended by their splat maps. Holes are cut out.
+- **Sprite sheets & 2D animations** (Unity): a texture outlines every sprite cut from it (toggle **Sprite outlines**) and lists them; a sprite animation clip plays frame by frame with **Play sprite animation**.
 - **Maps**: Source `.bsp` maps show the whole level with textures, terrain (displacements) and all static props; the 3D skybox is left out.
 - **Sounds** play in a built-in player (play/pause, seek, volume, autoplay) and save as `.wav`/`.mp3`/`.ogg`.
 - **Animations** (Unity): each clip lists the bones it moves; pick a model with a matching skeleton and press **Play on model** to watch it (play/pause and a time slider), or save the keyframes as JSON. Humanoid (muscle) clips can't be played yet.
