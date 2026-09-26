@@ -59,6 +59,8 @@ leave out raises a clear "not supported" message in the viewer.
   and the UI run on different threads, so your code doesn't need its own locking.
 * **`start_background()` / `close()`**: optional. `start_background()` can start indexing work
   after the game loads. `close()` should stop that work and close files when the game is unloaded.
+* **`video(asset)`**: `(bytes, extension)` of a video (mp4, webm, mov...). Default: the raw file.
+* Fonts use `image()` for their preview (see `engines.sdk.font_preview`) and `raw()` for the file.
 * **`audio(asset)`**: return `(bytes, extension)` in a format the player decodes (wav, mp3, ogg, flac, aac).
   By default the raw file is used when its extension is one of those.
 * **`animation_targets(clip)` / `animate(model, clip)`**: for `animation` assets, list the models a clip fits,
@@ -73,7 +75,7 @@ leave out raises a clear "not supported" message in the viewer.
 Asset(kind, name, key, uid=None, size=None, path="", source="", ref=None, ext="")
 ```
 
-* `kind` is one of `model`, `texture`, `sprite`, `animation`, `text`, `audio` or `file`. Use `file` for
+* `kind` is one of `model`, `scene` (many placed models), `texture`, `sprite`, `animation`, `font`, `video`, `data` (structured data shown as text), `text`, `audio` or `file`. Use `file` for
   anything that can only be exported as-is.
 * `key` is any hashable value that is unique within the game. `uid` is a string that stays the
   same between runs, because favorites are saved by it.

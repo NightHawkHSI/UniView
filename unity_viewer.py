@@ -8,7 +8,7 @@ the right. Models render in 3D with their texture when the plugin can find it, t
 show as images.
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 APP_SHORT = "UniView"
 APP_TITLE = "UniView - Game Asset Viewer"
 
@@ -59,7 +59,7 @@ from PIL import ImageDraw
 from pyvistaqt import QtInteractor
 
 import engines
-from engines.sdk import IMAGE_KINDS, KIND_LABELS, KINDS, NORMAL, THUMB_KINDS, Progress, main_texture
+from engines.sdk import IMAGE_KINDS, KIND_LABELS, KINDS, MODEL_KINDS, NORMAL, THUMB_KINDS, Progress, main_texture
 
 MAX_TEXT_CHARS = 200_000
 THUMB_SIZE = 40      # icon size in the list
@@ -524,6 +524,9 @@ def write_glb(session, md, materials, path):
     for mat in materials:
         entry = {"name": mat.name or "material", "doubleSided": True,
                  "pbrMetallicRoughness": {"metallicFactor": 0.0, "roughnessFactor": 1.0}}
+        if mat.color is not None:
+            entry["pbrMetallicRoughness"]["baseColorFactor"] = [min(1.0, max(0.0, float(c)))
+                                                                for c in (list(mat.color) + [1.0])[:4]]
         tex = mat.main_texture()
         if tex is not None:
             key = tex.asset.key
@@ -594,7 +597,8 @@ def write_obj(session, md, materials, path):
     for i, mat in enumerate(materials):
         mat_name = f"{safe_filename(mat.name or 'material')}_{i}"
         mat_names[id(mat)] = mat_name
-        mtl += [f"newmtl {mat_name}", "Kd 1 1 1"]
+        kd = " ".join(f"{min(1.0, max(0.0, c)):.4f}" for c in mat.color[:3]) if mat.color is not None else "1 1 1"
+        mtl += [f"newmtl {mat_name}", f"Kd {kd}"]
         have_diffuse = False
         for tex in mat.textures:
             png = f"{stem}_{safe_filename(tex.name)}.png"
@@ -844,6 +848,12 @@ class MeshInfoPanel(QWidget):
             self.textures.addItem(empty)
         for mat in materials:
             header = QListWidgetItem(f"Material: {mat.name or '(unnamed)'}")
+            if mat.color is not None:
+                swatch = QPixmap(16, 16)
+                swatch.fill(QColor.fromRgbF(*[min(1.0, max(0.0, c)) for c in mat.color[:3]]))
+                header.setIcon(QIcon(swatch))
+            if mat.properties:
+                header.setToolTip("\n".join(f"{k}: {v}" for k, v in mat.properties[:60]))
             header.setFlags(Qt.NoItemFlags)
             font = header.font()
             font.setBold(True)
@@ -1011,7 +1021,7 @@ class MeshView(QWidget):
     def set_uv_channel(self, name):
         if self.poly is None or name not in self.poly.point_data:
             return
-        for mesh in [self.poly] + [part for part, _img in self.parts]:
+        for mesh in [self.poly] + [part for part, *_ in self.parts]:
             mesh.active_texture_coordinates = mesh.point_data[name]
         self.redraw()
 
@@ -1024,7 +1034,7 @@ class MeshView(QWidget):
         self.anim_bar.show()
         self.anim_label.setToolTip(title)
         self.anim_play.setText("\u23f8 Pause")
-        for mesh in [self.poly] + [part for part, _img in self.parts]:
+        for mesh in [self.poly] + [part for part, *_ in self.parts]:
             for name in ("Normals", "Normals_"):
                 if mesh is not None and name in mesh.point_data:
                     mesh.point_data.remove(name)  # stale normals would freeze the lighting
@@ -1045,7 +1055,7 @@ class MeshView(QWidget):
         self.redraw()
 
     def _set_points(self, pts):
-        meshes = [(self.poly, pts)] + [(part, pts[used]) for (part, _img), used
+        meshes = [(self.poly, pts)] + [(part, pts[used]) for (part, *_), used
                                        in zip(self.parts, getattr(self, "_part_vertices", []))]
         for mesh, pts in meshes:
             mesh.points = pts
@@ -1089,7 +1099,7 @@ class MeshView(QWidget):
             self._anim_apply()
 
     def show_mesh(self, poly, texture_img, parts=None):
-        """parts: [(faces array (M, 3), texture image or None)] to texture each submesh on its own."""
+        """parts: [(faces array (M, 3), texture image or None, color or None)] - each submesh with its own look."""
         self.anim_timer.stop()
         self.animator = None
         self.anim_bar.hide()
@@ -1098,9 +1108,10 @@ class MeshView(QWidget):
         self.override = None
         self._textures = {}
         self.parts = []
-        if parts and len({id(img) for _f, img in parts if img is not None}) > 1:
+        looks = {(id(img) if img is not None else None, color) for _f, img, color in parts or []}
+        if parts and (len(looks) > 1 or any(color is not None and img is None for _f, img, color in parts)):
             self._part_vertices = []
-            for tris, img in parts:
+            for tris, img, color in parts:
                 # Each part keeps only its own vertices (big maps have hundreds of parts).
                 used, local = np.unique(tris, return_inverse=True)
                 faces = np.hstack([np.full((len(tris), 1), 3, dtype=np.int64),
@@ -1110,7 +1121,7 @@ class MeshView(QWidget):
                     part.point_data[key] = poly.point_data[key][used]
                 if poly.active_texture_coordinates is not None:
                     part.active_texture_coordinates = np.asarray(poly.active_texture_coordinates)[used]
-                self.parts.append((part, img))
+                self.parts.append((part, img, color))
                 self._part_vertices.append(used)
         with QSignalBlocker(self.uv_combo):
             self.uv_combo.clear()
@@ -1152,10 +1163,12 @@ class MeshView(QWidget):
         has_uv = self.poly.active_texture_coordinates is not None
         if self.use_tex.isChecked() and has_uv and self.parts and self.override is None:
             # Each part with its own material's texture.
-            for part, img in self.parts:
+            for part, img, color in self.parts:
                 part_kwargs = dict(kwargs)
                 if img is not None:
                     part_kwargs["texture"] = self._texture(img)
+                elif color is not None:
+                    part_kwargs["color"] = color[:3]
                 elif self.use_colors.isChecked() and "vertex_colors" in part.point_data:
                     part_kwargs.update(scalars="vertex_colors", rgba=True)
                 else:
@@ -1327,6 +1340,105 @@ class ImageView(QWidget):
         mode = Qt.SmoothTransformation if scale < 1 else Qt.FastTransformation
         self.pix_item.setTransformationMode(mode)
         self.zoom_label.setText(f"{scale * 100:.0f}%")
+
+
+class VideoView(QWidget):
+    """Video player: picture, play/pause, seek, volume, save."""
+
+    save_requested = Signal()
+
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+        from PySide6.QtMultimediaWidgets import QVideoWidget
+        self.settings = settings
+        self.player = QMediaPlayer(self)
+        self.output = QAudioOutput(self)
+        self.output.setVolume(settings.get("volume", 0.7))
+        self.player.setAudioOutput(self.output)
+        self.screen = QVideoWidget()
+        self.screen.setStyleSheet("background: black;")
+        self.player.setVideoOutput(self.screen)
+        self._file_index = 0
+
+        self.title = QLabel()
+        self.title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color: #e0a030;")
+        self.play_btn = QPushButton("\u25b6 Play")
+        self.play_btn.setMinimumWidth(110)
+        self.play_btn.clicked.connect(self.toggle)
+        stop = QPushButton("\u25a0 Stop")
+        stop.clicked.connect(self.player.stop)
+        self.seek = QSlider(Qt.Horizontal)
+        self.seek.sliderMoved.connect(self.player.setPosition)
+        self.time = QLabel("0:00 / 0:00")
+        self.loop = QCheckBox("Loop")
+        self.loop.setChecked(True)
+        save = QPushButton("Save video...")
+        save.clicked.connect(self.save_requested)
+        controls = QHBoxLayout()
+        for w in (self.play_btn, stop):
+            controls.addWidget(w)
+        controls.addWidget(self.seek, 1)
+        controls.addWidget(self.time)
+        controls.addWidget(self.loop)
+        controls.addWidget(save)
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.title)
+        lay.addWidget(self.screen, 1)
+        lay.addLayout(controls)
+        lay.addWidget(self.status)
+        self.player.positionChanged.connect(self._position)
+        self.player.durationChanged.connect(lambda ms: self.seek.setRange(0, ms))
+        self.player.playbackStateChanged.connect(self._state)
+        self.player.mediaStatusChanged.connect(self._media_status)
+        self.player.errorOccurred.connect(lambda _e, text: self.status.setText(f"Can't play this video: {text}"))
+
+    def _position(self, ms):
+        if not self.seek.isSliderDown():
+            self.seek.setValue(ms)
+        self.time.setText(f"{AudioView._fmt(ms)} / {AudioView._fmt(self.player.duration())}")
+
+    def _state(self, state):
+        from PySide6.QtMultimedia import QMediaPlayer
+        self.play_btn.setText("\u23f8 Pause" if state == QMediaPlayer.PlayingState else "\u25b6 Play")
+
+    def _media_status(self, status):
+        from PySide6.QtMultimedia import QMediaPlayer
+        if status == QMediaPlayer.EndOfMedia and self.loop.isChecked():
+            self.player.setPosition(0)
+            self.player.play()
+
+    def toggle(self):
+        from PySide6.QtMultimedia import QMediaPlayer
+        if self.player.playbackState() == QMediaPlayer.PlayingState:
+            self.player.pause()
+        else:
+            self.player.play()
+
+    def stop(self):
+        self.player.stop()
+        self.player.setSource(QUrl())
+
+    def load(self, name, data, ext):
+        self.stop()
+        folder = os.path.join(tempfile.gettempdir(), APP_SHORT)
+        os.makedirs(folder, exist_ok=True)
+        self._file_index ^= 1
+        path = os.path.join(folder, f"video_{self._file_index}.{ext}")
+        with open(path, "wb") as f:
+            f.write(data)
+        self.title.setText(f"{name}   ({ext.upper()}, {fmt_size(len(data))})")
+        self.status.setText("")
+        self.player.setSource(QUrl.fromLocalFile(path))
+        self.player.play()
+
+    def show_error(self, name, message):
+        self.stop()
+        self.title.setText(name)
+        self.status.setText(f"{message}\n\nSave video... still exports the file as it is stored in the game.")
 
 
 class AudioView(QWidget):
@@ -2856,6 +2968,8 @@ class MainWindow(QMainWindow):
         self.anim_view = AnimationView()
         self.anim_view.play_requested.connect(self.play_animation)
         self.audio_view = AudioView(self.settings)
+        self.video_view = VideoView(self.settings)
+        self.video_view.save_requested.connect(lambda: self.current and self.export_item(self.current))
         self.audio_view.save_requested.connect(lambda: self.current and self.export_item(self.current))
 
         self.placeholder = QLabel("Loading...", alignment=Qt.AlignCenter)
@@ -2871,7 +2985,7 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         for w in (self.placeholder_page, self.mesh_view, self.image_view, self.text_view, self.audio_view,
-                  self.anim_view):
+                  self.anim_view, self.video_view):
             self.stack.addWidget(w)
 
         self.viewer = QSplitter()
@@ -3128,7 +3242,11 @@ class MainWindow(QMainWindow):
         project = self.current_project()
         self.favorites = set(project.get("favorites", [])) if project else entry["favorites"]
         file_icon = self.style().standardIcon(QStyle.SP_FileIcon)
-        audio_icon = self.style().standardIcon(QStyle.SP_MediaVolume)
+        kind_icons = {"audio": self.style().standardIcon(QStyle.SP_MediaVolume),
+                      "video": self.style().standardIcon(QStyle.SP_MediaPlay),
+                      "font": self.style().standardIcon(QStyle.SP_FileDialogDetailedView),
+                      "data": self.style().standardIcon(QStyle.SP_FileDialogInfoView),
+                      "animation": self.style().standardIcon(QStyle.SP_BrowserReload)}
 
         by_kind = {}
         for asset in session.assets:
@@ -3150,7 +3268,7 @@ class MainWindow(QMainWindow):
                 child.setData(0, SORT_ROLE, asset.name.lower())
                 child.setData(2, SORT_ROLE, asset.size if asset.size is not None else -1)
                 child.setIcon(0, self.thumb_cache.get(asset.key, self.blank) if kind in THUMB_KINDS else
-                              audio_icon if kind == "audio" else file_icon)
+                              kind_icons.get(kind, file_icon))
                 if asset.uid in self.favorites:
                     self._mark_favorite(child, True)
                 stats = self.stats.get(asset.key)
@@ -3398,10 +3516,11 @@ class MainWindow(QMainWindow):
         self.current = asset
         session = self.session
         self.audio_view.stop()
+        self.video_view.stop()
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             with session.lock:
-                if asset.kind == "model":
+                if asset.kind in MODEL_KINDS:
                     self.show_mesh(asset)
                 elif asset.kind in IMAGE_KINDS:
                     self.show_texture(asset, session.image(asset))
@@ -3415,6 +3534,20 @@ class MainWindow(QMainWindow):
                         if not isinstance(e, NotImplementedError):
                             log.exception("Couldn't decode the sound '%s'", asset.name)
                         self.audio_view.show_error(asset.name, str(e), rows)
+                elif asset.kind == "font":
+                    self.show_texture(asset, session.image(asset))
+                elif asset.kind == "video":
+                    self.stack.setCurrentWidget(self.video_view)
+                    try:
+                        data, ext = session.video(asset)
+                        self.video_view.load(asset.name, data, ext)
+                    except Exception as e:
+                        if not isinstance(e, (ValueError, NotImplementedError)):
+                            log.exception("Couldn't read the video '%s'", asset.name)
+                        self.video_view.show_error(asset.name, str(e))
+                elif asset.kind == "data":
+                    self.text_view.setPlainText(session.text(asset)[:MAX_TEXT_CHARS])
+                    self.stack.setCurrentWidget(self.text_view)
                 elif asset.kind == "animation":
                     text = session.text(asset)
                     try:
@@ -3436,6 +3569,11 @@ class MainWindow(QMainWindow):
                         f"{asset.name}\n\n" + "\n".join(rows) + f"\nSize: {fmt_size(asset.size)}\n\n"
                         "No preview for this kind of file. Right-click \u2192 Save... exports it as-is.")
                     self.stack.setCurrentWidget(self.text_view)
+        except (ValueError, NotImplementedError) as e:
+            # Expected cases (nothing visible, unsupported format...): a plain message is enough.
+            log.info("No preview for %s '%s': %s", asset.kind, asset.name, e)
+            self.stack.setCurrentWidget(self.text_view)
+            self.text_view.setPlainText(f"{asset.name}\n\n{e}")
         except Exception as e:
             log.exception("Could not preview %s '%s'", asset.kind, asset.name)
             self.stack.setCurrentWidget(self.text_view)
@@ -3504,13 +3642,16 @@ class MainWindow(QMainWindow):
         else:
             materials = self._materials(asset)
         # Group the submeshes by the texture they show: one drawn part per texture.
-        groups = {}  # texture key (None = untextured) -> (texture Asset, [triangle arrays])
-        if materials and len(md.submeshes) > 1:
+        groups = {}  # (texture key, color) -> (texture Asset, color, [triangle arrays])
+        if materials:
             for j, tris in enumerate(md.submeshes):
                 mat = material_for(materials, md, j)
                 main = mat.main_texture() if mat is not None else None
-                key = main.asset.key if main is not None else None
-                groups.setdefault(key, (main.asset if main is not None else None, []))[1].append(tris)
+                color = mat.color if (mat is not None and main is None and mat.color is not None) else None
+                if color is not None:
+                    color = tuple(min(1.0, max(0.0, c)) for c in color[:3])
+                key = (main.asset.key if main is not None else None, color)
+                groups.setdefault(key, (main.asset if main is not None else None, color, []))[2].append(tris)
         # Big scenes (maps) use hundreds of textures: show them smaller to keep memory in check.
         max_side = 256 if len(groups) > 32 else 1024
         images = {}  # texture asset key -> display image (or None if it failed)
@@ -3531,8 +3672,8 @@ class MainWindow(QMainWindow):
             return images[tex_asset.key]
 
         tex = image_of(display_texture(md, materials))
-        parts = [(np.concatenate(tris_list) if len(tris_list) > 1 else tris_list[0], image_of(tex_asset))
-                 for tex_asset, tris_list in groups.values()]
+        parts = [(np.concatenate(tris_list) if len(tris_list) > 1 else tris_list[0], image_of(tex_asset), color)
+                 for tex_asset, color, tris_list in groups.values()]
         self.stack.setCurrentWidget(self.mesh_view)
         self.mesh_view.show_mesh(poly, tex, parts)
         n_tex = sum(len(m.textures) for m in materials)
@@ -3674,7 +3815,7 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         if data.kind in IMAGE_KINDS and self.mesh_view.poly is not None:
             menu.addAction("Apply as texture to current model", lambda: self.apply_texture(data))
-        if data.kind == "model":
+        if data.kind in MODEL_KINDS:
             menu.addAction("Open in Blender", lambda: self.open_in_blender(data))
         fav = all(d.uid in self.favorites for d in selected)
         menu.addAction(("Remove from favorites" if fav else "Add to favorites") + "   Ctrl+D",
@@ -3706,7 +3847,7 @@ class MainWindow(QMainWindow):
 
     def open_in_blender(self, data=None):
         data = data or self.current
-        if not data or data.kind != "model":
+        if not data or data.kind not in MODEL_KINDS:
             QMessageBox.information(self, "Open in Blender", "Select a model first.")
             return
         blender = find_blender(self.settings.get("blender_path"))
@@ -3748,7 +3889,7 @@ class MainWindow(QMainWindow):
             self.export_item(datas[0])
 
     def export_selected_mesh(self):
-        if self.current and self.current.kind == "model":
+        if self.current and self.current.kind in MODEL_KINDS:
             self.export_item(self.current)
 
     def save_shown_image(self):
@@ -3768,7 +3909,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def export_ext(asset, model_format="obj"):
-        if asset.kind == "model":
+        if asset.kind in MODEL_KINDS:
             return model_format
         if asset.kind in IMAGE_KINDS:
             return "png"
@@ -3777,7 +3918,7 @@ class MainWindow(QMainWindow):
         return asset.ext or ("txt" if asset.kind == "text" else "bin")
 
     def export_item(self, asset):
-        if asset.kind == "model":
+        if asset.kind in MODEL_KINDS:
             filters = "Wavefront OBJ + textures (*.obj);;glTF binary, textures inside (*.glb)"
         elif asset.kind in IMAGE_KINDS:
             filters = "PNG image (*.png)"
@@ -3789,7 +3930,7 @@ class MainWindow(QMainWindow):
         path, chosen = self.ask_save_path(f"{base}.{ext}", filters)
         if not path:
             return
-        if asset.kind == "model" and not path.lower().endswith((".obj", ".glb")):
+        if asset.kind in MODEL_KINDS and not path.lower().endswith((".obj", ".glb")):
             path += ".glb" if "glb" in chosen else ".obj"
         try:
             written = self.write_asset(asset, path)
@@ -3804,7 +3945,7 @@ class MainWindow(QMainWindow):
         """Save one asset to `path` (.obj/.glb for models); returns the list of files written."""
         session = self.session
         with session.lock:
-            if asset.kind == "model":
+            if asset.kind in MODEL_KINDS:
                 md = session.mesh(asset)
                 materials = self._materials(asset)  # waits for background indexing if needed
                 if path.lower().endswith(".glb"):
@@ -3853,7 +3994,7 @@ class MainWindow(QMainWindow):
         if not items:
             QMessageBox.information(self, "Export", "Nothing to export.")
             return
-        dlg = ExportDialog(len(items), any(a.kind == "model" for a in items), self.settings, self)
+        dlg = ExportDialog(len(items), any(a.kind in MODEL_KINDS for a in items), self.settings, self)
         if dlg.exec():
             folder, model_format, keep = dlg.values()
             self._export_to_folder(items, folder, model_format, keep)

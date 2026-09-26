@@ -16,7 +16,8 @@ from .sdk import (
 log = logging.getLogger("viewer.unity")
 
 TYPE_KINDS = {"Mesh": "model", "Texture2D": "texture", "Sprite": "sprite", "TextAsset": "text", "AudioClip": "audio",
-              "AnimationClip": "animation"}
+              "AnimationClip": "animation",
+              "Font": "font", "VideoClip": "video", "MonoBehaviour": "data"}
 ALBEDO_PROPS = ("_MainTex", "_BaseMap", "_BaseColorMap", "_Albedo", "_BaseColorTexture")
 NORMAL_PROPS = ("_BumpMap", "_NormalMap")
 
@@ -237,6 +238,58 @@ def obj_key(assets_file, path_id):
     return (id(assets_file), path_id)
 
 
+# --------------------------------------------------------------------------- materials
+
+COLOR_PROPS = ("_Color", "_BaseColor", "_MainColor", "_TintColor", "_Albedo", "_BaseColorFactor")
+
+
+def _prop_name(prop):
+    return getattr(prop, "name", prop) if not isinstance(prop, str) else prop
+
+
+def read_material(mat):
+    """A parsed Material -> {"name", "textures": [(property, texture name, ObjectReader)], "color", "properties"}."""
+    saved = mat.m_SavedProperties
+    textures = []
+    for prop, tex_env in saved.m_TexEnvs:
+        prop = _prop_name(prop)
+        tptr = tex_env.m_Texture
+        if not tptr.path_id:
+            continue
+        try:
+            reader = tptr.deref()
+            if reader.type.name != "Texture2D":
+                continue
+            textures.append((prop, reader.peek_name() or prop, reader))
+        except Exception:
+            continue
+    textures.sort(key=lambda t: t[0] not in ALBEDO_PROPS)
+    colors, properties = {}, []
+    for prop, c in getattr(saved, "m_Colors", None) or []:
+        prop = _prop_name(prop)
+        try:
+            rgba = (float(c.r), float(c.g), float(c.b), float(c.a))
+        except AttributeError:
+            continue
+        colors[prop] = rgba
+        properties.append((prop, "#%02x%02x%02x  alpha %.2f" % tuple(
+            [int(max(0, min(1, v)) * 255) for v in rgba[:3]] + [rgba[3]])))
+    for prop, value in getattr(saved, "m_Floats", None) or []:
+        try:
+            properties.append((_prop_name(prop), f"{float(value):.3g}"))
+        except (TypeError, ValueError):
+            continue
+    color = next((colors[p] for p in COLOR_PROPS if p in colors), None)
+    shader = ""
+    try:
+        shader = mat.m_Shader.deref().peek_name() or ""
+    except Exception:
+        pass
+    if shader:
+        properties.insert(0, ("Shader", shader))
+    return {"name": mat.m_Name, "textures": textures, "color": color, "properties": properties}
+
+
 # --------------------------------------------------------------------------- material index
 
 class TextureFinder:
@@ -430,25 +483,9 @@ class TextureFinder:
             materials = []
             for ptr in self._material_ptrs(key):
                 try:
-                    mat = ptr.deref_parse_as_object()
-                    tex_envs = mat.m_SavedProperties.m_TexEnvs
+                    materials.append(read_material(ptr.deref_parse_as_object()))
                 except Exception:
                     continue
-                textures = []
-                for prop, tex_env in tex_envs:
-                    prop = getattr(prop, "name", prop)
-                    tptr = tex_env.m_Texture
-                    if tptr.path_id == 0:
-                        continue
-                    try:
-                        reader = tptr.deref()
-                        if reader.type.name != "Texture2D":
-                            continue
-                        textures.append((prop, reader.peek_name() or prop, reader))
-                    except Exception:
-                        continue
-                textures.sort(key=lambda t: t[0] not in ALBEDO_PROPS)
-                materials.append({"name": mat.m_Name, "textures": textures})
             return names, materials, len(gos) + len(skinned)
 
     def texture_users(self, tex_obj):
@@ -474,6 +511,89 @@ class TextureFinder:
         return keys
 
 
+
+# --------------------------------------------------------------------------- scripts (MonoBehaviour data)
+
+class ScriptReader:
+    """Reads MonoBehaviour fields. Cooked games don't store script field layouts, so they're generated
+    from the game's code (Managed/*.dll for Mono, GameAssembly.dll + metadata for IL2CPP) with
+    TypeTreeGeneratorAPI, trying a second backend when the first fails for a class."""
+
+    def __init__(self, env, game_dir):
+        self.env = env
+        self.game_dir = game_dir
+        self.generators = None
+        self.error = ""
+
+    def _setup(self):
+        if self.generators is not None:
+            return
+        self.generators = []
+        try:
+            from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
+        except ImportError:
+            self.error = "Install TypeTreeGeneratorAPI to read script fields (py -m pip install TypeTreeGeneratorAPI)."
+            return
+        version = next((f.unity_version for f in getattr(self.env, "assets", []) if getattr(f, "unity_version", "")), "")
+        il2cpp = os.path.isfile(os.path.join(self.game_dir, "GameAssembly.dll"))
+        for backend in (("AssetStudio", "AssetsTools") if il2cpp else ("AssetsTools", "AssetStudio")):
+            try:
+                gen = TypeTreeGenerator(version, backend)
+                gen.load_local_game(self.game_dir)
+                self.generators.append(gen)
+            except Exception as e:
+                self.error = f"Couldn't load the game's code: {e}"
+        if self.generators:
+            log.info("Script field layouts from the game's %s code (%s)", "IL2CPP" if il2cpp else "Mono",
+                     ", ".join(type(g).__name__ for g in self.generators))
+
+    def read(self, obj):
+        """(dict of fields, note)"""
+        self._setup()
+        previous = self.env.typetree_generator
+        try:
+            for gen in self.generators:
+                self.env.typetree_generator = gen
+                try:
+                    return obj.read_typetree(), ""
+                except Exception:
+                    continue
+        finally:
+            self.env.typetree_generator = previous
+        # Only the fields every MonoBehaviour has.
+        try:
+            tree = obj.read_typetree(check_read=False)
+        except Exception:
+            tree = {}
+        note = self.error or "This script's own fields couldn't be decoded (its class uses features the field " \
+                             "reader doesn't support yet); showing the common fields only."
+        return tree, note
+
+
+def script_class(obj):
+    """'Namespace.ClassName' of a MonoBehaviour's script, or ''."""
+    try:
+        script = obj.read(check_read=False).m_Script.read()
+        ns, cls = getattr(script, "m_Namespace", ""), getattr(script, "m_ClassName", "")
+        return f"{ns}.{cls}" if ns else cls
+    except Exception:
+        return ""
+
+
+def json_safe(value):
+    """typetree values -> JSON-friendly (bytes shortened)."""
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        data = bytes(value)
+        return f"<{len(data)} bytes>" if len(data) > 64 else data.hex()
+    if isinstance(value, float) and value != value:
+        return "NaN"
+    return value
+
+
 # --------------------------------------------------------------------------- session
 
 class UnitySession(GameSession):
@@ -486,6 +606,8 @@ class UnitySession(GameSession):
         self._paths = None
         self._transforms = None
         self._hierarchy_done = False
+        self._scenes = {}
+        self._script_reader = None
         self._skins = {}
 
     def _asset_for(self, obj, type_name="Texture2D", name=None):
@@ -505,12 +627,66 @@ class UnitySession(GameSession):
         self.finder.stop()
 
     def image(self, asset):
+        if asset.kind == "font":
+            from .sdk import font_preview
+            return font_preview(self.raw(asset), asset.name)
         return asset_image(asset.ref.read())
 
     def mesh(self, asset):
+        if asset.kind == "scene":
+            return self._scene(asset)[0]
         return mesh_to_meshdata(asset.ref.read())
 
+    def _scene_roots(self, asset):
+        """Root Transform readers of a scene or prefab asset."""
+        ref = asset.ref
+        if ref["type"] == "scene":
+            roots = []
+            for t in ref["transforms"]:
+                try:
+                    if not t.read().m_Father.path_id:
+                        roots.append(t)
+                except Exception:
+                    continue
+            return roots
+        if ref["type"] == "root":
+            return [ref["transform"]]
+        # A prefab bundle entry: find its root GameObject's transform.
+        gos = ref["gameobjects"]
+        base = os.path.splitext(os.path.basename(asset.path))[0].lower()
+        go = next((g for g in gos if (g.peek_name() or "").lower() == base), gos[0])
+        from .unity_scene import _components
+        transform = next((r for n, r in _components(go.read()) if n in ("Transform", "RectTransform")), None)
+        if transform is None:
+            raise ValueError("This prefab has no transform.")
+        for _ in range(200):
+            father = transform.read().m_Father
+            if not father.path_id:
+                break
+            transform = father.deref()
+        return [transform]
+
+    def _scene(self, asset):
+        """(MeshData, materials, info rows) of a scene/prefab, cached (the last few)."""
+        from .unity_scene import build
+        if asset.key not in self._scenes:
+            with self.lock:
+                result = build(self, self._scene_roots(asset), asset.name.split(": ", 1)[-1])
+            self._scenes[asset.key] = result
+            while len(self._scenes) > 3:
+                self._scenes.pop(next(iter(self._scenes)))
+        return self._scenes[asset.key]
+
     def raw(self, asset):
+        if asset.kind == "font":
+            with self.lock:
+                return bytes(asset.ref.read().m_FontData)
+        if asset.kind == "video":
+            return self.video(asset)[0]
+        if asset.kind == "data":
+            import json
+            tree, _note = self._data(asset)
+            return json.dumps(tree, indent=2, ensure_ascii=False).encode("utf-8")
         if asset.kind == "animation":
             import json
             return json.dumps(self._clip(asset), indent=1).encode("utf-8")
@@ -518,6 +694,13 @@ class UnitySession(GameSession):
         return script.encode("utf-8", "surrogateescape") if isinstance(script, str) else bytes(script)
 
     def text(self, asset):
+        if asset.kind == "data":
+            import json
+            tree, note = self._data(asset)
+            header = f"{asset.name}   ({script_class(asset.ref) or 'script'})\n"
+            if note:
+                header += f"\nNote: {note}\n"
+            return header + "\n" + json.dumps(tree, indent=2, ensure_ascii=False)
         if asset.kind == "animation":
             from .unity_anim import summary_text
             return summary_text(self._clip(asset))
@@ -687,6 +870,30 @@ class UnitySession(GameSession):
                 names.setdefault(h, path)
         return decode_clip(tree, names)
 
+    def _scripts(self):
+        if self._script_reader is None:
+            game_dir = self.path if os.path.isdir(self.path) else os.path.dirname(self.path)
+            if not os.path.isfile(os.path.join(game_dir, "GameAssembly.dll")) and not any(
+                    n.endswith("_Data") for n in os.listdir(game_dir)):
+                game_dir = os.path.dirname(game_dir)  # opened the _Data folder itself
+            self._script_reader = ScriptReader(self.env, game_dir)
+        return self._script_reader
+
+    def _data(self, asset):
+        with self.lock:
+            tree, note = self._scripts().read(asset.ref)
+        return json_safe(tree), note
+
+    def video(self, asset):
+        from UnityPy.helpers.ResourceReader import get_resource_data
+        with self.lock:
+            tree = asset.ref.read_typetree()
+            res = tree.get("m_ExternalResources") or {}
+            if not res.get("m_Size"):
+                raise ValueError("This VideoClip has no video data in the game files.")
+            data = get_resource_data(res["m_Source"], asset.ref.assets_file, res["m_Offset"], res["m_Size"])
+        return bytes(data), asset.ext or "mp4"
+
     def audio(self, asset):
         clip = asset.ref.read()
         samples = clip.samples  # UnityPy converts through FMOD to WAV
@@ -696,8 +903,17 @@ class UnitySession(GameSession):
         return bytes(data), "wav"
 
     def stats(self, asset):
+        if asset.kind == "scene":
+            n = len(asset.ref.get("transforms", [])) if asset.ref["type"] == "scene" else 0
+            return {"size": asset.size, "info": f"{n:,} objects" if n else "prefab", "sort": n}
         obj = asset.ref
         stats = {"size": obj.byte_size}
+        if asset.kind == "data":
+            with self.lock:
+                cls = script_class(obj)
+            return {"size": obj.byte_size, "info": cls.rsplit(".", 1)[-1], "sort": obj.byte_size}
+        if asset.kind in ("font", "video"):
+            return {"size": obj.byte_size, "info": asset.ext.upper(), "sort": obj.byte_size}
         if asset.kind == "animation":
             tree = obj.read_typetree()
             muscle = tree.get("m_MuscleClip") or {}
@@ -737,6 +953,8 @@ class UnitySession(GameSession):
         return self.finder.info(asset.ref)
 
     def materials(self, asset):
+        if asset.kind == "scene":
+            return list(self._scene(asset)[1])
         _names, mats, _n = self._info(asset)
         out = []
         for mat in mats:
@@ -744,10 +962,15 @@ class UnitySession(GameSession):
             for prop, tex_name, reader in mat["textures"]:
                 role = ALBEDO if prop in ALBEDO_PROPS else NORMAL if prop in NORMAL_PROPS else OTHER
                 refs.append(TextureRef(prop, tex_name, self._asset_for(reader, "Texture2D", tex_name), role))
-            out.append(Material(mat["name"], refs))
+            out.append(Material(mat["name"], refs, color=mat.get("color"), properties=mat.get("properties")))
         return out
 
     def describe(self, asset):
+        if asset.kind == "scene":
+            rows = [("File", asset.source)] + ([("Path", asset.path)] if asset.path else [])
+            if asset.key in self._scenes:
+                rows += self._scenes[asset.key][2]
+            return rows
         rows = [("File", asset.source)]
         if asset.path:
             rows.append(("Path", asset.path))
@@ -823,6 +1046,111 @@ class UnityPlugin(EnginePlugin):
     def short_version(self, info):
         return unity_branch(info.get("engine_version"))
 
+    @staticmethod
+    def _ext(kind, obj):
+        if kind == "font":
+            try:
+                data = obj.read().m_FontData
+                return "otf" if bytes(data[:4]) == b"OTTO" else "ttf"
+            except Exception:
+                return "ttf"
+        if kind == "video":
+            try:
+                path = obj.read_typetree().get("m_OriginalPath", "")
+                return os.path.splitext(path)[1].lstrip(".").lower() or "mp4"
+            except Exception:
+                return "mp4"
+        return {"text": "txt", "audio": "wav", "animation": "json", "data": "json"}.get(kind, "")
+
+    MAX_PREFAB_SCAN = 200_000
+
+    def _scenes_and_prefabs(self, env, session, transforms_by_file, prefab_containers, renderer_readers):
+        """Add 'scene' assets: one per level file, one per prefab (bundle container or root object)."""
+        from .unity_scene import is_scene_file, scene_name
+        scene_paths = []
+        for obj in env.objects:
+            if obj.type.name == "BuildSettings":
+                try:
+                    tree = obj.read_typetree()
+                    scene_paths = tree.get("scenes") or tree.get("m_Scenes") or []
+                except Exception:
+                    pass
+                break
+        added = 0
+        for file_id, (assets_file, transforms) in transforms_by_file.items():
+            if not is_scene_file(assets_file):
+                continue
+            name = scene_name(assets_file, scene_paths)
+            key = ("scene", file_id)
+            session.assets.append(Asset("scene", f"Scene: {name}", key, uid=f"scene:{assets_file.name}",
+                                        size=sum(t.byte_size for t in transforms), path="", source=assets_file.name,
+                                        ref={"type": "scene", "transforms": transforms}))
+            added += 1
+        # Only prefabs with something to see (skip audio/logic/UI prefabs): a MeshFilter or
+        # SkinnedMeshRenderer inside the same bundle entry.
+        visible = {getattr(r, "container", None) for r in renderer_readers}
+        for container, gos in prefab_containers.items():
+            if container not in visible:
+                continue
+            label = container[7:] if container.lower().startswith("assets/") else container
+            label = label[:-7] if label.lower().endswith(".prefab") else label
+            session.assets.append(Asset("scene", f"Prefab: {label}", ("prefab", container), uid=f"prefab:{container}",
+                                        size=None, path=container, source=gos[0].assets_file.name,
+                                        ref={"type": "prefab", "gameobjects": gos}))
+            added += 1
+        if not prefab_containers:
+            added += self._classic_prefabs(session, transforms_by_file, renderer_readers)
+        log.info("Found %d scene(s)/prefab(s)", added)
+
+    def _classic_prefabs(self, session, transforms_by_file, renderer_readers):
+        """Builds without bundles: root objects outside the scene files that have a mesh under them."""
+        from .unity_scene import is_scene_file
+        files = [(f, ts) for f, ts in transforms_by_file.values() if not is_scene_file(f)]
+        if sum(len(ts) for _f, ts in files) > self.MAX_PREFAB_SCAN:
+            log.info("Too many objects to look for prefabs without bundles - skipped")
+            return 0
+        father, go_of, node = {}, {}, {}
+        for _f, ts in files:
+            for t in ts:
+                try:
+                    tr = t.read()
+                    k = obj_key(t.assets_file, t.path_id)
+                    node[k] = t
+                    fp = tr.m_Father
+                    father[k] = obj_key(fp.deref().assets_file, fp.path_id) if fp.path_id else None
+                    go = tr.m_GameObject
+                    go_of[obj_key(go.deref().assets_file, go.path_id)] = k
+                except Exception:
+                    continue
+        roots = set()
+        for r in renderer_readers:
+            if is_scene_file(r.assets_file):
+                continue
+            try:
+                go = r.read().m_GameObject
+                k = go_of.get(obj_key(go.deref().assets_file, go.path_id))
+            except Exception:
+                continue
+            for _ in range(200):
+                if k is None:
+                    break
+                if father.get(k) is None:
+                    roots.add(k)
+                    break
+                k = father[k]
+        added = 0
+        for k in roots:
+            t = node[k]
+            try:
+                name = t.read().m_GameObject.deref().peek_name() or "prefab"
+            except Exception:
+                name = "prefab"
+            session.assets.append(Asset("scene", f"Prefab: {name}", ("root", k[1], id(t.assets_file)),
+                                        uid=f"prefab:{t.assets_file.name}:{t.path_id}", size=None, path="",
+                                        source=t.assets_file.name, ref={"type": "root", "transform": t}))
+            added += 1
+        return added
+
     def open(self, path, progress):
         import UnityPy
         started = time.time()
@@ -846,8 +1174,22 @@ class UnityPlugin(EnginePlugin):
                 log.warning("Could not load %s: %s: %s", rel, type(e).__name__, e)
         progress("Indexing objects ...")
         session = UnitySession(self, path, env, len(files))
+        transforms_by_file = {}   # id(assets file) -> (assets file, [Transform readers])
+        prefab_containers = {}    # container path -> [GameObject readers]
+        renderer_readers = []     # MeshFilter / SkinnedMeshRenderer (to find prefab roots in classic builds)
         for i, obj in enumerate(env.objects):
             type_name = obj.type.name
+            if type_name in ("Transform", "RectTransform"):
+                entry = transforms_by_file.setdefault(id(obj.assets_file), (obj.assets_file, []))
+                entry[1].append(obj)
+                continue
+            if type_name == "GameObject":
+                container = getattr(obj, "container", None)
+                if container and container.lower().endswith(".prefab"):
+                    prefab_containers.setdefault(container, []).append(obj)
+                continue
+            if type_name in ("MeshFilter", "SkinnedMeshRenderer"):
+                renderer_readers.append(obj)
             kind = TYPE_KINDS.get(type_name)
             if kind is None:
                 continue
@@ -855,6 +1197,14 @@ class UnityPlugin(EnginePlugin):
                 name = obj.peek_name()
             except Exception:
                 name = None
+            if kind == "data" and not name:
+                continue  # only named MonoBehaviours: data assets (ScriptableObjects), not components
+            if kind == "font":
+                try:
+                    if not obj.read().m_FontData:
+                        continue  # a reference to a built-in/OS font: nothing to show or export
+                except Exception:
+                    continue
             container = getattr(obj, "container", None)
             if not name:
                 # Unnamed (common for combined/prefab meshes): name it after where it lives.
@@ -863,11 +1213,16 @@ class UnityPlugin(EnginePlugin):
             key = obj_key(obj.assets_file, obj.path_id)
             asset = Asset(kind, name, key, uid=f"{obj.assets_file.name}:{obj.path_id}", size=obj.byte_size,
                           path=container or "", source=obj.assets_file.name, ref=obj,
-                          ext={"text": "txt", "audio": "wav", "animation": "json"}.get(kind, ""))
+                          ext=self._ext(kind, obj))
             session.assets.append(asset)
             session.by_key[key] = asset
             if i % 2000 == 0:
                 progress(f"Indexing objects ... {i}")
+        try:
+            progress("Finding scenes and prefabs ...")
+            self._scenes_and_prefabs(env, session, transforms_by_file, prefab_containers, renderer_readers)
+        except Exception:
+            log.exception("Listing scenes and prefabs failed")
         if failed:
             session.warnings.append(f"{failed} file(s) could not be loaded (see the console).")
         version = next((v for v in (getattr(f, "unity_version", "") for f in getattr(env, "assets", []))

@@ -135,6 +135,9 @@ class GenericSession(GameSession):
             return f.read()
 
     def image(self, asset):
+        if asset.kind == "font":
+            from .sdk import font_preview
+            return font_preview(self.raw(asset), asset.name)
         return pil_image_from_bytes(self.raw(asset))
 
     def text(self, asset):

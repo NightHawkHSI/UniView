@@ -4,3 +4,4 @@ pyvista
 pyvistaqt
 numpy
 Pillow
+TypeTreeGeneratorAPI

@@ -31,17 +31,22 @@ import numpy as np
 API_VERSION = 1
 
 # Asset kinds the app knows how to show. Anything else should be "file" (raw export only).
-KINDS = ("model", "texture", "sprite", "animation", "text", "audio", "file")
+KINDS = ("model", "scene", "texture", "sprite", "animation", "font", "video", "data", "text", "audio", "file")
 KIND_LABELS = {
     "model": "Models",
+    "scene": "Scenes & prefabs",
     "texture": "Textures",
     "sprite": "Sprites",
     "animation": "Animations",
+    "font": "Fonts",
+    "video": "Videos",
+    "data": "Scripts & data",
     "text": "Text",
     "audio": "Audio",
     "file": "Other files",
 }
 IMAGE_KINDS = ("texture", "sprite")
+MODEL_KINDS = ("model", "scene")  # shown in 3D (a scene/prefab is many placed models)
 THUMB_KINDS = ("model", "texture", "sprite")
 
 # Texture roles in a material (used to pick the texture shown on a model / exported as base color).
@@ -156,11 +161,17 @@ class TextureRef:
 
 
 class Material:
-    """name + textures (albedo first is nice: the first albedo texture goes on the model)."""
+    """name + textures (albedo first is nice: the first albedo texture goes on the model).
 
-    def __init__(self, name, textures=()):
+    color: main color (r, g, b, a) in 0..1 - shown when there's no texture, and multiplied with the
+    texture in GLB exports. properties: [(name, value text)] shown in the info panel.
+    """
+
+    def __init__(self, name, textures=(), color=None, properties=None):
         self.name = name
         self.textures = list(textures)
+        self.color = tuple(color) if color is not None else None
+        self.properties = list(properties or [])
 
     def main_texture(self):
         for t in self.textures:
@@ -266,6 +277,10 @@ class GameSession:
     def related(self, asset):
         """Links shown under a texture: (title, [Asset], text when empty). E.g. models that use it."""
         return "", [], ""
+
+    def video(self, asset):
+        """(bytes, extension) of a video the player can open (mp4, webm, mov, avi, mkv...)."""
+        return self.raw(asset), (asset.ext or "mp4").lower()
 
     def animation_targets(self, asset):
         """Models an animation clip can play on, best match first ([Asset])."""
@@ -446,6 +461,8 @@ TEXT_EXTS = {
 IMAGE_EXTS = {"png", "jpg", "jpeg", "bmp", "tga", "dds", "gif", "webp", "tif", "tiff"}
 AUDIO_EXTS = {"wav", "mp3", "ogg", "flac", "opus", "m4a", "aac", "wem", "bnk", "bank", "fsb", "xwb", "vsnd_c"}
 PLAYABLE_AUDIO = {"wav", "mp3", "ogg", "flac", "opus", "m4a", "aac"}  # what the built-in player decodes
+VIDEO_EXTS = {"mp4", "webm", "mov", "avi", "mkv", "ogv", "m4v", "wmv", "bk2", "bik", "usm"}
+FONT_EXTS = {"ttf", "otf", "ttc"}
 
 
 def kind_for_extension(ext):
@@ -457,6 +474,10 @@ def kind_for_extension(ext):
         return "texture"
     if ext in AUDIO_EXTS:
         return "audio"
+    if ext in VIDEO_EXTS:
+        return "video"
+    if ext in FONT_EXTS:
+        return "font"
     return "file"
 
 
@@ -466,4 +487,27 @@ def pil_image_from_bytes(data):
     from PIL import Image
     img = Image.open(io.BytesIO(data))
     img.load()
+    return img
+
+
+def font_preview(data, name=""):
+    """A sample sheet rendered with a font (TTF/OTF bytes)."""
+    import io
+    if not data:
+        raise ValueError("This font has no font file inside - it points to a built-in or system font.")
+    from PIL import Image, ImageDraw, ImageFont
+    lines = ((52, name or "Font"), (38, "The quick brown fox jumps over the lazy dog"),
+             (30, "ABCDEFGHIJKLMNOPQRSTUVWXYZ"), (30, "abcdefghijklmnopqrstuvwxyz"),
+             (30, "0123456789  !?&@#$%*()[]{}<>+-=/"), (22, "Grumpy wizards make toxic brew for the jumping queen."),
+             (16, "Pack my box with five dozen liquor jugs."))
+    img = Image.new("RGBA", (1100, 40 + sum(int(size * 1.4) for size, _t in lines)), (250, 250, 250, 255))
+    draw = ImageDraw.Draw(img)
+    y = 16
+    for size, text in lines:
+        try:
+            font = ImageFont.truetype(io.BytesIO(data), size)
+        except OSError as e:
+            raise ValueError(f"This font can't be rendered: {e}")
+        draw.text((20, y), text, font=font, fill=(25, 25, 25, 255))
+        y += int(size * 1.4)
     return img
