@@ -239,3 +239,75 @@ def test_builder_json_fields_match_the_cs_classes():
     assert set(desc["nodes"][0]) <= fields
     cs_desc = re.search(r"public class Description\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
     assert set(desc) <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_desc))
+
+
+# ---------------------------------------------------------------------------- scenes
+
+class SceneSession(Session):
+    """A scene: a lit, statically batched 2-object level, one object hidden, plus a terrain."""
+
+    def __init__(self, assets):
+        super().__init__(assets)
+        self.red, self.blue = Material("red", color=(1, 0, 0, 1)), Material("blue", color=(0, 0, 1, 1))
+
+    def mesh(self, a):
+        if a.uid == "combined":  # 3 submeshes: one per batched renderer
+            pts = [[i, 0, 0] for i in range(9)]
+            return MeshData(pts, [[[0, 1, 2]], [[3, 4, 5]], [[6, 7, 8]]])
+        return super().mesh(a)
+
+    def hierarchy(self, asset):
+        base = {"rot": [0, 0, 0, 1], "scale": [1, 1, 1], "mesh": None, "skinned": False, "renderer_enabled": True,
+                "pos": [0, 0, 0]}
+        return [
+            {**base, "name": "Level", "parent": -1, "active": True},
+            {**base, "name": "Wall", "parent": 0, "active": True,
+             "batch": {"mesh": "combined", "first": 0, "count": 1, "materials": [self.red]}},
+            {**base, "name": "Floor", "parent": 0, "active": True,
+             "batch": {"mesh": "combined", "first": 1, "count": 1, "materials": [self.blue]}},
+            {**base, "name": "Hidden", "parent": 0, "active": False,
+             "batch": {"mesh": "combined", "first": 2, "count": 1, "materials": [self.red]}},
+            {**base, "name": "Sun", "parent": -1, "active": True,
+             "light": {"type": 1, "color": [1, 0.9, 0.8, 1], "intensity": 1.2, "range": 10, "spot_angle": 30}},
+            {**base, "name": "Ground", "parent": -1, "active": True, "terrain": "terrain:level0:5"},
+        ]
+
+
+def test_visible_nodes():
+    nodes = [{"parent": -1, "active": True}, {"parent": 0, "active": False}, {"parent": 1, "active": True},
+             {"parent": 0, "active": True}]
+    assert up.visible_nodes(nodes) == [True, False, False, True]
+
+
+def test_plan_scenes(tmp_path):
+    assets = [Asset("scene", "Scene: Main", ("scene", 1), source="level0"),
+              Asset("scene", "Scene: Main", ("scene", 2), source="level1"),
+              Asset("scene", "Prefab: Boat", ("root", 1, 2), source="x")]
+    rel = [os.path.relpath(p, tmp_path).replace("\\", "/") for _a, p in up.plan_scenes(assets, str(tmp_path))]
+    assert rel == ["Scenes/Main.unity", "Scenes/Main_2.unity"]
+
+
+def test_export_scene_with_static_batches_lights_and_terrain(tmp_path):
+    combined = Asset("model", "Combined Mesh (root: scene) 1", "cm", uid="combined", source="level0")
+    terrain = Asset("model", "Terrain: Ground", "tr", uid="terrain:level0:5", source="level0")
+    scene = Asset("scene", "Scene: Main", ("scene", 1), uid="scene:level0", source="level0")
+    root = tmp_path / "proj"
+    written, failed, _ = up.export_unity_project(SceneSession([combined, terrain, scene]), str(root), "6000.5.4f1",
+                                                 editor_exe=fake_editor(tmp_path))
+    assert failed == 0
+    desc = json.load(open(root / "Assets" / "UniView" / "Build" / "Scenes" / "Main.unity.json"))
+    assert desc["kind"] == "scene" and desc["target"] == "Assets/Scenes/Main.unity"
+    nodes = {n["name"]: n for n in desc["nodes"]}
+    assert nodes["Wall"]["model"] == "" and nodes["Floor"]["model"] == ""  # drawn by the batch instead
+    assert nodes["Ground"]["model"] == "Assets/level0/Models/Terrain_ Ground.glb"
+    assert nodes["Sun"]["light"] == {"present": True, "type": 1, "color": [1.0, 0.9, 0.8, 1.0], "intensity": 1.2,
+                                     "range": 10, "spotAngle": 30, "enabled": True}
+    assert "light" not in nodes["Wall"]
+    assert len(desc["batches"]) == 1 and desc["batches"][0]["model"].startswith("Assets/Scenes/Main_StaticBatches/")
+    glb = root / desc["batches"][0]["model"]
+    gltf = glb_json(glb)
+    prims = gltf["meshes"][0]["primitives"]
+    assert len(prims) == 2  # the hidden object's submesh is left out
+    colors = [gltf["materials"][p["material"]]["pbrMetallicRoughness"]["baseColorFactor"] for p in prims]
+    assert colors == [[1, 0, 0, 1], [0, 0, 1, 1]]
+    assert os.path.exists(str(glb) + ".meta")

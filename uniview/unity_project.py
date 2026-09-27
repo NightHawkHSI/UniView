@@ -15,7 +15,7 @@ import json
 import os
 import re
 
-from engines.sdk import NORMAL
+from engines.sdk import NORMAL, Material
 from uniview.constants import log
 from uniview.export import (export_ext, export_stem, export_subfolder, rig_for_export, session_materials,
                             write_asset, write_glb, write_obj)
@@ -187,11 +187,11 @@ def unity_path(root, path):
     return os.path.relpath(path, root).replace("\\", "/")
 
 
-def prefab_description(nodes, target, model_paths, root, builtin_meshes=None):
+def prefab_description(nodes, target, model_paths, root, builtin_meshes=None, kind="prefab"):
     """The JSON UniViewBuilder.cs reads: nodes with their model GLB/OBJ (or built-in mesh) instead of mesh uids."""
     out = []
     for n in nodes:
-        model = model_paths.get(n.get("mesh"))
+        model = model_paths.get(n.get("mesh")) or model_paths.get(n.get("terrain"))
         builtin = (builtin_meshes or {}).get(n.get("mesh"), "") if not model else ""
         out.append({"name": n["name"], "parent": n["parent"], "active": n["active"],
                     "rendererEnabled": n.get("renderer_enabled", True),
@@ -199,7 +199,128 @@ def prefab_description(nodes, target, model_paths, root, builtin_meshes=None):
                     "scale": [float(v) for v in n["scale"]],
                     "model": unity_path(root, model) if model else "", "builtin": builtin,
                     "skinned": bool(n.get("skinned"))})
-    return {"version": 1, "kind": "prefab", "target": unity_path(root, target), "nodes": out}
+        light = n.get("light")
+        if light:
+            out[-1]["light"] = {"present": True, "type": light["type"], "color": [float(c) for c in light["color"]],
+                                "intensity": light["intensity"], "range": light["range"],
+                                "spotAngle": light["spot_angle"], "enabled": light.get("enabled", True)}
+    return {"version": 1, "kind": kind, "target": unity_path(root, target), "nodes": out}
+
+
+def is_scene(asset):
+    return asset.kind == "scene" and isinstance(asset.key, tuple) and asset.key[:1] == ("scene",)
+
+
+def plan_scenes(assets, assets_dir):
+    """[(scene asset, target .unity path)] in Assets/Scenes/, unique names."""
+    out, used = [], set()
+    folder = os.path.join(assets_dir, "Scenes")
+    for asset in assets:
+        if not is_scene(asset):
+            continue
+        base = safe_filename(asset.name.split(": ", 1)[-1]) or "Scene"
+        name, i = base, 1
+        while name.lower() in used:
+            i += 1
+            name = f"{base}_{i}"
+        used.add(name.lower())
+        out.append((asset, os.path.join(folder, f"{name}.unity")))
+    return out
+
+
+def visible_nodes(nodes):
+    """Per node: active in the hierarchy (it and all its parents active)."""
+    out = []
+    for n in nodes:
+        parent = n["parent"]
+        out.append(bool(n["active"]) and (parent < 0 or out[parent]))
+    return out
+
+
+def write_static_batches(session, nodes, folder, texture_paths):
+    """One GLB per static-batch combined mesh used in a scene, each submesh with the material of the renderer
+    that owns it; submeshes of hidden objects are left out. Returns the files written."""
+    by_uid = {a.uid: a for a in session.assets}
+    visible = visible_nodes(nodes)
+    owners = {}  # combined mesh uid -> [(first, count, materials)]
+    for n, vis in zip(nodes, visible):
+        batch = n.get("batch")
+        if batch and vis and n.get("renderer_enabled", True):
+            owners.setdefault(batch["mesh"], []).append((batch["first"], batch["count"], batch["materials"]))
+    written = []
+    default = Material("Default")
+    for uid, owned in owners.items():
+        asset = by_uid.get(uid)
+        if asset is None:
+            continue
+        with session.lock:
+            md = session.mesh(asset)
+        materials, index, keep, slots = [], {}, [], []
+        for j, tris in enumerate(md.submeshes):
+            slot = md.material_slots[j] if j < len(md.material_slots) else j
+            owner = next((o for o in owned if o[0] <= slot < o[0] + o[1]), None)
+            if owner is None:
+                continue
+            mats, k = owner[2], slot - owner[0]
+            mat = mats[k] if k < len(mats) and mats[k] is not None else default
+            if id(mat) not in index:
+                index[id(mat)] = len(materials)
+                materials.append(mat)
+            keep.append(tris)
+            slots.append(index[id(mat)])
+        if not keep:
+            continue
+        md.submeshes, md.material_slots = keep, slots
+        base = os.path.join(folder, safe_filename(asset.name) or "Combined Mesh")
+        path, n = base + ".glb", 1
+        while path in written:
+            n += 1
+            path = f"{base}_{n}.glb"
+        os.makedirs(folder, exist_ok=True)
+
+        def image_uri(tex_asset):
+            target = texture_paths.get(tex_asset.key)
+            return os.path.relpath(target, folder).replace(os.sep, "/") if target else None
+
+        write_glb(session, md, materials, path, image_uri=image_uri, normal_maps=True)
+        written.append(path)
+    return written
+
+
+def write_scene_descriptions(session, root, assets_dir, model_paths, texture_paths, cancelled=None):
+    """One JSON per scene (+ its static-batch GLBs); returns (files written, failed)."""
+    if not hasattr(session, "hierarchy"):
+        return 0, 0
+    written = failed = 0
+    build_dir = os.path.join(assets_dir, *BUILD_DIR)
+    builtin_meshes = {a.uid: a.name for a in session.assets
+                      if a.kind in MODEL_KINDS and a.source in BUILTIN_SOURCES and a.name in BUILTIN_MESHES}
+    for asset, target in plan_scenes(session.assets, assets_dir):
+        if cancelled is not None and cancelled():
+            break
+        try:
+            nodes = session.hierarchy(asset)
+            if not nodes:
+                continue
+            desc = prefab_description(nodes, target, model_paths, root, builtin_meshes, kind="scene")
+            batches = write_static_batches(session, nodes, target[:-len(".unity")] + "_StaticBatches", texture_paths)
+            for glb in batches:
+                write_meta(glb, asset_guid(f"{asset.uid}:batch:{os.path.basename(glb)}"))
+                write_folder_metas(assets_dir, os.path.dirname(glb))
+            desc["batches"] = [{"model": unity_path(root, glb)} for glb in batches]
+            path = os.path.join(build_dir, os.path.relpath(target, assets_dir) + ".json")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(desc, f, separators=(",", ":"))
+            write_meta(path, asset_guid(f"{asset.uid}:description"))
+            write_folder_metas(assets_dir, os.path.dirname(path))
+            written += 1 + len(batches)
+        except Exception as e:
+            failed += 1
+            log.warning("Could not describe scene '%s': %s", asset.name, e)
+    if written:
+        write_builder(root, assets_dir)
+    return written, failed
 
 
 def write_builder(root, assets_dir):
@@ -344,8 +465,12 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
         model_paths = {asset.uid: path for asset, path in jobs
                        if asset.kind in MODEL_KINDS and os.path.isfile(path)}
         prefabs, prefab_failed = write_prefab_descriptions(session, root, assets_dir, model_paths, cancelled)
-        written += prefabs
-        failed += prefab_failed
-        log.info("Unity project: %d prefab description(s) for UniViewBuilder.cs", prefabs)
+        if progress is not None:
+            progress(len(jobs), len(jobs), "scenes")
+        scenes, scene_failed = write_scene_descriptions(session, root, assets_dir, model_paths, texture_paths,
+                                                        cancelled)
+        written += prefabs + scenes
+        failed += prefab_failed + scene_failed
+        log.info("Unity project: %d prefab and %d scene file(s) for UniViewBuilder.cs", prefabs, scenes)
     log.info("Unity project: %d file(s) written, %d failed, %d skipped", written, failed, skipped)
     return written, failed, skipped

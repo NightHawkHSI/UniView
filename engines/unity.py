@@ -873,9 +873,34 @@ class UnitySession(GameSession):
     def hierarchy(self, asset):
         """GameObject tree of a scene/prefab asset as a flat list (parents before children):
         [{"name", "parent" (index or -1), "active", "pos" (x,y,z), "rot" (x,y,z,w), "scale",
-          "mesh" (uid of the Mesh asset or None), "skinned" (bool), "renderer_enabled"}], in Unity's own space."""
+          "mesh" (uid of the Mesh asset or None), "skinned" (bool), "renderer_enabled",
+          "batch" (static batching: {"mesh": combined mesh uid, "first", "count", "materials": [Material]}),
+          "light" ({"type", "color", "intensity", "range", "spot_angle"}), "terrain" (uid of the terrain model)}],
+        in Unity's own space. Optional keys are missing when they don't apply."""
         from .unity_scene import _components
         nodes = []
+        material_cache = {}
+
+        def renderer_materials(renderer):
+            out = []
+            for ptr in getattr(renderer, "m_Materials", None) or []:
+                try:
+                    reader = ptr.deref()
+                    key = obj_key(reader.assets_file, reader.path_id)
+                except Exception:
+                    out.append(None)
+                    continue
+                if key not in material_cache:
+                    try:
+                        mat = read_material(reader.read())
+                        refs = [TextureRef(prop, name, self._asset_for(tex, "Texture2D", name),
+                                           ALBEDO if prop in ALBEDO_PROPS else NORMAL if prop in NORMAL_PROPS else OTHER)
+                                for prop, name, tex in mat["textures"]]
+                        material_cache[key] = Material(mat["name"], refs, color=mat["color"], properties=mat["properties"])
+                    except Exception:
+                        material_cache[key] = None
+                out.append(material_cache[key])
+            return out
 
         def visit(transform_reader, parent, depth):
             if depth > 200:
@@ -892,6 +917,7 @@ class UnitySession(GameSession):
                     "mesh": None, "skinned": False, "renderer_enabled": True}
             comps = _components(go)
             mesh_ptr = None
+            batch = None
             for name, reader in comps:
                 try:
                     if name == "SkinnedMeshRenderer":
@@ -901,7 +927,25 @@ class UnitySession(GameSession):
                     elif name == "MeshFilter" and mesh_ptr is None:
                         mesh_ptr = reader.read().m_Mesh
                     elif name == "MeshRenderer":
-                        node["renderer_enabled"] = bool(getattr(reader.read(), "m_Enabled", True))
+                        renderer = reader.read()
+                        node["renderer_enabled"] = bool(getattr(renderer, "m_Enabled", True))
+                        info = getattr(renderer, "m_StaticBatchInfo", None)
+                        if info is not None and getattr(info, "subMeshCount", 0):
+                            batch = {"first": int(info.firstSubMesh), "count": int(info.subMeshCount),
+                                     "materials": renderer_materials(renderer)}
+                    elif name == "Light":
+                        light = reader.read()
+                        c = light.m_Color
+                        node["light"] = {"type": int(getattr(light, "m_Type", 1)), "color": [c.r, c.g, c.b, c.a],
+                                         "intensity": float(getattr(light, "m_Intensity", 1.0)),
+                                         "range": float(getattr(light, "m_Range", 10.0)),
+                                         "spot_angle": float(getattr(light, "m_SpotAngle", 30.0)),
+                                         "enabled": bool(getattr(light, "m_Enabled", True))}
+                    elif name == "Terrain":
+                        data = reader.read().m_TerrainData
+                        if data.path_id:
+                            obj = data.deref()
+                            node["terrain"] = f"terrain:{obj.assets_file.name}:{obj.path_id}"
                 except Exception:
                     continue
             if mesh_ptr is not None and getattr(mesh_ptr, "path_id", 0):
@@ -909,6 +953,10 @@ class UnitySession(GameSession):
                     node["mesh"] = self._asset_for(mesh_ptr.deref(), "Mesh").uid
                 except Exception:
                     pass
+            if batch is not None and node["mesh"]:
+                # The mesh is a combined (world space) static batch: not this object's own mesh.
+                batch["mesh"], node["mesh"] = node["mesh"], None
+                node["batch"] = batch
             index = len(nodes)
             nodes.append(node)
             for child in t.m_Children or []:
