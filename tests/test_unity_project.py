@@ -239,6 +239,13 @@ def test_builder_json_fields_match_the_cs_classes():
     assert set(desc["nodes"][0]) <= fields
     cs_desc = re.search(r"public class Description\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
     assert set(desc) <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_desc))
+    cs_batch = re.search(r"public class BatchRef\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
+    assert {"model", "materials"} <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_batch))
+    cs_light = re.search(r"public class LightInfo\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
+    light = up.prefab_description([{**PrefabSession([]).hierarchy(None)[0],
+                                    "light": {"type": 1, "color": [1, 1, 1, 1], "intensity": 1, "range": 1,
+                                              "spot_angle": 1}}], "Assets/x.unity", {}, "")["nodes"][0]["light"]
+    assert set(light) <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_light))
 
 
 # ---------------------------------------------------------------------------- scenes
@@ -311,3 +318,44 @@ def test_export_scene_with_static_batches_lights_and_terrain(tmp_path):
     colors = [gltf["materials"][p["material"]]["pbrMetallicRoughness"]["baseColorFactor"] for p in prims]
     assert colors == [[1, 0, 0, 1], [0, 0, 1, 1]]
     assert os.path.exists(str(glb) + ".meta")
+
+
+# ---------------------------------------------------------------------------- .mat files
+
+class MaterialSession(PrefabSession):
+    def hierarchy(self, asset):
+        nodes = super().hierarchy(asset)
+        nodes[1]["materials"] = ["material:sharedassets1.assets:77", None]
+        return nodes
+
+    def material_details(self, uid):
+        wall = next(a for a in self.assets if a.name == "wall")
+        return {"name": "Shield", "shader": "Custom/Translucent", "textures": [("_MainTex", wall, (1, 1), (0, 0))],
+                "colors": {"_Color": (0, 0.5, 1, 0.3)}, "floats": {}, "keywords": [], "queue": -1, "tags": {}}
+
+
+def test_export_writes_mat_files_for_renderers(tmp_path):
+    wall = Asset("texture", "wall", "w", uid="s:1", source="sharedassets0.assets")
+    crate = Asset("model", "crate", "c", uid="s:6", source="sharedassets1.assets")
+    prefab = Asset("scene", "Prefab: Crate", ("root", 1, 1), uid="prefab:crate", source="sharedassets1.assets")
+    root = tmp_path / "proj"
+    written, failed, _ = up.export_unity_project(MaterialSession([wall, crate, prefab]), str(root), "6000.5.4f1",
+                                                 editor_exe=fake_editor(tmp_path))
+    assert failed == 0
+    mat = root / "Assets" / "sharedassets1.assets" / "Materials" / "Shield.mat"
+    text = mat.read_text()
+    assert "m_CustomRenderQueue: 3000" in text and up.asset_guid("s:1") in text  # transparent, texture by GUID
+    assert open(str(mat) + ".meta").read() == up.meta_text(up.asset_guid("material:sharedassets1.assets:77"))
+    desc = json.load(open(root / "Assets" / "UniView" / "Build" / "sharedassets1.assets" / "Prefabs" / "Crate.prefab.json"))
+    body = desc["nodes"][1]
+    assert body["materials"] == ["Assets/sharedassets1.assets/Materials/Shield.mat", ""]
+    assert desc["nodes"][0]["materials"] == []  # no renderer, no materials
+    assert body["noMaterials"] is False and desc["nodes"][0]["noMaterials"] is False
+
+
+def test_renderer_without_materials_is_marked():
+    nodes = PrefabSession([]).hierarchy(None)
+    nodes[1]["materials"] = []           # the game's renderer has an empty material list
+    desc = up.prefab_description(nodes, "Assets/x.prefab", {"s:6": "/p/Assets/m.glb"}, "/p")
+    assert desc["nodes"][1]["noMaterials"] is True
+    assert desc["nodes"][2]["noMaterials"] is False  # no "materials" key: unknown, keep the fallback

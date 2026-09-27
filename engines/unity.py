@@ -247,6 +247,75 @@ def _prop_name(prop):
     return getattr(prop, "name", prop) if not isinstance(prop, str) else prop
 
 
+_SHADER_NAMES = {}
+
+
+def shader_name(ptr):
+    """'Legacy Shaders/Diffuse'-style name of a Shader PPtr ('' if unknown). Shader objects keep it in their
+    parsed form, not in m_Name; read once per shader."""
+    try:
+        if not ptr.path_id:
+            return ""
+        reader = ptr.deref()
+    except Exception:
+        return ""
+    key = (reader.assets_file.name, reader.path_id)
+    if key not in _SHADER_NAMES:
+        name = ""
+        try:
+            shader = reader.read()
+            parsed = getattr(shader, "m_ParsedForm", None)
+            name = (getattr(parsed, "m_Name", "") if parsed is not None else "") or getattr(shader, "m_Name", "") or ""
+        except Exception as e:
+            log.debug("Shader name of %s: %s", key, e)
+        _SHADER_NAMES[key] = name
+    return _SHADER_NAMES[key]
+
+
+def read_material_details(mat):
+    """Everything a Unity project needs to rebuild a Material: {"name", "shader", "textures":
+    [(property, texture ObjectReader, (scale x, y), (offset x, y))], "colors": {prop: rgba}, "floats": {prop: v},
+    "keywords": [..], "queue" (-1 = the shader's), "tags": {name: value}}."""
+    saved = mat.m_SavedProperties
+    textures = []
+    for prop, tex_env in saved.m_TexEnvs:
+        tptr = tex_env.m_Texture
+        if not tptr.path_id:
+            continue
+        try:
+            reader = tptr.deref()
+            if reader.type.name != "Texture2D":
+                continue
+            sc, off = tex_env.m_Scale, tex_env.m_Offset
+            textures.append((_prop_name(prop), reader, (float(sc.x), float(sc.y)), (float(off.x), float(off.y))))
+        except Exception:
+            continue
+    colors = {}
+    for prop, c in getattr(saved, "m_Colors", None) or []:
+        try:
+            colors[_prop_name(prop)] = (float(c.r), float(c.g), float(c.b), float(c.a))
+        except (AttributeError, TypeError, ValueError):
+            continue
+    floats = {}
+    for prop, value in getattr(saved, "m_Floats", None) or []:
+        try:
+            floats[_prop_name(prop)] = float(value)
+        except (TypeError, ValueError):
+            continue
+    keywords = getattr(mat, "m_ValidKeywords", None)
+    if keywords is None:
+        keywords = (getattr(mat, "m_ShaderKeywords", "") or "").split()
+    tags = {}
+    for entry in getattr(mat, "stringTagMap", None) or []:
+        try:
+            k, v = entry if isinstance(entry, (tuple, list)) else (entry.first, entry.second)
+            tags[str(k)] = str(v)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return {"name": mat.m_Name, "shader": shader_name(mat.m_Shader), "textures": textures, "colors": colors, "floats": floats,
+            "keywords": list(keywords), "queue": int(getattr(mat, "m_CustomRenderQueue", -1)), "tags": tags}
+
+
 def read_material(mat):
     """A parsed Material -> {"name", "textures": [(property, texture name, ObjectReader)], "color", "properties"}."""
     saved = mat.m_SavedProperties
@@ -756,6 +825,7 @@ class UnitySession(GameSession):
         self._rigs = None        # humanoid Avatars (unity_humanoid.HumanRig)
         self._model_rigs = {}    # mesh key -> the HumanRig that fits its skeleton, or None
         self._humanoid = {}      # (clip key, rig) -> clip converted to bone curves
+        self._material_readers = {}  # "material:<file>:<id>" -> ObjectReader (filled by hierarchy())
 
     def _asset_for(self, obj, type_name="Texture2D", name=None):
         """Asset for an ObjectReader (the listed one if we have it)."""
@@ -881,6 +951,21 @@ class UnitySession(GameSession):
         nodes = []
         material_cache = {}
 
+        def material_uids(renderer):
+            out = []
+            for ptr in getattr(renderer, "m_Materials", None) or []:
+                try:
+                    reader = ptr.deref() if ptr.path_id else None
+                except Exception:
+                    reader = None
+                if reader is None:
+                    out.append(None)
+                    continue
+                uid = f"material:{reader.assets_file.name}:{reader.path_id}"
+                self._material_readers[uid] = reader
+                out.append(uid)
+            return out
+
         def renderer_materials(renderer):
             out = []
             for ptr in getattr(renderer, "m_Materials", None) or []:
@@ -924,15 +1009,17 @@ class UnitySession(GameSession):
                         renderer = reader.read()
                         mesh_ptr, node["skinned"] = renderer.m_Mesh, True
                         node["renderer_enabled"] = bool(getattr(renderer, "m_Enabled", True))
+                        node["materials"] = material_uids(renderer)
                     elif name == "MeshFilter" and mesh_ptr is None:
                         mesh_ptr = reader.read().m_Mesh
                     elif name == "MeshRenderer":
                         renderer = reader.read()
                         node["renderer_enabled"] = bool(getattr(renderer, "m_Enabled", True))
+                        node["materials"] = material_uids(renderer)
                         info = getattr(renderer, "m_StaticBatchInfo", None)
                         if info is not None and getattr(info, "subMeshCount", 0):
                             batch = {"first": int(info.firstSubMesh), "count": int(info.subMeshCount),
-                                     "materials": renderer_materials(renderer)}
+                                     "materials": renderer_materials(renderer), "material_uids": node["materials"]}
                     elif name == "Light":
                         light = reader.read()
                         c = light.m_Color
@@ -969,6 +1056,18 @@ class UnitySession(GameSession):
             for root in self._scene_roots(asset):
                 visit(root, -1, 0)
         return nodes
+
+    def material_details(self, uid):
+        """read_material_details() of a material named by hierarchy() ("material:<file>:<id>"), with texture
+        Assets instead of readers; None if unknown."""
+        reader = self._material_readers.get(uid)
+        if reader is None:
+            return None
+        with self.lock:
+            d = read_material_details(reader.read())
+        d["textures"] = [(prop, self._asset_for(tex, "Texture2D"), scale, offset)
+                         for prop, tex, scale, offset in d["textures"]]
+        return d
 
     def _scene(self, asset):
         """(MeshData, materials, info rows) of a scene/prefab, cached (the last few)."""

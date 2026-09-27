@@ -42,6 +42,8 @@ namespace UniView
         public string model;
         public string builtin;
         public bool skinned;
+        public string[] materials;
+        public bool noMaterials;
         public LightInfo light;
     }
 
@@ -49,6 +51,7 @@ namespace UniView
     public class BatchRef
     {
         public string model;
+        public string[] materials;
     }
 
     [Serializable]
@@ -220,7 +223,7 @@ namespace UniView
                     Mesh mesh = src.GetComponent<MeshFilter>() != null ? src.GetComponent<MeshFilter>().sharedMesh : null;
                     if (mesh == null) continue;
                     go.AddComponent<MeshFilter>().sharedMesh = mesh;
-                    go.AddComponent<MeshRenderer>().sharedMaterials = Materials(src, mesh);
+                    go.AddComponent<MeshRenderer>().sharedMaterials = Materials(src, mesh, b.materials);
                     go.isStatic = true;
                 }
             }
@@ -250,14 +253,34 @@ namespace UniView
             return defaultMaterial;
         }
 
-        static Material[] Materials(Renderer src, Mesh mesh)
+        static readonly Dictionary<string, Material> matCache = new Dictionary<string, Material>();
+
+        static Material LoadMaterial(string path)
         {
-            // Models the game never showed with a material have empty slots: use Unity's default
-            // material there instead of leaving them pink.
+            if (string.IsNullOrEmpty(path)) return null;
+            Material m;
+            if (!matCache.TryGetValue(path, out m) || m == null)
+            {
+                m = AssetDatabase.LoadAssetAtPath<Material>(path);
+                matCache[path] = m;
+            }
+            return m;
+        }
+
+        static Material[] Materials(Renderer src, Mesh mesh, string[] exported)
+        {
+            // The renderer's own materials (exported as .mat) first, else the model's, else Unity's
+            // default material (models the game never showed with a material would be pink otherwise).
             Material[] mats = src.sharedMaterials;
-            int count = Math.Max(mats.Length, mesh != null ? mesh.subMeshCount : 1);
+            int count = exported != null && exported.Length > 0 ? exported.Length
+                                                              : Math.Max(mats.Length, mesh != null ? mesh.subMeshCount : 1);
             var result = new Material[count];
-            for (int i = 0; i < count; i++) result[i] = i < mats.Length && mats[i] != null ? mats[i] : DefaultMaterial();
+            for (int i = 0; i < count; i++)
+            {
+                Material m = exported != null && i < exported.Length ? LoadMaterial(exported[i]) : null;
+                if (m == null && i < mats.Length) m = mats[i];
+                result[i] = m != null ? m : DefaultMaterial();
+            }
             return result;
         }
 
@@ -266,11 +289,11 @@ namespace UniView
             Renderer src = ModelRenderer(n.model, parts);
             if (src == null) return;
             var skinned = src as SkinnedMeshRenderer;
-            if (skinned != null && n.skinned && AddSkinned(go, skinned, root, n.rendererEnabled)) return;
+            if (skinned != null && n.skinned && AddSkinned(go, skinned, root, n.rendererEnabled, n)) return;
             Mesh mesh = skinned != null ? skinned.sharedMesh : src.GetComponent<MeshFilter>().sharedMesh;
             go.AddComponent<MeshFilter>().sharedMesh = mesh;
             var mr = go.AddComponent<MeshRenderer>();
-            mr.sharedMaterials = Materials(src, mesh);
+            mr.sharedMaterials = n.noMaterials ? new Material[0] : Materials(src, mesh, n.materials);
             mr.enabled = n.rendererEnabled;
         }
 
@@ -282,7 +305,9 @@ namespace UniView
             if (mesh == null) return;
             go.AddComponent<MeshFilter>().sharedMesh = mesh;
             var mr = go.AddComponent<MeshRenderer>();
-            mr.sharedMaterial = DefaultMaterial();
+            Material own = n.materials != null && n.materials.Length > 0 ? LoadMaterial(n.materials[0]) : null;
+            if (n.noMaterials) mr.sharedMaterials = new Material[0];  // not drawn in the game either
+            else mr.sharedMaterial = own != null ? own : DefaultMaterial();
             mr.enabled = n.rendererEnabled;
         }
 
@@ -298,7 +323,7 @@ namespace UniView
             light.enabled = info.enabled;
         }
 
-        static bool AddSkinned(GameObject go, SkinnedMeshRenderer src, Transform root, bool enabled)
+        static bool AddSkinned(GameObject go, SkinnedMeshRenderer src, Transform root, bool enabled, Node n)
         {
             // The model's bones are matched to this prefab's objects by name.
             var byName = new Dictionary<string, Transform>();
@@ -311,7 +336,7 @@ namespace UniView
             }
             var smr = go.AddComponent<SkinnedMeshRenderer>();
             smr.sharedMesh = src.sharedMesh;
-            smr.sharedMaterials = Materials(src, src.sharedMesh);
+            smr.sharedMaterials = n.noMaterials ? new Material[0] : Materials(src, src.sharedMesh, n.materials);
             smr.bones = bones;
             Transform rootBone;
             if (src.rootBone != null && byName.TryGetValue(src.rootBone.name, out rootBone)) smr.rootBone = rootBone;
