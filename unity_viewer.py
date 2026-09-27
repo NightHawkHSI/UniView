@@ -32,6 +32,7 @@ import traceback
 import urllib.parse
 import urllib.request
 import webbrowser
+from dataclasses import dataclass, field
 from datetime import datetime
 from html import escape as html_escape
 
@@ -464,8 +465,8 @@ class AssetFilter:
             return False
         if self.type and not kind.startswith(self.type):
             return False
-        for field, op, number in self.conditions:
-            value = (stats or {}).get(field)
+        for stat, op, number in self.conditions:
+            value = (stats or {}).get(stat)
             if value is None or not op(value, number):
                 return False
         return True
@@ -683,7 +684,8 @@ def write_obj(session, md, materials, path):
                         img = session.image(tex.asset)
                     img.save(png_path)
                     written.append(png_path)
-            except Exception:
+            except Exception as e:
+                log.warning("Could not save the texture %s: %s", png, e)
                 continue
             if tex.role == NORMAL:
                 mtl.append(f"map_Bump {png}")
@@ -751,22 +753,117 @@ def render_uv_layout(poly, channel, texture_img, max_tris=80000):
 
 # --------------------------------------------------------------------------- settings, Blender, compat list
 
-class Settings(dict):
-    """Small per-user settings file (settings.json next to the app)."""
-
-    def __init__(self):
-        super().__init__()
+def read_json(path, what):
+    """Parsed JSON file, or None if it's missing. A corrupt file is logged and copied to <path>.bad
+    so the next save doesn't silently replace what the user had."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        log.error("Could not read the %s file %s: %s", what, path, e)
         try:
-            with open(SETTINGS_FILE, encoding="utf-8") as f:
-                self.update(json.load(f))
-        except (OSError, ValueError):
+            shutil.copyfile(path, path + ".bad")
+            log.error("A copy of it was kept as %s", path + ".bad")
+        except OSError:
             pass
+        return None
+
+
+def write_json(path, data):
+    """Write JSON atomically: serialize first, then replace the file, so a failure never leaves it truncated."""
+    text = json.dumps(data, indent=2)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+SETTING_CHOICES = {"model_format": ("obj", "glb"), "view": ("list", "grid")}
+_SETTINGS_INTERNAL = ("options", "path", "extra")
+
+
+@dataclass(slots=True)
+class Settings:
+    """Per-user settings (settings.json next to the app).
+
+    Every value is checked when it's assigned, so a typo'd name or a wrong type fails right there
+    instead of silently breaking the save. Load with Settings.load().
+    """
+
+    last_dir: str = field(default_factory=lambda: os.path.expanduser("~"))
+    export_dir: str = ""
+    model_format: str = "obj"
+    keep_structure: bool = True
+    volume: float = 0.7  # 0..1
+    autoplay: bool = False
+    view: str = "list"
+    home_engine: str = ""
+    home_group: str = "engine"
+    home_sort: str = "recent"
+    online_compat: bool = True
+    blender_path: str = ""
+    options: dict = field(default_factory=dict)  # Options menu (VIEW_OPTION_ITEMS): {key: bool}, missing = on
+    path: str = SETTINGS_FILE
+    extra: dict = field(default_factory=dict)  # keys this version doesn't know, written back unchanged
+
+    def __setattr__(self, name, value):
+        kind = self.__dataclass_fields__[name].type if name in self.__dataclass_fields__ else None
+        if kind is None:
+            raise AttributeError(f"Unknown setting '{name}'")
+        if kind is float and isinstance(value, int) and not isinstance(value, bool):
+            value = float(value)
+        if type(value) is not kind:
+            raise TypeError(f"Setting '{name}' must be {kind.__name__}, not {type(value).__name__}")
+        if name in SETTING_CHOICES and value not in SETTING_CHOICES[name]:
+            raise ValueError(f"Setting '{name}' must be one of {SETTING_CHOICES[name]}, not {value!r}")
+        if name == "volume" and not 0.0 <= value <= 1.0:
+            raise ValueError(f"Setting 'volume' must be 0..1, not {value}")
+        object.__setattr__(self, name, value)
+
+    @classmethod
+    def load(cls, path=SETTINGS_FILE):
+        settings = cls(path=path)
+        data = read_json(path, "settings")
+        if data is None:
+            return settings
+        if not isinstance(data, dict):
+            log.warning("Ignoring the settings file %s: not a JSON object", path)
+            return settings
+        for key, value in data.items():
+            if key.startswith("opt_"):
+                if isinstance(value, bool):
+                    settings.options[key[4:]] = value
+                else:
+                    log.warning("Ignoring the setting %s: %r isn't true/false", key, value)
+            elif key in cls.__dataclass_fields__ and key not in _SETTINGS_INTERNAL:
+                try:
+                    setattr(settings, key, value)
+                except (TypeError, ValueError) as e:
+                    log.warning("Ignoring a saved setting: %s", e)
+            else:
+                settings.extra[key] = value
+        return settings
+
+    def option(self, key):
+        return self.options.get(key, True)
+
+    def set_option(self, key, on):
+        if not isinstance(on, bool):
+            raise TypeError(f"Option '{key}' must be bool, not {type(on).__name__}")
+        self.options[key] = on
+
+    def to_json(self):
+        data = dict(self.extra)
+        data.update((name, getattr(self, name)) for name in self.__dataclass_fields__ if name not in _SETTINGS_INTERNAL)
+        data.update(("opt_" + key, on) for key, on in self.options.items())
+        return data
 
     def save(self):
         try:
-            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-                json.dump(self, f, indent=2)
-        except OSError as e:
+            write_json(self.path, self.to_json())
+        except (OSError, TypeError, ValueError) as e:
             log.warning("Could not save settings: %s", e)
 
 
@@ -796,7 +893,7 @@ def find_blender(saved=None):
         try:
             candidates += [os.path.join(common, "Blender", "blender.exe") for common in steam_library_dirs()]
         except Exception:
-            pass
+            log.debug("Looking for Blender in the Steam libraries failed", exc_info=True)
     return next((c for c in candidates if c and os.path.isfile(c)), None)
 
 
@@ -818,7 +915,10 @@ def load_compat():
                 games = json.load(f).get("games")
             if isinstance(games, dict):
                 return {name.lower(): entry for name, entry in games.items() if isinstance(entry, dict)}
-        except (OSError, ValueError, AttributeError):
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, AttributeError) as e:
+            log.warning("Ignoring the compatibility list %s: %s", path, e)
             continue
     return {}
 
@@ -829,8 +929,7 @@ def fetch_compat():
         data = json.loads(response.read().decode("utf-8"))
     if not isinstance(data.get("games"), dict):
         raise ValueError("unexpected compat.json format")
-    with open(COMPAT_CACHE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    write_json(COMPAT_CACHE, data)
     return len(data["games"])
 
 
@@ -1182,9 +1281,9 @@ class MeshView(QWidget):
 
     def _update_fly_hint(self):
         self.speed_label.setText(f"{fmt_distance(self._fly_speed)}/s")
-        self.fly_hint.setText(f"WASD move \u00b7 Q/E down/up \u00b7 drag to look \u00b7 Shift faster \u00b7 "
-                              f"wheel = speed \u00b7 double-click to jump there "
-                              f"\u00b7 F / Esc to leave")
+        self.fly_hint.setText("WASD move \u00b7 Q/E down/up \u00b7 drag to look \u00b7 Shift faster \u00b7 "
+                              "wheel = speed \u00b7 double-click to jump there "
+                              "\u00b7 F / Esc to leave")
 
     def _fly_home(self):
         """Start over the busy part of the scene: huge ground/water planes or skyboxes would otherwise
@@ -1686,7 +1785,7 @@ class VideoView(QWidget):
         self.settings = settings
         self.player = QMediaPlayer(self)
         self.output = QAudioOutput(self)
-        self.output.setVolume(settings.get("volume", 0.7))
+        self.output.setVolume(settings.volume)
         self.player.setAudioOutput(self.output)
         self.screen = QVideoWidget()
         self.screen.setStyleSheet("background: black;")
@@ -1784,7 +1883,7 @@ class AudioView(QWidget):
         self.settings = settings
         self.player = QMediaPlayer(self)
         self.output = QAudioOutput(self)
-        self.output.setVolume(settings.get("volume", 0.7))
+        self.output.setVolume(settings.volume)
         self.player.setAudioOutput(self.output)
         self._file_index = 0
 
@@ -1814,8 +1913,8 @@ class AudioView(QWidget):
         self.volume.valueChanged.connect(self._set_volume)
         self.autoplay = QCheckBox("Autoplay")
         self.autoplay.setToolTip("Start playing as soon as a sound is picked (handy for flipping through sounds)")
-        self.autoplay.setChecked(settings.get("autoplay", False))
-        self.autoplay.toggled.connect(lambda on: (settings.__setitem__("autoplay", on), settings.save()))
+        self.autoplay.setChecked(settings.autoplay)
+        self.autoplay.toggled.connect(lambda on: (setattr(settings, "autoplay", on), settings.save()))
         save = QPushButton("Save sound...")
         save.clicked.connect(self.save_requested)
 
@@ -1851,7 +1950,7 @@ class AudioView(QWidget):
 
     def _set_volume(self, value):
         self.output.setVolume(value / 100)
-        self.settings["volume"] = value / 100
+        self.settings.volume = value / 100
         self.settings.save()
 
     def _position(self, ms):
@@ -1996,7 +2095,7 @@ class ExportDialog(QDialog):
         super().__init__(parent)
         self.settings = settings
         self.setWindowTitle("Export")
-        self.folder = QLineEdit(settings.get("export_dir", settings.get("last_dir", os.path.expanduser("~"))))
+        self.folder = QLineEdit(settings.export_dir or settings.last_dir)
         browse = QPushButton("Browse...")
         browse.clicked.connect(self._browse)
         folder_row = QHBoxLayout()
@@ -2005,12 +2104,12 @@ class ExportDialog(QDialog):
         self.format = QComboBox()
         self.format.addItem("OBJ + MTL + PNG textures", "obj")
         self.format.addItem("GLB (one file, textures inside)", "glb")
-        self.format.setCurrentIndex(max(0, self.format.findData(settings.get("model_format", "obj"))))
+        self.format.setCurrentIndex(max(0, self.format.findData(settings.model_format)))
         self.format.setEnabled(has_models)
         self.keep = QCheckBox("Keep the game's folder structure")
         self.keep.setToolTip("Puts each asset in folders that mirror where it lives in the game\n"
                              "(e.g. assets/prefabs/weapons/...), so big dumps stay easy to browse.")
-        self.keep.setChecked(settings.get("keep_structure", True))
+        self.keep.setChecked(settings.keep_structure)
         form = QFormLayout(self)
         form.addRow(QLabel(f"{count:,} item(s) will be exported."))
         form.addRow("Folder:", folder_row)
@@ -2030,8 +2129,9 @@ class ExportDialog(QDialog):
     def _accept(self):
         if not self.folder.text().strip():
             return
-        self.settings.update(export_dir=self.folder.text().strip(), model_format=self.format.currentData(),
-                             keep_structure=self.keep.isChecked())
+        self.settings.export_dir = self.folder.text().strip()
+        self.settings.model_format = self.format.currentData()
+        self.settings.keep_structure = self.keep.isChecked()
         self.settings.save()
         self.accept()
 
@@ -2163,6 +2263,7 @@ def engine_group(project):
     try:
         return plugin.short_version(project_info(project)) or plugin.name
     except Exception:
+        log.debug("%s.short_version() failed", plugin.id, exc_info=True)
         return plugin.name
 
 
@@ -2183,12 +2284,8 @@ class ProjectStore:
 
     def __init__(self, path=PROJECTS_FILE):
         self.path = path
-        self.projects = []
-        try:
-            with open(path, encoding="utf-8") as f:
-                self.projects = json.load(f)
-        except (OSError, ValueError):
-            pass
+        data = read_json(path, "project list")
+        self.projects = data if isinstance(data, list) else []
         # Projects saved by UniView 1.x were always Unity games.
         migrated = False
         for project in self.projects:
@@ -2201,8 +2298,7 @@ class ProjectStore:
             self.save()
 
     def save(self):
-        with open(self.path, "w", encoding="utf-8") as f:
-            json.dump(self.projects, f, indent=2)
+        write_json(self.path, self.projects)
 
     def get(self, path):
         key = norm_path(path)
@@ -2524,17 +2620,17 @@ class HomePage(QWidget):
         self.engine_combo.setToolTip("Show only games made with this engine")
         self.engine_combo.currentIndexChanged.connect(lambda _: self._catalog_changed("home_engine",
                                                                                       self.engine_combo))
-        self._engine_filter = settings.get("home_engine", "")
+        self._engine_filter = settings.home_engine
         self.group_combo = QComboBox()
         for label, value in self.GROUPS:
             self.group_combo.addItem(label, value)
-        self.group_combo.setCurrentIndex(max(0, self.group_combo.findData(settings.get("home_group", "engine"))))
+        self.group_combo.setCurrentIndex(max(0, self.group_combo.findData(settings.home_group)))
         self.group_combo.currentIndexChanged.connect(lambda _: self._catalog_changed("home_group",
                                                                                      self.group_combo))
         self.sort_combo = QComboBox()
         for label, value in self.SORTS:
             self.sort_combo.addItem(label, value)
-        self.sort_combo.setCurrentIndex(max(0, self.sort_combo.findData(settings.get("home_sort", "recent"))))
+        self.sort_combo.setCurrentIndex(max(0, self.sort_combo.findData(settings.home_sort)))
         self.sort_combo.currentIndexChanged.connect(lambda _: self._catalog_changed("home_sort",
                                                                                     self.sort_combo))
         self.count_label = QLabel()
@@ -2573,7 +2669,7 @@ class HomePage(QWidget):
         lay.addLayout(bar)
         lay.addWidget(self.grid, 1)
         self.refresh()
-        if self.settings.get("online_compat", True):
+        if self.settings.online_compat:
             self.fetch_compat()
 
     # ---- compatibility list
@@ -2642,7 +2738,7 @@ class HomePage(QWidget):
         return item
 
     def _catalog_changed(self, key, combo):
-        self.settings[key] = combo.currentData()
+        setattr(self.settings, key, combo.currentData() or "")
         self.settings.save()
         self.refresh()
 
@@ -3244,11 +3340,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.resize(1500, 900)
-        self.settings = Settings()
+        self.settings = Settings.load()
         self.session = None      # GameSession of the game being viewed
         self.current = None      # Asset shown on the right
         self.thread = None
-        self.last_dir = self.settings.get("last_dir", os.path.expanduser("~"))
+        self.last_dir = self.settings.last_dir
         self.loaded = {}  # norm path -> {"session", "thumbs", "stats", "favorites"}
         self.loading_path = None
         self.favorites = set()   # Asset.uid values
@@ -3428,9 +3524,9 @@ class MainWindow(QMainWindow):
             self.resizeDocks([self.console], [170], Qt.Vertical)
 
         for key in VIEW_OPTIONS:
-            VIEW_OPTIONS[key] = self.settings.get("opt_" + key, True)
+            VIEW_OPTIONS[key] = self.settings.option(key)
         self._build_menu()
-        if self.settings.get("view") == "grid":
+        if self.settings.view == "grid":
             self.grid_btn.setChecked(True)
         self.statusBar().showMessage("Ready")
         log.info(APP_SHORT + " %s started - engine plugins: %s", __version__,
@@ -3540,7 +3636,7 @@ class MainWindow(QMainWindow):
         options = self.menuBar().addMenu("&Options")
         for key, text, tip in VIEW_OPTION_ITEMS:
             act = QAction(text, self, checkable=True)
-            act.setChecked(self.settings.get("opt_" + key, True))
+            act.setChecked(self.settings.option(key))
             act.setToolTip(tip)
             act.setStatusTip(tip)
             act.toggled.connect(lambda on, key=key: self._set_view_option(key, on))
@@ -3549,7 +3645,7 @@ class MainWindow(QMainWindow):
 
         help_menu = self.menuBar().addMenu("&Help")
         online = QAction("Download community compatibility list", self, checkable=True)
-        online.setChecked(self.settings.get("online_compat", True))
+        online.setChecked(self.settings.online_compat)
         online.setToolTip(f"Fetches compat.json from {REPO_URL} at startup")
         online.toggled.connect(self._set_online_compat)
         help_menu.addAction(online)
@@ -3564,7 +3660,7 @@ class MainWindow(QMainWindow):
         help_menu.addAction("Open app folder", lambda: os.startfile(APP_DIR))
 
     def _set_view_option(self, key, on):
-        self.settings["opt_" + key] = on
+        self.settings.set_option(key, on)
         self.settings.save()
         if key == "hide_unreadable":
             self.apply_filter()
@@ -3579,7 +3675,7 @@ class MainWindow(QMainWindow):
             self.show_asset(self.current)  # rebuild the map / scene with the new setting
 
     def _set_online_compat(self, on):
-        self.settings["online_compat"] = on
+        self.settings.online_compat = on
         self.settings.save()
         if on:
             self.home.fetch_compat()
@@ -3769,7 +3865,7 @@ class MainWindow(QMainWindow):
             log.info("Finished measuring all assets (tris, sizes)")
         if self.tree.header().sortIndicatorSection() in (1, 2) and not self.resort_timer.isActive():
             self.resort_timer.start()
-        unreadable = self.settings.get("opt_hide_unreadable", True) and any(is_unreadable(st) for _k, st in batch)
+        unreadable = self.settings.option("hide_unreadable") and any(is_unreadable(st) for _k, st in batch)
         if (unreadable or AssetFilter(self.search.text()).conditions) and not self.filter_timer.isActive():
             self.filter_timer.start()
 
@@ -3784,7 +3880,7 @@ class MainWindow(QMainWindow):
     def apply_filter(self):
         filt = AssetFilter(self.search.text())
         want = self.type_combo.currentData()
-        hide_unreadable = self.settings.get("opt_hide_unreadable", True)
+        hide_unreadable = self.settings.option("hide_unreadable")
         self.tree.setUpdatesEnabled(False)
         try:
             for i in range(self.tree.topLevelItemCount()):
@@ -3837,7 +3933,7 @@ class MainWindow(QMainWindow):
     # ---- grid view
     def set_grid_mode(self, grid):
         self.list_stack.setCurrentWidget(self.grid if grid else self.tree)
-        self.settings["view"] = "grid" if grid else "list"
+        self.settings.view = "grid" if grid else "list"
         self.settings.save()
         if grid:
             self.rebuild_grid()
@@ -4346,14 +4442,15 @@ class MainWindow(QMainWindow):
             self.mesh_view.set_texture(img)
             self.stack.setCurrentWidget(self.mesh_view)
         except Exception as e:
+            log.exception("Applying the texture '%s' failed", getattr(data, "name", data))
             QMessageBox.warning(self, "Texture", str(e))
 
     # ---- Blender
     def choose_blender(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Where is blender.exe?", self.settings.get("blender_path", ""),
+        path, _ = QFileDialog.getOpenFileName(self, "Where is blender.exe?", self.settings.blender_path,
                                               "Blender (blender.exe);;Programs (*.exe)")
         if path:
-            self.settings["blender_path"] = path
+            self.settings.blender_path = path
             self.settings.save()
             log.info("Blender location set to %s", path)
         return path or None
@@ -4363,7 +4460,7 @@ class MainWindow(QMainWindow):
         if not data or data.kind not in MODEL_KINDS:
             QMessageBox.information(self, "Open in Blender", "Select a model first.")
             return
-        blender = find_blender(self.settings.get("blender_path"))
+        blender = find_blender(self.settings.blender_path)
         if blender is None:
             if QMessageBox.question(self, "Blender not found",
                                     "Couldn't find Blender on this PC.\n\nPoint to blender.exe yourself?") != QMessageBox.Yes:
@@ -4390,7 +4487,7 @@ class MainWindow(QMainWindow):
             self, "Save", os.path.join(self.last_dir, default_name), filter_text)
         if path:
             self.last_dir = os.path.dirname(path)
-            self.settings["last_dir"] = self.last_dir
+            self.settings.last_dir = self.last_dir
             self.settings.save()
         return path, chosen
 
@@ -4437,7 +4534,7 @@ class MainWindow(QMainWindow):
             filters = "PNG image (*.png)"
         else:
             filters = "All files (*)"
-        ext = self.export_ext(asset, self.settings.get("model_format", "obj"))
+        ext = self.export_ext(asset, self.settings.model_format)
         if asset.kind in ("font", "video") and ext:
             label = {"ttf": "TrueType font", "otf": "OpenType font"}.get(ext, f"{ext.upper()} video")
             filters = f"{label} (*.{ext});;All files (*)"
@@ -4593,7 +4690,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.thumbs.clear()
         self.stats_worker.start([])
-        self.settings["last_dir"] = self.last_dir
+        self.settings.last_dir = self.last_dir
         self.settings.save()
         self.mesh_view.plotter.close()
         super().closeEvent(event)

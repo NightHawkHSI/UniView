@@ -32,7 +32,8 @@ UNITYPY_PACKAGES = [
 SOURCE_FILES = [
     "unity_viewer.py", "requirements.txt", "run.bat", "build.bat", "build.py",
     "Icon.png", "README.md", ".gitignore", "ScreenShots", "compat.json",
-    "engines", "plugins", "PLUGINS.md",
+    "engines", "plugins", "PLUGINS.md", "tests",
+    ".github", "ruff.toml", "requirements-dev.txt",
 ]
 
 

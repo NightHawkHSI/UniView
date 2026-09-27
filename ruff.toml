@@ -1,0 +1,6 @@
+line-length = 120
+extend-exclude = ["Builds", "tools", "cache"]
+
+[lint]
+# Real bugs only for now: syntax errors and pyflakes (undefined names, unused imports, shadowing, ...).
+select = ["E9", "F"]

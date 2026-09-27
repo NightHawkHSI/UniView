@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest
+ruff
+trimesh  # tests/test_glb.py cross-checks exported files with it

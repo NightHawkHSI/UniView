@@ -614,8 +614,8 @@ class ScriptReader:
         if st is not None and st.node is not None:
             try:
                 return obj.read_typetree(), ""  # stored with the object (AssetBundles): no need for the game's code
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("Stored layout of '%s' didn't fit: %s", script_class(obj), e)
         else:
             node = self._embedded_layouts().get(script_class(obj))
             if node is not None:
@@ -625,8 +625,8 @@ class ScriptReader:
                 f.ref_types = self._ref_types + [r for r in own_refs or () if r.node is not None]
                 try:
                     return obj.read_typetree(nodes=node), ""
-                except Exception:
-                    pass  # a different version of the class: generate the layout instead
+                except Exception as e:  # a different version of the class: generate the layout instead
+                    log.debug("Bundle layout of '%s' didn't fit: %s", script_class(obj), e)
                 finally:
                     f.ref_types = own_refs
         self._setup()
