@@ -2,7 +2,8 @@
 rem Builds UniView - Unity Asset Viewer into the Builds folder:
 rem   Builds\GitHub   - clean source copy, ready to push to a GitHub repo
 rem   Builds\Release  - standalone .exe folder + .zip (no Python needed)
-rem Usage: build.bat [github] [release] [--test-game "path\to\game"]
+rem Runs the lint + tests first and stops if they fail.
+rem Usage: build.bat [github] [release] [--test-game "path\to\game"] [--skip-checks]
 setlocal
 cd /d "%~dp0"
 
@@ -16,7 +17,7 @@ if errorlevel 1 (
 if not exist "Builds" mkdir "Builds"
 
 echo Installing/updating requirements...
-py -m pip install --disable-pip-version-check -q -r requirements.txt pyinstaller
+py -m pip install --disable-pip-version-check -q -r requirements-dev.txt pyinstaller
 if errorlevel 1 (
     echo pip install failed.
     pause

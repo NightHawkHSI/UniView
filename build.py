@@ -6,8 +6,12 @@
 
 Add a game folder to also self-test the packaged exe against a real game:
     py build.py release --test-game "D:/SteamLibrary/steamapps/common/Robocraft"
+
+Every build first runs the lint (ruff) and the tests (pytest) and stops if they fail.
+--skip-checks skips them (emergencies only).
 """
 
+import importlib.util
 import os
 import re
 import shutil
@@ -60,6 +64,17 @@ def clear_folder(path, keep=(".git",)):
             shutil.rmtree(full)
         else:
             os.remove(full)
+
+
+def run_checks():
+    """Lint + tests (what CI would run). Exits if anything fails."""
+    step("Checks (ruff + pytest)")
+    missing = [m for m in ("ruff", "pytest") if importlib.util.find_spec(m) is None]
+    if missing:
+        sys.exit(f"Missing {', '.join(missing)}. Install the dev tools: py -m pip install -r requirements-dev.txt")
+    for cmd in (["ruff", "check", "."], ["pytest", "tests", "-q"]):
+        if subprocess.run([sys.executable, "-m", *cmd], cwd=ROOT).returncode != 0:
+            sys.exit(f"{cmd[0]} failed - fix the problems above (or build with --skip-checks).")
 
 
 def build_github():
@@ -196,6 +211,8 @@ def main():
         i = args.index("--test-game")
         test_game = args[i + 1] if i + 1 < len(args) else None
         del args[i:i + 2]
+    skip_checks = "--skip-checks" in args
+    args = [a for a in args if a != "--skip-checks"]
     targets = set(a.lower() for a in args) or {"github", "release"}
     unknown = targets - {"github", "release"}
     if unknown:
@@ -204,6 +221,10 @@ def main():
     version = read_version()
     os.makedirs(BUILDS, exist_ok=True)
     print(f"UniView v{version} -> {BUILDS}")
+    if skip_checks:
+        print("\n!!! Skipping lint and tests (--skip-checks)")
+    else:
+        run_checks()
     if "github" in targets:
         build_github()
     if "release" in targets:
