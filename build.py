@@ -25,6 +25,7 @@ UNITYPY_PACKAGES = [
     "UnityPy", "fmod_toolkit", "pyfmodex", "astc_encoder", "archspec",
     "texture2ddecoder", "etcpak", "tpk_ar", "brotli", "lz4",
     "TypeTreeGeneratorAPI",  # reads MonoBehaviour fields from the game's code (native DLLs inside)
+    "zstandard",  # Source 2 / Unreal data compressed with zstd
 ]
 
 # Files that make up the project (what goes in the GitHub folder).

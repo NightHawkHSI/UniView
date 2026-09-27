@@ -107,6 +107,10 @@ class Animator:
         return tracks
 
     def _local(self, key, t):
+        return trs(*self.local_trs(key, t))
+
+    def local_trs(self, key, t):
+        """(position, rotation x/y/z/w, scale) of a node at time t (its rest values where not animated)."""
         node = self.nodes[key]
         pos, rot, scale = list(node["pos"]), np.array(node["rot"], float), list(node["scale"])
         track = self.tracks.get(key)
@@ -125,7 +129,7 @@ class Animator:
             elif "euler" in track:
                 e = [(_sample(k, t) if k is not None else 0.0) for k in track["euler"][:3]]
                 rot = euler_to_quat(e)
-        return trs(pos, rot, scale)
+        return pos, rot, scale
 
     def _world(self, key, t, cache):
         if key in cache:
@@ -154,3 +158,106 @@ class Animator:
         out = np.einsum("nij,nj->ni", blended, self.vertices)[:, :3].astype(np.float32)
         out[:, 0] *= -1  # Unity is left-handed; UniView meshes are x-flipped
         return out
+
+
+# ---------------------------------------------------------------------------- rigged exports (glTF)
+# UniView shows Unity's left-handed data mirrored on x; transforms are mirrored the same way.
+
+_MIRROR = np.diag([-1.0, 1.0, 1.0, 1.0])
+
+
+def _mirror_trs(pos, rot, scale):
+    return ([-float(pos[0]), float(pos[1]), float(pos[2])],
+            [float(rot[0]), -float(rot[1]), -float(rot[2]), float(rot[3])], [float(v) for v in scale])
+
+
+def export_rig(nodes, bone_keys, bind_poses, bone_indices, bone_weights, mesh_node, root=None):
+    """Skeleton of a skinned mesh for glTF, in UniView's (mirrored) space.
+
+    Joints are the bones plus their ancestors up to `root` (the animated character's root when a clip
+    plays; otherwise the bones' closest common ancestor), which is kept at the origin.
+    Returns (rig dict, {node key: joint index}).
+    """
+    chains = []
+    for key in [k for k in bone_keys if k in nodes] + ([mesh_node] if mesh_node in nodes else []):
+        chain, k = [], key
+        while k is not None and k in nodes and len(chain) < 256:
+            chain.append(k)
+            if k == root:
+                break
+            k = nodes[k]["parent"]
+        chains.append(chain[::-1])  # top ... node
+    if not chains:
+        raise ValueError("This model's bones aren't in the game files.")
+    if root is None or not all(c[0] == root for c in chains):
+        # Closest common ancestor of everything.
+        common = chains[0]
+        for c in chains[1:]:
+            n = 0
+            while n < min(len(common), len(c)) and common[n] == c[n]:
+                n += 1
+            common = common[:n]
+        root = common[-1] if common else None
+        chains = [c[c.index(root):] if root in c else c for c in chains]
+    order, joint_of = [], {}
+    for chain in chains:
+        for k in chain:
+            if k not in joint_of:
+                joint_of[k] = len(order)
+                order.append(k)
+    joints = []
+    for k in order:
+        node = nodes[k]
+        parent = node["parent"] if k != root else None
+        if k == root or parent not in joint_of:
+            pos, rot, scale = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0]  # the character's origin
+            parent = None
+        else:
+            pos, rot, scale = _mirror_trs(node["pos"], node["rot"], node["scale"])
+        joints.append({"name": node["name"] or f"joint{len(joints)}",
+                       "parent": joint_of[parent] if parent is not None else -1,
+                       "translation": pos, "rotation": rot, "scale": scale})
+    top = joint_of[order[0]]
+    skin_joints = [joint_of.get(k, top) for k in bone_keys]
+    inverse_bind = np.stack([_MIRROR @ np.asarray(b, float) @ _MIRROR if k in joint_of else np.eye(4)
+                             for k, b in zip(bone_keys, bind_poses)])
+    indices = np.clip(np.asarray(bone_indices, np.int64).reshape(len(bone_indices), -1), 0, len(bone_keys) - 1)
+    weights = np.asarray(bone_weights, np.float32).reshape(len(bone_weights), -1)
+    if weights.shape[1] > 4:  # glTF's JOINTS_0/WEIGHTS_0 hold 4 influences: keep the strongest
+        top = np.argsort(-weights, axis=1)[:, :4]
+        weights = np.take_along_axis(weights, top, 1)
+        indices = np.take_along_axis(indices, top, 1)
+    elif weights.shape[1] < 4:
+        pad = 4 - weights.shape[1]
+        weights = np.hstack([weights, np.zeros((len(weights), pad), np.float32)])
+        indices = np.hstack([indices, np.zeros((len(indices), pad), np.int64)])
+    total = weights.sum(axis=1, keepdims=True)
+    weights = np.where(total > 0, weights / np.maximum(total, 1e-8), np.array([1, 0, 0, 0], np.float32))
+    rig = {"joints": joints, "skin_joints": skin_joints, "inverse_bind": inverse_bind,
+           "joints_0": indices.astype(np.uint16), "weights_0": weights.astype(np.float32)}
+    return rig, joint_of
+
+
+def export_animation(animator, joint_of, name, fps=30.0):
+    """The clip playing in `animator`, sampled to glTF channels for the joints in `joint_of`."""
+    length = animator.length
+    times = np.linspace(0.0, length, max(2, int(round(length * fps)) + 1))
+    channels = []
+    root = animator.root_node
+    for key, track in animator.tracks.items():
+        joint = joint_of.get(key)
+        if joint is None or key == root:
+            continue
+        samples = [_mirror_trs(*animator.local_trs(key, float(t))) for t in times]
+        if "position" in track:
+            channels.append({"joint": joint, "path": "translation", "values": np.array([s[0] for s in samples])})
+        if "rotation" in track or "euler" in track:
+            rot = np.array([s[1] for s in samples])
+            for i in range(1, len(rot)):
+                if np.dot(rot[i], rot[i - 1]) < 0:
+                    rot[i] = -rot[i]
+            rot /= np.maximum(np.linalg.norm(rot, axis=1, keepdims=True), 1e-12)
+            channels.append({"joint": joint, "path": "rotation", "values": rot})
+        if "scale" in track:
+            channels.append({"joint": joint, "path": "scale", "values": np.array([s[2] for s in samples])})
+    return {"name": name, "times": times.astype(np.float32), "channels": channels}

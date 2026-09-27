@@ -66,6 +66,9 @@ leave out raises a clear "not supported" message in the viewer.
 * **`animation_targets(clip)` / `animate(model, clip)`**: for `animation` assets, list the models a clip fits,
   and return an object with `.length` and `.points_at(t)` giving the posed vertices (same order as `mesh(model)`).
   The viewer then plays the animation on the model.
+* **`skeleton(model, clip=None)`**: for skinned models, `(rig, animation)` with the joints, skin weights and
+  inverse bind matrices (and, with a clip, the sampled joint curves). GLB exports then include the skeleton, and
+  **Save animated GLB...** the animation. See the docstring in `engines/sdk.py` for the exact format.
 * **`sprite_frames(clip)`**: for 2D animations, `([(time, sprite Asset)], length)`. The viewer shows a
   **Play sprite animation** button and flips through the sprites' images.
 * **`sprite_rects(texture)`**: `[(x, y, w, h)]` of the sprites cut from a sprite sheet (y measured from the
@@ -135,7 +138,7 @@ texture2ddecoder, brotli) are guaranteed to be available in the packaged exe.
 
 | Engine | Handles | Missing (good first plugin) |
 |---|---|---|
-| Unity | models with materials, textures, sprites, text, AudioClips, AnimationClips (generic clips play on skinned models) | humanoid (muscle) animation playback |
+| Unity | models with materials, textures, sprites, text, AudioClips, AnimationClips (generic and humanoid clips play on skinned models; rigged/animated GLB export) | IK goals and twist distribution for humanoid clips |
 | Source | .mdl models, .bsp maps with props, .vtf textures, .vmt materials, sounds, text | model animations, map entities/lighting |
 | Source 2 | .vmdl_c models + materials, .vtex_c textures, .vsnd_c sounds, text | animations, maps (.vmap_c / world nodes) |
 | Fallout 1/2 | .dat archives (DAT1 LZSS / DAT2 zlib), FRM sprites, RIX images, ACM sounds, MSG text | maps, critter art sets as animations |

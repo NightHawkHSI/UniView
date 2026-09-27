@@ -166,7 +166,7 @@ class BSP:
         raw = self.lump(LUMP_PAKFILE)
         return zipfile.ZipFile(io.BytesIO(raw)) if raw[:2] == b"PK" else None
 
-    def geometry(self, skip_faces=()):
+    def geometry(self, skip_faces=(), skip_tools=True):
         """(points (N,3), uvs (N,2), [(texdata index, triangles (M,3))]) in Source units, Z up."""
         verts = np.frombuffer(self.lump(LUMP_VERTEXES), "<f4").reshape(-1, 3)
         edges = np.frombuffer(self.lump(LUMP_EDGES), "<u2").reshape(-1, 2)
@@ -193,11 +193,11 @@ class BSP:
 
         for f in range(len(faces) // 56):
             first_edge, num_edges, ti, disp = struct.unpack_from("<ihhh", faces, f * 56 + 4)
-            if f in skip_faces or ti < 0 or num_edges < 3 or tex_flags[ti] & SKIP_FLAGS:
+            if f in skip_faces or ti < 0 or num_edges < 3 or (skip_tools and tex_flags[ti] & SKIP_FLAGS):
                 continue
             td = tex_data[ti]
             name = materials[td][0] if 0 <= td < len(materials) else ""
-            if name.lower().startswith(SKIP_MATERIALS):
+            if skip_tools and name.lower().startswith(SKIP_MATERIALS):
                 continue
             se = surfedges[first_edge:first_edge + num_edges]
             idx = np.where(se >= 0, edges[np.abs(se), 0], edges[np.abs(se), 1])

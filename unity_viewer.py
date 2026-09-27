@@ -8,7 +8,7 @@ the right. Models render in 3D with their texture when the plugin can find it, t
 show as images.
 """
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 APP_SHORT = "UniView"
 APP_TITLE = "UniView - Game Asset Viewer"
 
@@ -50,7 +50,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QDockWidget, QFileDialog, QFormLayout, QHeaderView, QProgressBar, QToolButton,
+    QDockWidget, QFileDialog, QFormLayout, QHeaderView, QProgressBar, QProgressDialog, QToolButton,
     QFileIconProvider, QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem,
     QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSlider, QSplitter,
     QStackedWidget, QStyle, QStyledItemDelegate, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
@@ -59,7 +59,9 @@ from PIL import ImageDraw
 from pyvistaqt import QtInteractor
 
 import engines
-from engines.sdk import IMAGE_KINDS, KIND_LABELS, KINDS, MODEL_KINDS, NORMAL, THUMB_KINDS, Progress, main_texture
+from engines.sdk import (
+    IMAGE_KINDS, KIND_LABELS, KINDS, MODEL_KINDS, NORMAL, THUMB_KINDS, VIEW_OPTIONS, Progress, main_texture,
+)
 
 MAX_TEXT_CHARS = 200_000
 THUMB_SIZE = 40      # icon size in the list
@@ -335,6 +337,27 @@ def safe_filename(name):
 
 # --------------------------------------------------------------------------- stats & search
 
+VIEW_OPTION_ITEMS = (
+    ("hide_unreadable", "Hide assets that can't be shown",
+     "Hide list entries that failed to decode or are empty placeholders (e.g. 0x0 textures made while the game runs)"),
+    ("hide_skybox", "Hide 3D skybox in maps",
+     "Source maps: leave out the small copy of the scenery around the sky_camera"),
+    ("hide_tool_surfaces", "Hide tool brushes in maps",
+     "Source maps: leave out nodraw, trigger, clip, hint and sky brushes"),
+    ("hide_lods", "Hide lower-detail LODs in scenes",
+     "Scenes and prefabs: show only the most detailed copy of objects that have LODs"),
+    ("hide_inactive", "Hide switched-off objects in scenes",
+     "Scenes and prefabs: leave out objects and renderers the game has disabled"),
+)
+
+
+def is_unreadable(stats):
+    """Stats of an asset that failed to decode or has nothing in it."""
+    if not stats:
+        return False
+    return stats.get("info") == "?" or stats.get("size") == 0 or stats.get("w") == 0 or stats.get("h") == 0
+
+
 def fmt_size(n):
     if n is None:
         return ""
@@ -480,10 +503,11 @@ def display_texture(md, materials):
     return main_texture(materials)
 
 
-def write_glb(session, md, materials, path):
+def write_glb(session, md, materials, path, rig=None, animation=None):
     """Binary glTF: positions, normals, UVs, vertex colors and embedded base-color textures.
 
     One primitive per submesh, each with its material. Opens directly in Blender.
+    rig / animation (see GameSession.skeleton): adds the skeleton, the skin weights and an animation.
     """
     count = len(md.points)
     buf, views, accessors = bytearray(), [], []
@@ -503,8 +527,8 @@ def write_glb(session, md, materials, path):
         acc = {"bufferView": add_view(arr.tobytes(), target), "componentType": component,
                "count": len(arr), "type": kind}
         if bounds:
-            acc["min"] = arr.min(axis=0).tolist()
-            acc["max"] = arr.max(axis=0).tolist()
+            acc["min"] = np.atleast_1d(arr.min(axis=0)).tolist()
+            acc["max"] = np.atleast_1d(arr.max(axis=0)).tolist()
         accessors.append(acc)
         return len(accessors) - 1
 
@@ -520,6 +544,11 @@ def write_glb(session, md, materials, path):
         attributes["TEXCOORD_0"] = add_accessor(uv, "VEC2")
     if md.colors is not None and len(md.colors) == count:
         attributes["COLOR_0"] = add_accessor(np.clip(md.colors, 0, 1).astype(np.float32), "VEC4")
+    if rig is not None:
+        # Vertices point at skin bones; the skin lists every joint, so map bones -> joints.
+        skin_joints = np.asarray(rig["skin_joints"], np.int64)
+        attributes["JOINTS_0"] = add_accessor(skin_joints[rig["joints_0"]].astype(np.uint16), "VEC4", 5123)
+        attributes["WEIGHTS_0"] = add_accessor(np.asarray(rig["weights_0"], np.float32), "VEC4")
 
     gl_materials, images, textures, texture_index, mat_index = [], [], [], {}, {}
     for mat in materials:
@@ -571,6 +600,8 @@ def write_glb(session, md, materials, path):
         "meshes": [{"name": name, "primitives": primitives}],
         "accessors": accessors, "bufferViews": views,
     }
+    if rig is not None:
+        _add_skeleton(gltf, rig, animation, add_accessor)
     if gl_materials:
         gltf["materials"] = gl_materials
     if images:
@@ -588,6 +619,48 @@ def write_glb(session, md, materials, path):
         f.write(struct.pack("<II", len(buf), 0x004E4942))
         f.write(buf)
     return [path]
+
+
+def _add_skeleton(gltf, rig, animation, add_accessor):
+    """Joint nodes, the skin on node 0 (the mesh) and, if given, the animation."""
+    joints = rig["joints"]
+    first = len(gltf["nodes"])
+    nodes = [{"name": j["name"], "translation": j["translation"], "rotation": j["rotation"], "scale": j["scale"]}
+             for j in joints]
+    for i, j in enumerate(joints):
+        if j["parent"] >= 0:
+            nodes[j["parent"]].setdefault("children", []).append(first + i)
+    gltf["nodes"] += nodes
+    roots = [first + i for i, j in enumerate(joints) if j["parent"] < 0]
+    gltf["scenes"][0]["nodes"] += roots
+    # Inverse bind matrices: the skin bones' own; other joints get their rest pose's inverse.
+    world = []
+    for j in joints:
+        m = np.eye(4)
+        x, y, z, w = j["rotation"]
+        m[:3, :3] = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                              [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                              [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]]) * j["scale"]
+        m[:3, 3] = j["translation"]
+        world.append(world[j["parent"]] @ m if j["parent"] >= 0 else m)
+    inverse = [np.linalg.inv(m) for m in world]
+    for bone, joint in enumerate(rig["skin_joints"]):
+        if bone < len(rig["inverse_bind"]):
+            inverse[joint] = rig["inverse_bind"][bone]
+    ibm = np.stack(inverse).transpose(0, 2, 1).astype(np.float32)  # glTF matrices are column-major
+    gltf["skins"] = [{"joints": list(range(first, first + len(joints))), "skeleton": roots[0],
+                      "inverseBindMatrices": add_accessor(ibm, "MAT4", target=None)}]
+    gltf["nodes"][0]["skin"] = 0
+    if not animation or not animation["channels"]:
+        return
+    times = add_accessor(np.asarray(animation["times"], np.float32), "SCALAR", target=None, bounds=True)
+    samplers, channels = [], []
+    for ch in animation["channels"]:
+        values = np.asarray(ch["values"], np.float32)
+        samplers.append({"input": times, "interpolation": "LINEAR",
+                         "output": add_accessor(values, "VEC4" if values.shape[1] == 4 else "VEC3", target=None)})
+        channels.append({"sampler": len(samplers) - 1, "target": {"node": first + ch["joint"], "path": ch["path"]}})
+    gltf["animations"] = [{"name": animation["name"] or "animation", "samplers": samplers, "channels": channels}]
 
 
 def write_obj(session, md, materials, path):
@@ -776,6 +849,13 @@ def compat_report_url(project):
 
 # --------------------------------------------------------------------------- UI
 
+def fmt_distance(value):
+    """Short number for a speed/distance in scene units (1.2k, 35, 0.04)."""
+    if value >= 1000:
+        return f"{value / 1000:.1f}k"
+    return f"{value:.3g}"
+
+
 def wheel_steps(event):
     """Scroll amount in 'notches' (mouse wheel = 1 per notch, touchpads give fractions)."""
     delta = event.angleDelta().y() or event.pixelDelta().y() * 4
@@ -940,6 +1020,12 @@ class MeshView(QWidget):
             btn.clicked.connect(lambda _=False, f=factor: self.zoom(f))
         reset = QPushButton("Reset camera")
         reset.clicked.connect(self.reset_camera)
+        self.fly = QCheckBox("Fly (F)")
+        self.fly.setToolTip("Walk/fly through the scene like a game camera:\n"
+                            "WASD move, Q/E down/up, drag to look around, Shift faster,\n"
+                            "mouse wheel changes speed, double-click a spot to jump there.\n"
+                            "F toggles it, Esc leaves it.")
+        self.fly.toggled.connect(self.set_fly)
         self.uv_combo = QComboBox()
         self.uv_combo.setToolTip("Which UV set maps the texture.\n"
                                  "UV0 is the normal one; UV1 is often the baked-lighting (lightmap) layout.")
@@ -949,6 +1035,43 @@ class MeshView(QWidget):
         uv_layout.clicked.connect(self.uv_layout_requested)
 
         self.info = QLabel()
+
+        # Fly camera: keys held, mouse-look drag, speed (units/second), yaw/pitch (degrees)
+        self._keys = set()
+        self._look = None
+        self._fly_speed = 1.0
+        self._fly_base = 1.0     # the scene's default speed; the slider goes from 1/100x to 100x of it
+        self._yaw = self._pitch = 0.0
+        self._fly_last = 0.0
+        self._fly_timer = QTimer(self, interval=16)
+        self._fly_timer.timeout.connect(self._fly_tick)
+        self.fly_hint = QLabel()
+        self.fly_hint.setStyleSheet("color: #9ecbff;")
+        self.speed_slider = QSlider(Qt.Horizontal)
+        self.speed_slider.setRange(0, self.SPEED_STEPS)
+        self.speed_slider.setValue(self.SPEED_STEPS // 2)
+        self.speed_slider.setFixedWidth(180)
+        self.speed_slider.setToolTip("Camera speed (the mouse wheel changes it too while flying)")
+        self.speed_slider.valueChanged.connect(self._speed_from_slider)
+        self.speed_label = QLabel()
+        self.speed_label.setMinimumWidth(70)
+        slower, faster = QPushButton("\u2212"), QPushButton("+")
+        for btn, step in ((slower, -1), (faster, 1)):
+            btn.setFixedWidth(28)
+            btn.setToolTip("Slower" if step < 0 else "Faster")
+            btn.clicked.connect(lambda _=False, st=step: self.speed_slider.setValue(
+                self.speed_slider.value() + st * self.SPEED_STEPS // 20))
+        self.fly_bar = QWidget()
+        fb = QHBoxLayout(self.fly_bar)
+        fb.setContentsMargins(0, 0, 0, 0)
+        fb.addWidget(QLabel("Speed:"))
+        fb.addWidget(slower)
+        fb.addWidget(self.speed_slider)
+        fb.addWidget(faster)
+        fb.addWidget(self.speed_label)
+        fb.addWidget(self.fly_hint, 1)
+        self.fly_bar.hide()
+        self.plotter.interactor.setFocusPolicy(Qt.StrongFocus)
 
         # Animation playback (shown while an animation plays on the model)
         self.animator = None
@@ -973,7 +1096,7 @@ class MeshView(QWidget):
         self.anim_bar.hide()
         bar = QHBoxLayout()
         for w in (self.wire, self.edges, self.use_tex, self.flip_v, self.tex_alpha, self.use_colors,
-                  zoom_in, zoom_out, reset, QLabel("UV:"), self.uv_combo, uv_layout):
+                  zoom_in, zoom_out, reset, self.fly, QLabel("UV:"), self.uv_combo, uv_layout):
             bar.addWidget(w)
         bar.addStretch()
         bar.addWidget(self.info)
@@ -988,20 +1111,199 @@ class MeshView(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addLayout(bar)
+        lay.addWidget(self.fly_bar)
         lay.addWidget(self.anim_bar)
         lay.addWidget(split, 1)
 
     def eventFilter(self, obj, event):
-        if obj is self.plotter.interactor and event.type() == QEvent.Wheel:
-            self.zoom(1.2 ** wheel_steps(event))
-            return True
+        if obj is self.plotter.interactor:
+            kind = event.type()
+            if kind == QEvent.Wheel:
+                if self.fly.isChecked():
+                    # One wheel notch = one slider step (x1.25 speed).
+                    self.speed_slider.setValue(self.speed_slider.value() + round(wheel_steps(event)))
+                else:
+                    self.zoom(1.2 ** wheel_steps(event))
+                return True
+            if kind == QEvent.KeyPress and event.key() == Qt.Key_F and not event.isAutoRepeat() \
+                    and not event.modifiers() & ~Qt.KeypadModifier:
+                self.fly.toggle()
+                return True
+            if self.fly.isChecked() and self._fly_event(event):
+                return True
         return super().eventFilter(obj, event)
 
     def zoom(self, factor):
         if self.poly is None or factor <= 0:
             return
+        if self.fly.isChecked():
+            self._fly_move(self._fly_dir() * self._fly_speed * (0.5 if factor > 1 else -0.5))
+            return
         self.plotter.camera.zoom(factor)
         self.plotter.render()
+
+    # ---- fly camera
+    FLY_MOVES = {Qt.Key_W: (1, 0, 0), Qt.Key_Up: (1, 0, 0), Qt.Key_S: (-1, 0, 0), Qt.Key_Down: (-1, 0, 0),
+                 Qt.Key_D: (0, 1, 0), Qt.Key_Right: (0, 1, 0), Qt.Key_A: (0, -1, 0), Qt.Key_Left: (0, -1, 0),
+                 Qt.Key_E: (0, 0, 1), Qt.Key_Space: (0, 0, 1), Qt.Key_Q: (0, 0, -1), Qt.Key_Control: (0, 0, -1)}
+    FLY_FOV = 75.0  # degrees; wider than the orbit view, like a game camera
+    LOOK_DEGREES_PER_PIXEL = 0.25
+
+    def set_fly(self, on):
+        """Game-style camera: move with the keyboard, look around with the mouse, get inside places."""
+        with QSignalBlocker(self.fly):
+            self.fly.setChecked(bool(on))
+        renderer, camera = self.plotter.renderer, self.plotter.camera
+        self._keys.clear()
+        self._look = None
+        if on:
+            camera.view_angle = self.FLY_FOV
+            # Keep walls drawn right up to the camera (VTK otherwise clips close geometry away).
+            renderer.SetNearClippingPlaneTolerance(0.0001)
+            self._fly_home()
+            self.plotter.interactor.setFocus()
+            self.fly_bar.show()
+            self._update_fly_hint()
+            self._fly_view()
+        else:
+            self._fly_timer.stop()
+            camera.view_angle = 30.0
+            renderer.SetNearClippingPlaneTolerance(0.0)
+            self.fly_bar.hide()
+            renderer.ResetCameraClippingRange()
+            self.plotter.render()
+
+    SPEED_STEPS = 40            # slider positions; each one is x1.25, so 1/100x .. 100x around the middle
+    SPEED_RATIO = 100.0 ** (2.0 / 40)
+
+    def _speed_from_slider(self, value):
+        self._fly_speed = self._fly_base * self.SPEED_RATIO ** (value - self.SPEED_STEPS // 2)
+        self._update_fly_hint()
+
+    def _update_fly_hint(self):
+        self.speed_label.setText(f"{fmt_distance(self._fly_speed)}/s")
+        self.fly_hint.setText(f"WASD move \u00b7 Q/E down/up \u00b7 drag to look \u00b7 Shift faster \u00b7 "
+                              f"wheel = speed \u00b7 double-click to jump there "
+                              f"\u00b7 F / Esc to leave")
+
+    def _fly_home(self):
+        """Start over the busy part of the scene: huge ground/water planes or skyboxes would otherwise
+        put the camera miles away and make it far too fast. Speed: the area in ~10 seconds."""
+        self._sync_fly()
+        if self.poly is None or not self.poly.n_points:
+            return
+        pts = np.asarray(self.poly.points)
+        if len(pts) > 200_000:
+            pts = pts[np.random.default_rng(0).choice(len(pts), 200_000, replace=False)]
+        lo, hi = np.percentile(pts, [2, 98], axis=0)
+        size = float(np.linalg.norm(hi - lo)) or float(self.poly.length) or 1.0
+        # Keep the user's slider position across scenes; it's relative to each scene's size.
+        self._fly_base = max(size * 0.1, 1e-4)
+        self._speed_from_slider(self.speed_slider.value())
+        camera = self.plotter.camera
+        camera.position = tuple((lo + hi) / 2 - self._fly_dir() * size * 0.75)
+
+    def _sync_fly(self):
+        """Yaw/pitch from where the camera currently looks (models are Y-up); level the horizon."""
+        camera = self.plotter.camera
+        d = np.subtract(camera.focal_point, camera.position)
+        d = d / max(np.linalg.norm(d), 1e-12)
+        self._pitch = float(np.degrees(np.arcsin(np.clip(d[1], -1, 1))))
+        self._yaw = float(np.degrees(np.arctan2(d[0], d[2])))
+
+    def _fly_dir(self):
+        y, p = np.radians(self._yaw), np.radians(self._pitch)
+        return np.array([np.cos(p) * np.sin(y), np.sin(p), np.cos(p) * np.cos(y)])
+
+    def _fly_view(self):
+        camera = self.plotter.camera
+        pos = np.asarray(camera.position, float)
+        camera.focal_point = tuple(pos + self._fly_dir() * max(self._fly_speed, 1e-4))
+        camera.up = (0.0, 1.0, 0.0)
+        self.plotter.renderer.ResetCameraClippingRange()
+        self.plotter.render()
+
+    def _fly_move(self, delta):
+        camera = self.plotter.camera
+        camera.position = tuple(np.asarray(camera.position, float) + delta)
+        self._fly_view()
+
+    def _fly_event(self, event):
+        """Keyboard/mouse while flying; True when handled (so VTK's own controls don't also react)."""
+        kind = event.type()
+        if kind == QEvent.KeyPress:
+            if event.key() == Qt.Key_Escape:
+                self.set_fly(False)
+            elif not event.isAutoRepeat():
+                self._keys.add(event.key())
+                if event.key() in self.FLY_MOVES and not self._fly_timer.isActive():
+                    self._fly_last = time.perf_counter()
+                    self._fly_timer.start()
+            return True  # also swallow VTK's single-key commands (w/s/e/q...)
+        if kind == QEvent.KeyRelease:
+            if not event.isAutoRepeat():
+                self._keys.discard(event.key())
+            return True
+        if kind == QEvent.FocusOut:
+            self._keys.clear()
+            return False
+        if kind == QEvent.MouseButtonDblClick and event.button() == Qt.LeftButton:
+            self._fly_jump(event.position())
+            return True
+        if kind == QEvent.MouseButtonPress:
+            self._look = event.position()
+            self.plotter.interactor.setFocus()
+            return True
+        if kind == QEvent.MouseMove and self._look is not None:
+            pos = event.position()
+            self._yaw -= (pos.x() - self._look.x()) * self.LOOK_DEGREES_PER_PIXEL
+            self._pitch = min(89.0, max(-89.0, self._pitch - (pos.y() - self._look.y()) * self.LOOK_DEGREES_PER_PIXEL))
+            self._look = pos
+            self._fly_view()
+            return True
+        if kind == QEvent.MouseButtonRelease:
+            self._look = None
+            return True
+        return False
+
+    def _fly_tick(self):
+        now = time.perf_counter()
+        dt = min(now - self._fly_last, 0.5)  # big scenes can render slowly: keep the real speed
+        self._fly_last = now
+        moves = [self.FLY_MOVES[k] for k in self._keys if k in self.FLY_MOVES]
+        if not moves or self.poly is None:
+            self._fly_timer.stop()
+            return
+        forward = self._fly_dir()
+        right = np.cross(forward, (0.0, 1.0, 0.0))
+        right = right / max(np.linalg.norm(right), 1e-12)
+        f, r, u = np.sum(moves, axis=0)
+        step = self._fly_speed * dt * (4.0 if Qt.Key_Shift in self._keys else 1.0)
+        delta = (forward * f + right * r + np.array([0.0, 1.0, 0.0]) * u) * step
+        if np.any(delta):
+            self._fly_move(delta)
+
+    def _fly_jump(self, point):
+        """Double-click: fly most of the way to the surface under the mouse, facing it."""
+        from vtkmodules.vtkRenderingCore import vtkCellPicker
+        widget = self.plotter.interactor
+        ratio = widget.devicePixelRatioF()
+        picker = vtkCellPicker()
+        picker.SetTolerance(0.0005)
+        if not picker.Pick(point.x() * ratio, (widget.height() - point.y()) * ratio, 0, self.plotter.renderer):
+            return
+        target = np.asarray(picker.GetPickPosition(), float)
+        camera = self.plotter.camera
+        pos = np.asarray(camera.position, float)
+        d = target - pos
+        dist = np.linalg.norm(d)
+        if dist < 1e-9:
+            return
+        d /= dist
+        self._pitch = float(np.degrees(np.arcsin(np.clip(d[1], -1, 1))))
+        self._yaw = float(np.degrees(np.arctan2(d[0], d[2])))
+        camera.position = tuple(pos + d * dist * 0.8)
+        self._fly_view()
 
     def reset_camera(self):
         self._home_camera()
@@ -1013,6 +1315,10 @@ class MeshView(QWidget):
         self.plotter.camera.azimuth = 35
         self.plotter.camera.elevation = 20
         self.plotter.reset_camera()
+        if self.fly.isChecked():
+            self.plotter.camera.view_angle = self.FLY_FOV
+            self._fly_home()
+            self._fly_view()
 
     def uv_channels(self):
         if self.poly is None:
@@ -1604,6 +1910,7 @@ class AnimationView(QWidget):
     """An animation clip: its summary, and the models it can be played on."""
 
     play_requested = Signal(object)  # model Asset
+    export_requested = Signal(object)  # model Asset: save it rigged + animated
     flipbook_requested = Signal()
 
     def __init__(self, parent=None):
@@ -1614,6 +1921,9 @@ class AnimationView(QWidget):
         self.targets.setMinimumWidth(320)
         self.play = QPushButton("\u25b6 Play on model")
         self.play.clicked.connect(self._play)
+        self.export = QPushButton("Save animated GLB...")
+        self.export.setToolTip("The model with its skeleton and this animation, e.g. for Blender")
+        self.export.clicked.connect(self._export)
         self.flipbook = QPushButton("\u25b6 Play sprite animation")
         self.flipbook.clicked.connect(self.flipbook_requested)
         self.flipbook.hide()
@@ -1623,6 +1933,7 @@ class AnimationView(QWidget):
         row.addWidget(QLabel("Model:"))
         row.addWidget(self.targets, 1)
         row.addWidget(self.play)
+        row.addWidget(self.export)
         row.addWidget(self.flipbook)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -1640,6 +1951,7 @@ class AnimationView(QWidget):
         for model in targets:
             self.targets.addItem(model.name, model)
         self.play.setEnabled(bool(targets))
+        self.export.setEnabled(bool(targets))
         self.targets.setEnabled(bool(targets))
         self.note.setText(note or ("Pick a model to play this animation on (best matches first)." if targets else
                                    "No model with a matching skeleton was found for this animation."))
@@ -1648,6 +1960,11 @@ class AnimationView(QWidget):
         model = self.targets.currentData()
         if model is not None:
             self.play_requested.emit(model)
+
+    def _export(self):
+        model = self.targets.currentData()
+        if model is not None:
+            self.export_requested.emit(model)
 
 
 class ImageWindow(QDialog):
@@ -1786,17 +2103,33 @@ def steam_library_dirs():
     return out
 
 
-def find_steam_games():
-    """[(name, path, plugin)] for every game in the Steam libraries that an engine plugin recognizes."""
-    games = []
+def find_steam_games(progress=None, cancelled=None):
+    """[(name, path, plugin)] for every game in the Steam libraries that an engine plugin recognizes.
+
+    progress(done, total, folder name) is called before each folder is checked; cancelled() -> True stops early.
+    """
+    folders = []
     for common in steam_library_dirs():
-        for name in sorted(os.listdir(common)):
-            path = os.path.join(common, name)
-            if not os.path.isdir(path):
-                continue
+        try:
+            names = sorted(os.listdir(common))
+        except OSError:
+            continue
+        folders += [(name, os.path.join(common, name)) for name in names]
+    games = []
+    for i, (name, path) in enumerate(folders):
+        if cancelled is not None and cancelled():
+            break
+        if progress is not None:
+            progress(i, len(folders), name)
+        if not os.path.isdir(path):
+            continue
+        try:
             plugin, score = engines.detect(path)
-            if plugin is not None and score >= 50:
-                games.append((name, path, plugin))
+        except Exception:
+            log.exception("Checking %s failed", path)
+            continue
+        if plugin is not None and score >= 50:
+            games.append((name, path, plugin))
     return games
 
 
@@ -2135,6 +2468,7 @@ class HomePage(QWidget):
     _detected = Signal(str, object)
     _compat_fetched = Signal(int)
     _games_found = Signal(object)
+    _find_progress = Signal(int, int, str)  # done, total, folder name
     ADD, FIND = "__add__", "__find__"
     UNTAGGED = "__untagged__"
     UNKNOWN_ENGINE = "__unknown_engine__"
@@ -2160,7 +2494,10 @@ class HomePage(QWidget):
         self._detected.connect(self._on_detected)
         self._compat_fetched.connect(self._on_compat_fetched)
         self._games_found.connect(self._on_games_found)
+        self._find_progress.connect(self._on_find_progress)
         self._finding = False
+        self._find_dialog = None
+        self._find_cancel = False
         # Background counts/version checks finish in bursts - redraw once per burst.
         self.refresh_timer = QTimer(self, singleShot=True, interval=150)
         self.refresh_timer.timeout.connect(self.refresh)
@@ -2599,22 +2936,55 @@ class HomePage(QWidget):
         if self._finding:
             return
         self._finding = True
+        self._find_cancel = False
         log.info("Searching Steam libraries for games the engine plugins can read...")
-        self.count_label.setText("Searching Steam libraries...")
+        dlg = QProgressDialog("Looking for your Steam libraries...", "Cancel", 0, 0, self)
+        dlg.setWindowTitle("Find games in Steam")
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setMinimumWidth(460)
+        dlg.setAutoReset(False)
+        dlg.setAutoClose(False)
+        dlg.canceled.connect(self._cancel_find)
+        dlg.show()
+        self._find_dialog = dlg
 
         def work():
             try:
-                games = find_steam_games()
+                games = find_steam_games(self._find_progress.emit, lambda: self._find_cancel)
             except Exception:
                 log.exception("Searching the Steam libraries failed")
                 games = []
-            self._games_found.emit(games)
+            try:
+                self._games_found.emit(games)
+            except RuntimeError:
+                pass  # window closed
 
         threading.Thread(target=work, daemon=True, name="find-games").start()
 
+    def _cancel_find(self):
+        self._find_cancel = True
+        if self._find_dialog is not None:
+            self._find_dialog.setLabelText("Stopping...")
+
+    def _on_find_progress(self, done, total, name):
+        dlg = self._find_dialog
+        if dlg is None or self._find_cancel:
+            return
+        dlg.setMaximum(max(total, 1))
+        dlg.setValue(done)
+        dlg.setLabelText(f"Checking game folder {done + 1:,} of {total:,}:\n{name}")
+
     def _on_games_found(self, games):
         self._finding = False
+        if self._find_dialog is not None:
+            self._find_dialog.canceled.disconnect(self._cancel_find)
+            self._find_dialog.close()
+            self._find_dialog.deleteLater()
+            self._find_dialog = None
         self.refresh()
+        if self._find_cancel and not games:
+            return
         log.info("Found %d supported game(s) in Steam libraries", len(games))
         if not games:
             QMessageBox.information(self, "Find games", "No games found in your Steam libraries that the "
@@ -3002,6 +3372,7 @@ class MainWindow(QMainWindow):
         self.text_view = QPlainTextEdit(readOnly=True)
         self.anim_view = AnimationView()
         self.anim_view.play_requested.connect(self.play_animation)
+        self.anim_view.export_requested.connect(self.export_animated)
         self.anim_view.flipbook_requested.connect(self.play_flipbook)
         self.flipbook_timer = QTimer(self, interval=15)
         self.flipbook_timer.timeout.connect(self._flipbook_tick)
@@ -3056,6 +3427,8 @@ class MainWindow(QMainWindow):
             self.addDockWidget(Qt.BottomDockWidgetArea, self.console)
             self.resizeDocks([self.console], [170], Qt.Vertical)
 
+        for key in VIEW_OPTIONS:
+            VIEW_OPTIONS[key] = self.settings.get("opt_" + key, True)
         self._build_menu()
         if self.settings.get("view") == "grid":
             self.grid_btn.setChecked(True)
@@ -3164,6 +3537,16 @@ class MainWindow(QMainWindow):
             toggle.setShortcut("Ctrl+`")
             view.addAction(toggle)
 
+        options = self.menuBar().addMenu("&Options")
+        for key, text, tip in VIEW_OPTION_ITEMS:
+            act = QAction(text, self, checkable=True)
+            act.setChecked(self.settings.get("opt_" + key, True))
+            act.setToolTip(tip)
+            act.setStatusTip(tip)
+            act.toggled.connect(lambda on, key=key: self._set_view_option(key, on))
+            options.addAction(act)
+        options.setToolTipsVisible(True)
+
         help_menu = self.menuBar().addMenu("&Help")
         online = QAction("Download community compatibility list", self, checkable=True)
         online.setChecked(self.settings.get("online_compat", True))
@@ -3179,6 +3562,21 @@ class MainWindow(QMainWindow):
         help_menu.addAction("Open log file", lambda: open_path(LOG_FILE))
         help_menu.addAction("Open crash log", lambda: open_path(CRASH_FILE))
         help_menu.addAction("Open app folder", lambda: os.startfile(APP_DIR))
+
+    def _set_view_option(self, key, on):
+        self.settings["opt_" + key] = on
+        self.settings.save()
+        if key == "hide_unreadable":
+            self.apply_filter()
+            return
+        VIEW_OPTIONS[key] = on
+        for entry in self.loaded.values():
+            session = entry.get("session")
+            if session is not None:
+                with session.lock:
+                    session.options_changed()
+        if self.current is not None and self.current.kind in MODEL_KINDS:
+            self.show_asset(self.current)  # rebuild the map / scene with the new setting
 
     def _set_online_compat(self, on):
         self.settings["online_compat"] = on
@@ -3371,7 +3769,8 @@ class MainWindow(QMainWindow):
             log.info("Finished measuring all assets (tris, sizes)")
         if self.tree.header().sortIndicatorSection() in (1, 2) and not self.resort_timer.isActive():
             self.resort_timer.start()
-        if AssetFilter(self.search.text()).conditions and not self.filter_timer.isActive():
+        unreadable = self.settings.get("opt_hide_unreadable", True) and any(is_unreadable(st) for _k, st in batch)
+        if (unreadable or AssetFilter(self.search.text()).conditions) and not self.filter_timer.isActive():
             self.filter_timer.start()
 
     def resort(self):
@@ -3385,6 +3784,7 @@ class MainWindow(QMainWindow):
     def apply_filter(self):
         filt = AssetFilter(self.search.text())
         want = self.type_combo.currentData()
+        hide_unreadable = self.settings.get("opt_hide_unreadable", True)
         self.tree.setUpdatesEnabled(False)
         try:
             for i in range(self.tree.topLevelItemCount()):
@@ -3397,7 +3797,10 @@ class MainWindow(QMainWindow):
                     for j in range(top.childCount()):
                         child = top.child(j)
                         asset = child.data(0, Qt.UserRole)
-                        ok = filt.matches(asset.name, kind, self.stats.get(asset.key))
+                        stats = self.stats.get(asset.key)
+                        ok = filt.matches(asset.name, kind, stats)
+                        if ok and hide_unreadable and is_unreadable(stats):
+                            ok = False
                         if ok and want == "fav":
                             ok = asset.uid in self.favorites
                         child.setHidden(not ok)
@@ -3777,6 +4180,10 @@ class MainWindow(QMainWindow):
                  for tex_asset, color, tris_list in groups.values()]
         self.stack.setCurrentWidget(self.mesh_view)
         self.mesh_view.show_mesh(poly, tex, parts)
+        # Walk through places (scenes, maps, terrains); orbit around single models.
+        place = (asset.kind == "scene" or asset.name.startswith("Terrain:")
+                 or (isinstance(asset.ref, str) and asset.ref.lower().endswith(".bsp")))
+        self.mesh_view.set_fly(place)
         n_tex = sum(len(m.textures) for m in materials)
         log.info("Model '%s': %s verts, %s tris, %d material(s), %d texture(s)%s", asset.name,
                  f"{poly.n_points:,}", f"{poly.n_cells:,}", len(materials), n_tex,
@@ -4031,6 +4438,9 @@ class MainWindow(QMainWindow):
         else:
             filters = "All files (*)"
         ext = self.export_ext(asset, self.settings.get("model_format", "obj"))
+        if asset.kind in ("font", "video") and ext:
+            label = {"ttf": "TrueType font", "otf": "OpenType font"}.get(ext, f"{ext.upper()} video")
+            filters = f"{label} (*.{ext});;All files (*)"
         base = safe_filename(os.path.splitext(os.path.basename(asset.name))[0]
                              if asset.kind in ("text", "file", "audio") else os.path.basename(asset.name))
         path, chosen = self.ask_save_path(f"{base}.{ext}", filters)
@@ -4047,6 +4457,46 @@ class MainWindow(QMainWindow):
             log.exception("Saving %s failed", asset.name)
             QMessageBox.warning(self, "Save failed", str(e))
 
+    def _rig(self, asset, md):
+        """Skeleton for a rigged GLB of a skinned model, or None (static export)."""
+        if asset.kind != "model":
+            return None
+        try:
+            rig, _anim = self.session.skeleton(asset)
+        except (NotImplementedError, ValueError):
+            return None
+        except Exception:
+            log.exception("Reading the skeleton of '%s' failed; saving it without bones", asset.name)
+            return None
+        return rig if len(rig["joints_0"]) == len(md.points) else None
+
+    def export_animated(self, model):
+        """Save `model` as a GLB with its skeleton and the current animation clip."""
+        clip, session = self.current, self.session
+        if clip is None or clip.kind != "animation" or session is None:
+            return
+        base = safe_filename(f"{os.path.basename(model.name)}_{os.path.basename(clip.name)}")
+        path, _chosen = self.ask_save_path(f"{base}.glb", "glTF binary with skeleton and animation (*.glb)")
+        if not path:
+            return
+        if not path.lower().endswith(".glb"):
+            path += ".glb"
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            with session.lock:
+                md = session.mesh(model)
+                rig, animation = session.skeleton(model, clip)
+                materials = self._materials(model)
+                written = write_glb(session, md, materials, path, rig=rig, animation=animation)
+            self.statusBar().showMessage("Saved " + ", ".join(os.path.basename(w) for w in written))
+            log.info("Saved %s ('%s' on '%s', %d joints)", path, clip.name, model.name, len(rig["joints"]))
+        except Exception as e:
+            if not isinstance(e, (ValueError, NotImplementedError)):
+                log.exception("Saving the animated model '%s' failed", model.name)
+            QMessageBox.warning(self, "Save animated GLB", str(e))
+        finally:
+            QApplication.restoreOverrideCursor()
+
     def write_asset(self, asset, path):
         """Save one asset to `path` (.obj/.glb for models); returns the list of files written."""
         session = self.session
@@ -4055,7 +4505,7 @@ class MainWindow(QMainWindow):
                 md = session.mesh(asset)
                 materials = self._materials(asset)  # waits for background indexing if needed
                 if path.lower().endswith(".glb"):
-                    return write_glb(session, md, materials, path)
+                    return write_glb(session, md, materials, path, rig=self._rig(asset, md))
                 return write_obj(session, md, materials, path)
             if asset.kind in IMAGE_KINDS:
                 session.image(asset).save(path)

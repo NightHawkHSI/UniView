@@ -5,3 +5,4 @@ pyvistaqt
 numpy
 Pillow
 TypeTreeGeneratorAPI
+zstandard

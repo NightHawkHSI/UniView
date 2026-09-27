@@ -35,7 +35,7 @@ Unzip it and run `UniView.exe`. You don't need Python.
 |---|---|
 | **What it opens** | Unity, Source, Source 2, Unreal and Fallout 1/2 game folders; loose files and zip archives of any game; any engine that has a [plugin](#engine-plugins) |
 | **What it shows** | Models and maps (3D), textures, sprites, sounds (built-in player), animations (played on their models), text files; everything else can be exported as-is |
-| **What it exports** | Models as `.obj` + `.mtl` + `.png` or a single `.glb` (both open textured in Blender), textures as `.png`, sounds as `.wav`/`.mp3`/`.ogg`, animations as JSON keyframes, text as-is |
+| **What it exports** | Models as `.obj` + `.mtl` + `.png` or a single `.glb` (both open textured in Blender), textures as `.png`, sounds as `.wav`/`.mp3`/`.ogg`, animations as JSON keyframes or a rigged, animated `.glb`, text as-is |
 | **Game files** | Read only. UniView never changes anything |
 | **Tested with** | Robocraft, Muck, Valheim (Unity) · Team Fortress 2, Portal (Source) · CS2, Deadlock (Source 2) · Satisfactory, Headliners, Dead as Disco (Unreal) · Fallout 1 & 2 · Project Zomboid, Serious Sam 2 (loose files) |
 | **Built with** | [UnityPy](https://github.com/K0lb3/UnityPy) · [PySide6](https://doc.qt.io/qtforpython-6/) · [PyVista](https://pyvista.org/) |
@@ -64,7 +64,7 @@ Each game is read by an **engine plugin**. UniView picks the plugin automaticall
 
 | Engine | Games (examples) | Models | Textures | Sound | Other |
 |---|---|---|---|---|---|
-| **Unity** | Valheim, Muck, Among Us, Robocraft, Megabonk | ✔ with materials and their colors; ✔ **scenes & prefabs** (every object placed); ✔ **terrains** | ✔ + sprites, sprite sheets, 2D animations | ✔ AudioClips | ✔ text; fonts (.ttf/.otf); videos; **scripts & data** (item stats, configs...); animations play on their skinned models |
+| **Unity** | Valheim, Muck, Among Us, Robocraft, Megabonk | ✔ with materials and their colors; ✔ **scenes & prefabs** (every object placed); ✔ **terrains** | ✔ + sprites, sprite sheets, 2D animations | ✔ AudioClips | ✔ text; fonts (.ttf/.otf); videos; **scripts & data** (item stats, configs...); animations (generic and humanoid) play on their skinned models and export as animated GLB |
 | **Source** | TF2, HL2, Portal, CS:S, L4D2, GMod | ✔ `.mdl` with `.vmt` materials; ✔ **maps** (`.bsp`) with terrain and static props | ✔ `.vtf` | ✔ wav/mp3 | ✔ text |
 | **Source 2** | CS2, Dota 2, Deadlock, HL: Alyx | ✔ `.vmdl_c` with materials | ✔ `.vtex_c` | ✔ `.vsnd_c` | ✔ text |
 | **Unreal 4/5** | Satisfactory, Dead as Disco, Headliners | ✔ static + skeletal meshes, textures found through their materials | ✔ incl. virtual textures | ✔ Ogg/WAV SoundWaves, Wwise `.wem`, FMOD `.bank`* (not Bink Audio yet) | ✔ ini/json/csv...; raw export of the rest |
@@ -80,7 +80,7 @@ Each game is read by an **engine plugin**. UniView picks the plugin automaticall
 - **Sprite sheets & 2D animations** (Unity): a texture outlines every sprite cut from it (toggle **Sprite outlines**) and lists them; a sprite animation clip plays frame by frame with **Play sprite animation**.
 - **Maps**: Source `.bsp` maps show the whole level with textures, terrain (displacements) and all static props; the 3D skybox is left out.
 - **Sounds** play in a built-in player (play/pause, seek, volume, autoplay) and save as `.wav`/`.mp3`/`.ogg`.
-- **Animations** (Unity): each clip lists the bones it moves; pick a model with a matching skeleton and press **Play on model** to watch it (play/pause and a time slider), or save the keyframes as JSON. Humanoid (muscle) clips can't be played yet.
+- **Animations** (Unity): each clip lists the bones it moves; pick a model with a matching skeleton and press **Play on model** to watch it (play/pause and a time slider), press **Save animated GLB...** for a rigged, animated model that opens in Blender, or save the keyframes as JSON. Humanoid (muscle) clips play on any humanoid character: each character's Avatar turns the muscle values into its own bone rotations, the way Unity does.
 
 Unreal notes:
 - Both `.pak` files and IoStore containers (`.utoc`/`.ucas`) are read. Packages are sorted into models, textures and other files by the class stored in their headers. The first time a game opens, this takes a few seconds; the result is cached in `cache/`.
@@ -101,11 +101,12 @@ Unreal notes:
 - Rotate, and zoom with the mouse wheel or +/−. Wireframe, edges, vertex colors and texture alpha can each be toggled on and off. The model's texture is found automatically.
 - **UV sets**: switch between UV0/UV1/... (UV1 is often the baked-lighting layout), and use **UV layout** to see the UVs drawn over the texture.
 - **Model panel**: vertex/triangle counts, the source file, the prefab path, what uses the model, and its materials and textures.
-- **Animation playback**: play Unity animation clips on their skinned models.
+- **Fly camera** (F): walk through scenes and maps like a game camera: WASD to move, Q/E down/up, drag to look around, Shift for speed, the mouse wheel sets the speed, double-click a spot to jump there. Scenes, maps and terrains open in it; walls stay drawn right up to the camera, so you can go inside buildings.
+- **Animation playback**: play Unity animation clips (generic and humanoid) on their skinned models.
 - **Texture viewer**: zoom under the mouse, drag to pan, with a checkerboard background for transparency.
 
 **Export**
-- **OBJ + MTL + PNG** or **GLB** (one file with the textures inside).
+- **OBJ + MTL + PNG** or **GLB** (one file with the textures inside). Skinned models (Unity) save to GLB with their skeleton and skin weights, and **Save animated GLB...** on an animation adds the clip, so a rigged, animated character opens in Blender.
 - **Open in Blender** (Ctrl+B): exports the model and opens it in Blender in one click. Blender is found automatically, or you can point to it.
 - **Bulk export** of all models, all textures, everything shown in the list, or a selection. It can **keep the game's folder structure** (e.g. `assets/prefabs/weapons/...`) so big dumps stay easy to browse.
 
@@ -180,7 +181,7 @@ Leave **Texture alpha** off. Many games store other data in the alpha channel. I
 Check the **Console**, or open `crash.log` / `viewer.log` next to `UniView.exe`. Please attach them when you [open an issue](https://github.com/NightHawkHSI/UniView/issues).
 
 **Why GLB and not FBX?**
-Blender can't import text-format FBX, and there's no simple Python writer for binary FBX. GLB (glTF) opens directly in Blender, Godot, Unity and most other tools, keeps the textures inside, and has room for bones and animation later.
+Blender can't import text-format FBX, and there's no simple Python writer for binary FBX. GLB (glTF) opens directly in Blender, Godot, Unity and most other tools, and keeps the textures, bones and animation inside one file.
 
 **Does it use a lot of memory?**
 Loaded games stay in memory so they reopen instantly. Right-click a game → **Unload from memory** to free it.

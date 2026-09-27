@@ -557,6 +557,8 @@ class ScriptReader:
         self.game_dir = game_dir
         self.generators = None
         self.error = ""
+        self._embedded = None  # script class -> field layout stored in some file (usually an AssetBundle)
+        self._ref_types = []   # [SerializeReference] type layouts stored in those files
 
     def _setup(self):
         if self.generators is not None:
@@ -581,8 +583,52 @@ class ScriptReader:
             log.info("Script field layouts from the game's %s code (%s)", "IL2CPP" if il2cpp else "Mono",
                      ", ".join(type(g).__name__ for g in self.generators))
 
+    def _embedded_layouts(self):
+        """Field layouts that AssetBundles store with their objects, by script class. The same class in a
+        file without layouts (resources.assets, sharedassets) can borrow them: they come from the build
+        itself and include [SerializeReference] fields the code-based generators leave out."""
+        if self._embedded is None:
+            self._embedded = {}
+            seen, files = set(), set()
+            for obj in self.env.objects:
+                if id(obj.assets_file) not in files:
+                    files.add(id(obj.assets_file))
+                    self._ref_types += [r for r in getattr(obj.assets_file, "ref_types", None) or () if r.node is not None]
+                st = obj.serialized_type
+                if obj.type.name != "MonoBehaviour" or st is None or st.node is None:
+                    continue
+                key = (id(obj.assets_file), id(st))  # one script per type entry of a file
+                if key in seen:
+                    continue
+                seen.add(key)
+                cls = script_class(obj)
+                if cls:
+                    self._embedded.setdefault(cls, st.node)
+            if self._embedded:
+                log.info("%d script layout(s) found stored with bundle objects", len(self._embedded))
+        return self._embedded
+
     def read(self, obj):
         """(dict of fields, note)"""
+        st = obj.serialized_type
+        if st is not None and st.node is not None:
+            try:
+                return obj.read_typetree(), ""  # stored with the object (AssetBundles): no need for the game's code
+            except Exception:
+                pass
+        else:
+            node = self._embedded_layouts().get(script_class(obj))
+            if node is not None:
+                f = obj.assets_file
+                own_refs = f.ref_types
+                # Layouts of the objects its [SerializeReference] fields hold (this file lists their names only).
+                f.ref_types = self._ref_types + [r for r in own_refs or () if r.node is not None]
+                try:
+                    return obj.read_typetree(nodes=node), ""
+                except Exception:
+                    pass  # a different version of the class: generate the layout instead
+                finally:
+                    f.ref_types = own_refs
         self._setup()
         previous = self.env.typetree_generator
         best = None  # (bytes read, generator) of the layout that got furthest without overrunning
@@ -609,6 +655,7 @@ class ScriptReader:
                     if len(tail) == 8 and tail[4:] == bytes(4) and tail[:4] in (b"\1\0\0\0", b"\2\0\0\0"):
                         tree["references"] = {"version": tail[0], "RefIds": []}
                         return tree, ""
+                    _add_strings(tree, tail)
                     return tree, (f"The last {len(tail):,} bytes of this object couldn't be decoded (objects "
                                   "stored by [SerializeReference], or fields the reader doesn't know); "
                                   "every field above them is shown.")
@@ -619,9 +666,50 @@ class ScriptReader:
             tree = obj.read_typetree(check_read=False)
         except Exception:
             tree = {}
+        try:
+            _add_strings(tree, bytes(obj.get_raw_data()), skip=(tree.get("m_Name"),))
+        except Exception:
+            pass
         note = self.error or "This script's own fields couldn't be decoded (its class uses features the field " \
                              "reader doesn't support yet); showing the common fields only."
         return tree, note
+
+
+def find_strings(data, min_len=2):
+    """Text stored the way Unity serializes strings (int32 length, UTF-8, aligned to 4) in undecoded bytes."""
+    found, pos, end = [], 0, len(data) - 4
+    while pos <= end:
+        n = int.from_bytes(data[pos:pos + 4], "little")
+        if min_len <= n <= 4096 and pos + 4 + n <= len(data):
+            chunk = data[pos + 4:pos + 4 + n]
+            try:
+                text = chunk.decode("utf-8")
+            except UnicodeDecodeError:
+                text = ""
+            if text.isprintable() and any(c.isalnum() for c in text):
+                found.append(text)
+                pos += (4 + n + 3) & ~3
+                continue
+        pos += 4
+    return found
+
+
+def _add_strings(tree, data, skip=()):
+    """Add the text found in bytes the reader couldn't decode, so names/values can still be searched."""
+    strings = [t for t in find_strings(data) if t not in skip]
+    if strings:
+        tree["(text in undecoded data)"] = strings
+
+
+def _path_closeness(a, b):
+    """How many leading folders two asset paths share (+1 when they're the same file)."""
+    if not a or not b:
+        return 0
+    pa, pb = a.lower().split("/"), b.lower().split("/")
+    n = 0
+    while n < min(len(pa), len(pb)) - 1 and pa[n] == pb[n]:
+        n += 1
+    return n + (a.lower() == b.lower())
 
 
 def script_class(obj):
@@ -665,6 +753,9 @@ class UnitySession(GameSession):
         self._sheets = None
         self._skins = {}
         self._terrains = {}
+        self._rigs = None        # humanoid Avatars (unity_humanoid.HumanRig)
+        self._model_rigs = {}    # mesh key -> the HumanRig that fits its skeleton, or None
+        self._humanoid = {}      # (clip key, rig) -> clip converted to bone curves
 
     def _asset_for(self, obj, type_name="Texture2D", name=None):
         """Asset for an ObjectReader (the listed one if we have it)."""
@@ -681,6 +772,9 @@ class UnitySession(GameSession):
 
     def close(self):
         self.finder.stop()
+
+    def options_changed(self):
+        self._scenes.clear()
 
     # ------------------------------------------------------------------ terrains
 
@@ -945,16 +1039,52 @@ class UnitySession(GameSession):
                 out.add("/".join(chain[i:]))
         return out
 
-    def animation_targets(self, asset):
-        clip = self._clip(asset)
-        wanted = {c["path"] for c in clip["curves"]
-                  if c["property"] in ("position", "rotation", "euler", "scale")}
-        if not wanted:
-            return []
+    # ---- humanoid (muscle) clips
+    MIN_HUMAN_BONES = 10  # skeleton bones an Avatar must share with a model to drive it
+
+    def _human_rigs(self):
+        """Every humanoid Avatar in the game (read once)."""
+        if self._rigs is None:
+            from .unity_humanoid import HumanRig
+            rigs = []
+            with self.lock:
+                for obj in self.env.objects:
+                    if obj.type.name != "Avatar":
+                        continue
+                    try:
+                        rig = HumanRig(obj.read_typetree())
+                    except Exception:
+                        continue
+                    if rig.valid:
+                        rig.source_path = getattr(obj, "container", None) or ""
+                        rigs.append(rig)
+            self._rigs = rigs
+            log.info("%d humanoid Avatar(s)", len(rigs))
+        return self._rigs
+
+    def _rig_for(self, mesh_key, bone_keys):
+        """The humanoid Avatar whose skeleton fits these bones best (cached per model), or None."""
+        if mesh_key not in self._model_rigs:
+            suffixes = self._bone_suffixes([b for b in bone_keys if b is not None])
+            model = self.by_key.get(mesh_key)
+            best, best_score = None, (0,)
+            for rig in self._human_rigs():
+                shared = rig.human_paths & suffixes
+                # Most bones in common; then the Avatar from the model's own file; then the fullest
+                # paths (a rig whose paths are just 'Hips/Spine' fits every skeleton equally).
+                score = (len(shared), _path_closeness(getattr(rig, "source_path", ""), model.path if model else ""),
+                         sum(p.count("/") for p in shared))
+                if score > best_score:
+                    best, best_score = rig, score
+            self._model_rigs[mesh_key] = best if best_score[0] >= self.MIN_HUMAN_BONES else None
+        return self._model_rigs[mesh_key]
+
+    def _skinned_models(self):
+        """[(model Asset, bone keys)] of every skinned mesh."""
         self.finder._run_until(lambda: self.finder.indexed)
-        scored = []
         with self.lock:
             skinned = dict(self.finder._skinned)
+        out = []
         for mesh_key, smrs in skinned.items():
             model = self.by_key.get(mesh_key)
             if model is None:
@@ -964,15 +1094,34 @@ class UnitySession(GameSession):
                     bones, _node = self._skin_info(smrs[0])
             except Exception:
                 continue
+            out.append((model, bones))
+        return out
+
+    def animation_targets(self, asset):
+        from .unity_humanoid import is_humanoid
+        clip = self._clip(asset)
+        if is_humanoid(clip):
+            # Humanoid clips play on any humanoid character: list the models that have an Avatar.
+            # The clip's own character first (same folder), then the most complete skeletons.
+            models = [(m, len(bones)) for m, bones in self._skinned_models() if self._rig_for(m.key, bones) is not None]
+            models.sort(key=lambda mb: (-_path_closeness(asset.path, mb[0].path), -mb[1], mb[0].name.lower()))
+            return [m for m, _n in models[:200]]
+        wanted = {c["path"] for c in clip["curves"]
+                  if c["property"] in ("position", "rotation", "euler", "scale")}
+        if not wanted:
+            return []
+        scored = []
+        for model, bones in self._skinned_models():
             score = len(wanted & self._bone_suffixes([b for b in bones if b is not None]))
             if score:
-                scored.append((score, model))
-        scored.sort(key=lambda s: (-s[0], s[1].name.lower()))
-        return [m for _s, m in scored[:50]]
+                scored.append((score, _path_closeness(asset.path, model.path), model))
+        # Creatures often share bone names: among equal matches, models from the clip's own file/folder first.
+        scored.sort(key=lambda s: (-s[0], -s[1], s[2].name.lower()))
+        return [m for _s, _c, m in scored[:50]]
 
-    def animate(self, model, clip_asset):
+    def _skin_setup(self, model):
+        """(MeshHandler, bone transform keys, mesh transform key, bind poses (B, 4, 4)) of a skinned model."""
         from UnityPy.helpers.MeshHelper import MeshHandler
-        from .unity_skin import Animator
         self.finder._run_until(lambda: self.finder.indexed)
         smrs = self.finder._skinned.get(model.key)
         if not smrs:
@@ -992,14 +1141,73 @@ class UnitySession(GameSession):
             else:
                 bind_poses.append(list(m) if len(m) == 4 else [m[i * 4:(i + 1) * 4] for i in range(4)])
         bind_poses = np.asarray(bind_poses, float).reshape(-1, 4, 4)
-        n = len(bone_keys := bones)
+        n = len(bones)
         if len(bind_poses) < n:
             bind_poses = np.concatenate([bind_poses, np.tile(np.eye(4), (n - len(bind_poses), 1, 1))])
-        animator = Animator(handler.m_Vertices, handler.m_BoneIndices, handler.m_BoneWeights, bind_poses[:n],
-                            bone_keys, self.transforms(), mesh_node, self._clip(clip_asset))
+        return handler, bones, mesh_node, bind_poses[:n]
+
+    def animate(self, model, clip_asset):
+        from .unity_skin import Animator
+        handler, bones, mesh_node, bind_poses = self._skin_setup(model)
+        animator = Animator(handler.m_Vertices, handler.m_BoneIndices, handler.m_BoneWeights, bind_poses,
+                            bones, self.transforms(), mesh_node, self.clip_for(model, clip_asset, bones))
         if not animator.matched:
             raise ValueError("None of this animation's bones are in this model's skeleton.")
         return animator
+
+    def skeleton(self, model, clip=None):
+        from .unity_skin import export_animation, export_rig
+        handler, bones, mesh_node, bind_poses = self._skin_setup(model)
+        animator = self.animate(model, clip) if clip is not None else None
+        rig, joint_of = export_rig(self.transforms(), bones, bind_poses, handler.m_BoneIndices,
+                                   handler.m_BoneWeights, mesh_node, animator.root_node if animator else None)
+        if len(rig["joints_0"]) != handler.m_VertexCount:
+            raise ValueError("The bone weights don't match the mesh's vertices.")
+        return rig, (export_animation(animator, joint_of, clip.name) if animator else None)
+
+    def clip_for(self, model, clip_asset, bones=None):
+        """Decoded clip with bone curves for `model`: humanoid clips are converted for its Avatar."""
+        from .unity_humanoid import is_humanoid, place_hips, to_generic
+        clip = self._clip(clip_asset)
+        if not is_humanoid(clip):
+            return clip
+        if bones is None:
+            smrs = self.finder._skinned.get(model.key)
+            if not smrs:
+                raise ValueError("This model isn't skinned (no SkinnedMeshRenderer uses it).")
+            with self.lock:
+                bones, _node = self._skin_info(smrs[0])
+        rig = self._rig_for(model.key, bones)
+        if rig is None:
+            raise ValueError("This is a humanoid animation, and this model has no humanoid Avatar to play it with.")
+        key = (clip_asset.key, id(rig))
+        if key not in self._humanoid:
+            self._humanoid[key] = to_generic(clip, rig)
+            while len(self._humanoid) > 8:
+                self._humanoid.pop(next(iter(self._humanoid)))
+        clip = self._humanoid[key]
+        parent = self._hips_parent(bones, clip["hips"]["path"])
+        return place_hips(clip, parent) if parent is not None else clip
+
+    def _hips_parent(self, bone_keys, hips_path):
+        """Matrix of the model's hips parent relative to the animated root (the object `hips_path`,
+        e.g. 'Armature/Hips', is relative to), from the model's own transforms; None if not found."""
+        from .unity_skin import trs
+        nodes = self.transforms()
+        parts = hips_path.split("/")
+        for key in bone_keys:
+            chain, k = [], key
+            while k is not None and k in nodes and len(chain) < len(parts):
+                chain.append(k)
+                k = nodes[k]["parent"]
+            if len(chain) < len(parts) or [nodes[c]["name"] for c in reversed(chain)] != parts:
+                continue
+            m = np.eye(4)
+            for c in reversed(chain[1:]):  # root's child ... the hips' parent
+                n = nodes[c]
+                m = m @ trs(n["pos"], n["rot"], n["scale"])
+            return m
+        return None
 
     # ---- sprites: sheets and flipbook animations
     def _sprite_sheets(self):

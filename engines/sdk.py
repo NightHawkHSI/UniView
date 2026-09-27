@@ -23,10 +23,13 @@ Conventions for decoded data
 * Images: any ``PIL.Image`` (converted to RGBA by the app when needed).
 """
 
+import logging
 import os
 import threading
 
 import numpy as np
+
+log = logging.getLogger("viewer.sdk")
 
 API_VERSION = 1
 
@@ -207,6 +210,20 @@ class Progress:
         self._value(done, total)
 
 
+# Display options from the app's Options menu (all on by default). Plugins read them with
+# view_option(); when one changes the app calls GameSession.options_changed() so caches can be dropped.
+VIEW_OPTIONS = {
+    "hide_skybox": True,         # maps: leave out the 3D skybox (the small scenery copy around the map)
+    "hide_tool_surfaces": True,  # maps: leave out nodraw, trigger, clip, hint and sky brushes
+    "hide_lods": True,           # scenes: show only the most detailed LOD of each object
+    "hide_inactive": True,       # scenes: leave out objects and renderers the game has switched off
+}
+
+
+def view_option(name):
+    return VIEW_OPTIONS.get(name, True)
+
+
 class GameSession:
     """A loaded game. Created by EnginePlugin.open(). Override what your engine supports."""
 
@@ -219,6 +236,9 @@ class GameSession:
         self.engine_version = ""       # set if you learn it while loading (else game_info's is kept)
         self.warnings = []             # things the user should know (shown once after loading)
 
+    def options_changed(self):
+        """VIEW_OPTIONS changed: drop cached maps/scenes built with the old settings."""
+
     # ---- previews (raise an exception with a friendly message if something can't be decoded)
     def image(self, asset):
         """PIL image of a texture/sprite asset."""
@@ -229,8 +249,14 @@ class GameSession:
         raise NotImplementedError("This engine plugin can't show models yet.")
 
     def text(self, asset):
-        """str (or bytes) of a text asset. Default: decode raw()."""
+        """str (or bytes) of a text asset. Default: decode raw() (binary text formats are decoded)."""
         data = self.raw(asset)
+        if (asset.ext or "").lower() == "locres" and isinstance(data, (bytes, bytearray)):
+            from .formats import locres_text
+            try:
+                return locres_text(data)
+            except Exception as e:
+                log.warning("Couldn't read the localization file '%s': %s", asset.name, e)
         return data.decode("utf-8", "replace") if isinstance(data, bytes) else data
 
     def raw(self, asset):
@@ -298,6 +324,16 @@ class GameSession:
         """An object with .length (seconds) and .points_at(t) -> (N, 3) vertex positions of `model`
         (same order as mesh(model)) posed by `clip` at time t."""
         raise NotImplementedError("This engine plugin can't play animations yet.")
+
+    def skeleton(self, model, clip=None):
+        """Rig of a skinned `model` for rigged glTF exports: (rig, animation or None).
+
+        rig: {"joints": [{"name", "parent" (joint index or -1), "translation", "rotation" (x, y, z, w),
+        "scale"}], "skin_joints": [joint index per skin bone], "inverse_bind": (B, 4, 4) row-major,
+        "joints_0": (N, 4) skin bone indices per vertex, "weights_0": (N, 4)}, all in UniView's space
+        (the same one mesh() uses). With `clip`, animation is {"name", "times": (F,), "channels":
+        [{"joint", "path": "translation"/"rotation"/"scale", "values": (F, 3 or 4)}]}."""
+        raise NotImplementedError("This engine plugin can't export skeletons yet.")
 
     def start_background(self):
         """Called once after loading, on the UI thread: start background indexing if you have any."""
@@ -465,8 +501,12 @@ TEXT_EXTS = {
     "shader", "hlsl", "glsl", "fx", "fxc", "vmt", "vdf", "res", "vfe", "gi", "kv3", "yaml", "yml",
     "html", "htm", "css", "properties", "toml", "uplugin", "uproject", "cmd", "bat", "rad", "lst",
     "acf", "manifest", "vcfg", "qc", "smd", "vsc", "gam",
+    # localization, subtitles, level/script text of various engines
+    "locres", "po", "pot", "lang", "srt", "vtt", "ass", "pop", "conf", "scr", "ts", "sh", "nfo", "sql",
+    "tscn", "tres", "gd", "godot", "rpy", "mcmeta", "ron", "vcd", "cfg", "ent", "def", "mtr", "map",
 }
-IMAGE_EXTS = {"png", "jpg", "jpeg", "bmp", "tga", "dds", "gif", "webp", "tif", "tiff"}
+IMAGE_EXTS = {"png", "jpg", "jpeg", "jfif", "bmp", "tga", "dds", "gif", "webp", "tif", "tiff", "svg", "ico", "cur",
+              "psd", "pcx", "ppm", "pgm", "pbm", "sgi", "icns"}
 AUDIO_EXTS = {"wav", "mp3", "ogg", "flac", "opus", "m4a", "aac", "wem", "bnk", "bank", "fsb", "xwb", "vsnd_c"}
 PLAYABLE_AUDIO = {"wav", "mp3", "ogg", "flac", "opus", "m4a", "aac"}  # what the built-in player decodes
 VIDEO_EXTS = {"mp4", "webm", "mov", "avi", "mkv", "ogv", "m4v", "wmv", "bk2", "bik", "usm"}
@@ -490,12 +530,53 @@ def kind_for_extension(ext):
 
 
 def pil_image_from_bytes(data):
-    """Open a png/jpg/tga/dds/... stored as bytes."""
+    """Open a png/jpg/tga/dds/ico/svg/... stored as bytes."""
     import io
     from PIL import Image
+    head = bytes(data[:512]).lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    if head.startswith(b"<svg") or (head.startswith(b"<?xml") and b"<svg" in bytes(data[:4096]).lower()) \
+            or head.startswith(b"<!--") and b"<svg" in bytes(data[:4096]).lower():
+        return svg_image(data)
     img = Image.open(io.BytesIO(data))
+    if getattr(img, "format", "") == "ICO" and hasattr(img, "ico"):
+        img = img.ico.getimage(max(img.ico.sizes()))  # the biggest icon inside
     img.load()
     return img
+
+
+def svg_image(data, size=1024):
+    """Render an SVG (bytes) to a PIL image about `size` pixels on its longest side (Qt's renderer)."""
+    from PIL import Image
+    from PySide6.QtCore import QByteArray, QRectF, Qt
+    from PySide6.QtGui import QImage, QPainter
+    from PySide6.QtSvg import QSvgRenderer
+    renderer = QSvgRenderer(QByteArray(bytes(data)))
+    if not renderer.isValid():
+        raise ValueError("This SVG image couldn't be read.")
+    view = renderer.viewBoxF()
+    w, h = (view.width(), view.height()) if view.width() > 0 and view.height() > 0 else (1.0, 1.0)
+    scale = size / max(w, h)
+    img = QImage(max(1, round(w * scale)), max(1, round(h * scale)), QImage.Format_RGBA8888)
+    img.fill(Qt.transparent)
+    painter = QPainter(img)
+    renderer.render(painter, QRectF(0, 0, img.width(), img.height()))
+    painter.end()
+    return Image.frombuffer("RGBA", (img.width(), img.height()), bytes(img.constBits()), "raw", "RGBA",
+                            img.bytesPerLine(), 1).copy()
+
+
+def find_cstrings(data, min_len=4, limit=20000):
+    """Readable zero-terminated strings in binary data (file names, keys...), in order, without repeats."""
+    import re
+    out, seen = [], set()
+    for m in re.finditer(rb"[\x20-\x7e\t]{%d,}" % min_len, bytes(data)):
+        text = m.group().decode("ascii").strip()
+        if text and text not in seen:
+            seen.add(text)
+            out.append(text)
+            if len(out) >= limit:
+                break
+    return out
 
 
 def font_preview(data, name=""):

@@ -14,7 +14,7 @@ from PIL import Image
 
 from .sdk import (
     ALBEDO, NORMAL, Asset, EnginePlugin, GameSession, Material, MeshData, TextureRef,
-    cstr_at, kind_for_extension, listdir_lower, orient_to_normals, pil_image_from_bytes, z_up_to_y_up,
+    cstr_at, kind_for_extension, listdir_lower, orient_to_normals, pil_image_from_bytes, view_option, z_up_to_y_up,
 )
 from .vpk import VPK, VirtualFS
 
@@ -501,6 +501,10 @@ class SourceSession(GameSession):
             out.append(Material(name.rsplit("/", 1)[-1] + ("" if vmt else " (material not found)"), refs))
         return out
 
+    def options_changed(self):
+        self._map_cache = None
+        self._scene_cache = None
+
     # ---- maps (.bsp)
     def _map(self, key):
         """(BSP, points, uvs, parts, pakfile, skybox leaves) of a map's world, cached (maps are big)."""
@@ -510,13 +514,13 @@ class SourceSession(GameSession):
         bsp = BSP(self.fs.read(key))
         sky_leaves, sky_faces = set(), set()
         try:
-            area = bsp.sky_area()
+            area = bsp.sky_area() if view_option("hide_skybox") else None
             if area is not None:
                 sky_leaves = bsp.area_leaves(area)
                 sky_faces = bsp.faces_in_leaves(sky_leaves)
         except Exception as e:
             log.debug("No 3D skybox found in %s: %s", key, e)
-        points, uvs, parts = bsp.geometry(skip_faces=sky_faces)
+        points, uvs, parts = bsp.geometry(skip_faces=sky_faces, skip_tools=view_option("hide_tool_surfaces"))
         try:
             pak = bsp.pakfile()
         except Exception:

@@ -7,7 +7,7 @@ import time
 
 import numpy as np
 
-from .sdk import ALBEDO, NORMAL, OTHER, Material, MeshData, TextureRef
+from .sdk import ALBEDO, NORMAL, OTHER, Material, MeshData, TextureRef, view_option
 from .unity_skin import trs
 
 log = logging.getLogger("viewer.unity")
@@ -62,6 +62,8 @@ class SceneBuilder:
         self.objects = self.renderers = self.skipped = 0
         self.lod_skip = set()
         self.terrains = 0
+        self.hide_lods = view_option("hide_lods")
+        self.hide_inactive = view_option("hide_inactive")
 
     def _mesh(self, key, reader):
         if key not in self.meshes:
@@ -135,7 +137,7 @@ class SceneBuilder:
         """A Terrain component: its heightmap mesh with the blended layers, at the object's position."""
         try:
             terrain = reader.read()
-            if not getattr(terrain, "m_Enabled", True):
+            if not getattr(terrain, "m_Enabled", True) and self.hide_inactive:
                 return
             found = _ptr_key(terrain.m_TerrainData)
             if found is None:
@@ -172,13 +174,13 @@ class SceneBuilder:
             return
         p, r, s = t.m_LocalPosition, t.m_LocalRotation, t.m_LocalScale
         matrix = parent_matrix @ trs((p.x, p.y, p.z), (r.x, r.y, r.z, r.w), (s.x, s.y, s.z))
-        active = parent_active and bool(getattr(go, "m_IsActive", True))
+        active = parent_active and (bool(getattr(go, "m_IsActive", True)) or not self.hide_inactive)
         self.objects += 1
         if active:
             comps = _components(go)
             names = {n for n, _r in comps}
             for name, reader in comps:
-                if name == "LODGroup":
+                if name == "LODGroup" and self.hide_lods:
                     try:
                         for level, lod in enumerate(reader.read().m_LODs):
                             if level == 0:
@@ -202,7 +204,7 @@ class SceneBuilder:
                     renderer = reader.read()
                 except Exception:
                     continue
-                if not getattr(renderer, "m_Enabled", True):
+                if not getattr(renderer, "m_Enabled", True) and self.hide_inactive:
                     continue
                 mesh_ptr = None
                 if name == "SkinnedMeshRenderer":

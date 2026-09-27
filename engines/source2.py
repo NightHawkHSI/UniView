@@ -100,6 +100,113 @@ def block_kv3(data, blocks, kind):
     return None
 
 
+# --------------------------------------------------------------------------- other resources as data
+
+# Compiled resource types shown as readable data, with a friendly type name.
+DATA_TYPES = {
+    "vpcf_c": "Particle system", "vmat_c": "Material", "vdata_c": "Game data", "vsmart_c": "Smart prop",
+    "vsndevts_c": "Sound events", "vsndstck_c": "Sound stack", "vnmclip_c": "Animation clip",
+    "vnmgraph_c": "Animation graph", "vnmskel_c": "Skeleton", "vnmvar_c": "Animation variations",
+    "vanmgrph_c": "Animation graph", "vseq_c": "Sequence", "vcd_c": "Choreography scene",
+    "vrr_c": "Response rules", "vsnap_c": "Snapshot", "vpost_c": "Post-processing", "vpulse_c": "Pulse graph",
+    "vmix_c": "Sound mix", "vsurf_c": "Surface properties", "vphys_c": "Physics", "vmdl_c": "Model",
+    "vwrld_c": "World", "vwnod_c": "World node", "vents_c": "Entity lump", "vmap_c": "Map",
+    "vxml_c": "UI layout", "vcss_c": "UI style sheet", "vjs_c": "UI script", "vts_c": "UI script (TypeScript)",
+    "vrman_c": "Resource manifest", "vcdlist_c": "Choreography list", "vpdi_c": "Dynamic images",
+    "vagrp_c": "Animation group", "vanim_c": "Animation", "vphysxml_c": "Physics",
+}
+PANORAMA_EXTS = {"vxml_c": "xml", "vcss_c": "css", "vjs_c": "js", "vts_c": "ts", "vsvg_c": "svg"}
+
+
+def external_refs(data, blocks):
+    """File names a resource refers to (RERL block): materials, textures, sounds..."""
+    for kind, off, size in blocks:
+        if kind != "RERL" or size < 8:
+            continue
+        rel, count = struct.unpack_from("<II", data, off)
+        names, pos = [], off + rel
+        for _ in range(min(count, 100000)):
+            name_rel = struct.unpack_from("<I", data, pos + 8)[0]
+            start = pos + 8 + name_rel
+            end = data.find(b"\0", start)
+            names.append(data[start:end if end >= 0 else start].decode("utf-8", "replace"))
+            pos += 16
+        return names
+    return []
+
+
+def panorama_text(data, blocks):
+    """UI files (Panorama): the DATA block is a CRC32 and a name table, then the text itself."""
+    block = next(((o, sz) for k, o, sz in blocks if k == "DATA"), None)
+    if block is None:
+        return None
+    raw = data[block[0]:block[0] + block[1]]
+    count = struct.unpack_from("<H", raw, 4)[0] if len(raw) >= 6 else 0
+    pos = 6
+    if count < 1000:
+        for _ in range(count):  # (name, two uint32) entries
+            end = raw.find(b"\0", pos)
+            if end < 0:
+                pos = 0
+                break
+            pos = end + 1 + 8
+    else:
+        pos = 0  # no header at all (scripts)
+    text = raw[pos:].decode("utf-8", "replace")
+    sample = text[:4000]
+    printable = sum(c.isprintable() or c in "\r\n\t" for c in sample)
+    return text if sample and printable >= 0.97 * len(sample) else None  # binary data isn't text
+
+
+def resource_data(data):
+    """(decoded content, export extension, referenced files) of a compiled resource.
+
+    Content is the DATA block as a dict (KeyValues3), UI text, or the readable strings found in it."""
+    blocks = resource_block_list(data)
+    refs = external_refs(data, blocks)
+    try:
+        tree = block_kv3(data, blocks, "DATA")
+    except RuntimeError:
+        raise  # a missing decompressor: say so
+    except Exception:
+        tree = None
+    if tree is not None:
+        return tree, "json", refs
+    for kind, _off, _size in blocks:  # e.g. UI layouts keep their content in a 'LaCo' KV3 block
+        if kind not in ("DATA", "RED2", "RERL", "REDI", "NTRO"):
+            try:
+                tree = block_kv3(data, blocks, kind)
+            except Exception:
+                tree = None
+            if tree:
+                return tree, "json", refs
+    text = panorama_text(data, blocks)
+    if text and text.strip():
+        return text, "txt", refs
+    block = next(((o, sz) for k, o, sz in blocks if k == "DATA"), (0, len(data)))
+    from .sdk import find_cstrings
+    return find_cstrings(data[block[0]:block[0] + block[1]]), "json", refs
+
+
+def _json_safe(value, depth=0):
+    if depth > 200:
+        return "..."
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v, depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v, depth + 1) for v in value]
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        b = bytes(value)
+        return f"<{len(b)} bytes>" if len(b) > 64 else b.hex()
+    if hasattr(value, "tolist"):
+        return _json_safe(value.tolist(), depth + 1)
+    if isinstance(value, float) and value != value:
+        return "NaN"
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 # --------------------------------------------------------------------------- models (.vmdl_c)
 
 # DXGI formats used by vertex attributes: id -> (numpy dtype, components, scale)
@@ -489,12 +596,44 @@ class Source2Session(GameSession):
         self.fs.close()
 
     def raw(self, asset):
+        if asset.kind == "data":
+            content, _ext, _refs = resource_data(self.fs.read(asset.ref))
+            if isinstance(content, str):
+                return content.encode("utf-8")
+            import json
+            return json.dumps(_json_safe(content), indent=2, ensure_ascii=False).encode("utf-8")
         return self.fs.read(asset.ref)
+
+    def text(self, asset):
+        if asset.kind != "data":
+            return super().text(asset)
+        import json
+        content, _ext, refs = resource_data(self.fs.read(asset.ref))
+        ext = asset.ref.rsplit(".", 1)[-1]
+        head = [f"{asset.name}   ({DATA_TYPES.get(ext, ext)})"]
+        tail = []
+        if refs:  # after the data: the data is what people look for
+            tail = ["", "", f"Uses {len(refs)} file(s):"] + [f"  {r}" for r in refs[:2000]]
+            if len(refs) > 2000:
+                tail.append(f"  ... and {len(refs) - 2000} more")
+        if isinstance(content, str):
+            body = content
+        elif isinstance(content, list) and content and all(isinstance(c, str) for c in content):
+            body = "Text found in this file (its format isn't decoded yet):\n\n" + "\n".join(content)
+        else:
+            body = json.dumps(_json_safe(content), indent=2, ensure_ascii=False)
+        return "\n".join(head) + "\n\n" + body + "\n".join(tail)
 
     def image(self, asset):
         data = self.fs.read(asset.ref)
         if asset.ref.endswith(".vtex_c"):
             return vtex_image(data)
+        if asset.ref.endswith(".vsvg_c"):
+            from .sdk import svg_image
+            text = panorama_text(data, resource_block_list(data))
+            if not text:
+                raise ValueError("This SVG has no image data.")
+            return svg_image(text.encode("utf-8"))
         return pil_image_from_bytes(data)
 
     def audio(self, asset):
@@ -537,6 +676,10 @@ class Source2Session(GameSession):
 
     def stats(self, asset):
         stats = {"size": asset.size, "info": "", "sort": asset.size or 0}
+        if asset.kind == "data":
+            ext = asset.ref.rsplit(".", 1)[-1]
+            stats["info"] = DATA_TYPES.get(ext, ext)
+            return stats
         if asset.kind == "model":
             md = self.mesh(asset)
             tris = md.triangle_count
@@ -629,6 +772,12 @@ class Source2Plugin(EnginePlugin):
                 kind, name = "model", display[:-len(".vmdl_c")]
                 if name.lower().startswith("models/"):
                     name = name[len("models/"):]
+            elif ext == "vsvg_c":
+                kind, name = "texture", display[:-len("_c")]
+            elif ext.endswith("_c") and ext not in ("vsnd_c",):
+                # Compiled resources: shown as their decoded data; saved as JSON / the UI file's text.
+                kind, name = "data", display[:-len("_c")]
+                ext = PANORAMA_EXTS.get(ext) or "json"
             else:
                 kind, name = kind_for_extension(ext), display
             asset = Asset(kind, name, key, uid=key, size=fs.size(key), path=display, ref=key, ext=ext or "bin")

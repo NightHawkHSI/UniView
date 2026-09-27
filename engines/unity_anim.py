@@ -40,6 +40,9 @@ def _bindings(tree):
             name, count = TRANSFORM_ATTRIBUTES[attribute]
         elif pptr and type_id == 212:
             name, count = "sprite", 1
+        elif type_id == 95:
+            from .unity_humanoid import attribute_name
+            name, count = attribute_name(attribute), 1  # humanoid muscle / body curve (on the Animator)
         else:
             name, count = f"property {attribute} (class {type_id})", 1
         out.append((b.get("path", 0), attribute, count, name, pptr, type_id))
@@ -78,14 +81,15 @@ def decode_clip(tree, path_names=None):
     curves = []
     index = 0
     component_names = {3: "xyz", 4: "xyzw"}
-    for path_hash, _attr, count, prop, pptr, class_id in _bindings(tree):
+    for path_hash, attr, count, prop, pptr, class_id in _bindings(tree):
         path = path_names.get(path_hash, f"#{path_hash:08x}") if path_hash else ""
         for k in range(count):
             comp = component_names.get(count, "")[k] if count > 1 else ""
             if index in keys:
-                curve = {"path": path, "property": prop, "component": comp, "keys": keys[index]}
+                curve = {"path": path, "property": prop, "component": comp, "keys": keys[index],
+                         "class_id": class_id, "attribute": attr}
                 if pptr:
-                    curve.update(object_curve=True, class_id=class_id)  # values index pptrCurveMapping
+                    curve.update(object_curve=True)  # values index pptrCurveMapping
                 curves.append(curve)
             index += 1
     # Legacy clips keep readable curves directly.
@@ -137,8 +141,11 @@ def summary_text(info):
         lines.append(f"  {path or '(root)'}: {prop}  ({max(counts)} keys)")
     if len(grouped) > 400:
         lines.append(f"  ... and {len(grouped) - 400} more")
-    lines += ["", "Save... exports every curve's keyframes as JSON (time, value) for use in other tools.",
-              "Playing animations on their model isn't supported yet."]
+    from .unity_humanoid import is_humanoid
+    if is_humanoid(info):
+        lines += ["", "Humanoid clip: it stores muscle values, not bone rotations, so it plays on any humanoid "
+                      "character (each character's Avatar turns the muscles into its own bone rotations)."]
+    lines += ["", "Save... exports every curve's keyframes as JSON (time, value) for use in other tools."]
     return "\n".join(lines)
 
 
