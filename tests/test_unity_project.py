@@ -363,3 +363,38 @@ def test_renderer_without_materials_is_marked():
     desc = up.prefab_description(nodes, "Assets/x.prefab", {"s:6": "/p/Assets/m.glb"}, "/p")
     assert desc["nodes"][1]["noMaterials"] is True
     assert desc["nodes"][2]["noMaterials"] is False  # no "materials" key: unknown, keep the fallback
+
+
+# ---------------------------------------------------------------------------- project settings
+
+class SettingsSession(PrefabSession):
+    def project_settings(self):
+        return {"managers": [{"type": "TagManager", "props": [{"p": "tags.Array.size", "t": "i", "v": 1},
+                                                             {"p": "tags.Array.data[0]", "t": "s", "s": "Enemy"}]}],
+                "tags": ["Enemy"], "scene_order": ["Assets/Menu.unity", "Assets/Game.unity"],
+                "product": "Muck", "company": "Dani"}
+
+    def hierarchy(self, asset):
+        nodes = super().hierarchy(asset)
+        nodes[1].update(layer=9, tag="Enemy")
+        return nodes
+
+
+def test_settings_and_layers_tags(tmp_path):
+    crate = Asset("model", "crate", "c", uid="s:6", source="sharedassets1.assets")
+    prefab = Asset("scene", "Prefab: Crate", ("root", 1, 1), uid="prefab:crate", source="sharedassets1.assets")
+    game = Asset("scene", "Scene: Game", ("scene", 2), uid="scene:level1", source="level1")
+    menu = Asset("scene", "Scene: Menu", ("scene", 1), uid="scene:level0", source="level0")
+    root = tmp_path / "proj"
+    up.export_unity_project(SettingsSession([crate, prefab, game, menu]), str(root), "6000.5.4f1",
+                            editor_exe=fake_editor(tmp_path))
+    settings = json.load(open(root / "Assets" / "UniView" / "Build" / "ProjectSettings.json"))
+    assert settings["kind"] == "settings" and settings["product"] == "Muck" and settings["company"] == "Dani"
+    assert settings["scenes"] == ["Assets/Scenes/Menu.unity", "Assets/Scenes/Game.unity"]  # build order, by level
+    assert settings["managers"][0]["type"] == "TagManager"
+    desc = json.load(open(root / "Assets" / "UniView" / "Build" / "sharedassets1.assets" / "Prefabs" / "Crate.prefab.json"))
+    assert desc["nodes"][1]["layer"] == 9 and desc["nodes"][1]["tag"] == "Enemy"
+    from uniview.unity_builder import BUILDER_CS
+    import re
+    cs_desc = re.search(r"public class Description\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
+    assert set(settings) <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_desc))

@@ -807,6 +807,13 @@ def json_safe(value):
 
 # --------------------------------------------------------------------------- session
 
+# Project settings kept in globalgamemanagers that an editor project can take back as they are.
+SETTINGS_TYPES = ("TagManager", "PhysicsManager", "Physics2DSettings", "InputManager", "TimeManager", "AudioManager",
+                  "QualitySettings", "NavMeshProjectSettings")
+BUILTIN_TAGS = {0: "Untagged", 1: "Respawn", 2: "Finish", 3: "EditorOnly", 5: "MainCamera", 6: "Player",
+                7: "GameController"}
+
+
 class UnitySession(GameSession):
     def __init__(self, plugin, path, env, file_count):
         super().__init__(plugin, path)
@@ -826,6 +833,7 @@ class UnitySession(GameSession):
         self._model_rigs = {}    # mesh key -> the HumanRig that fits its skeleton, or None
         self._humanoid = {}      # (clip key, rig) -> clip converted to bone curves
         self._material_readers = {}  # "material:<file>:<id>" -> ObjectReader (filled by hierarchy())
+        self._tags = None            # custom tag names (TagManager)
 
     def _asset_for(self, obj, type_name="Texture2D", name=None):
         """Asset for an ObjectReader (the listed one if we have it)."""
@@ -1007,6 +1015,8 @@ class UnitySession(GameSession):
             p, r, s = t.m_LocalPosition, t.m_LocalRotation, t.m_LocalScale
             node = {"name": getattr(go, "m_Name", "") or "GameObject", "parent": parent,
                     "active": bool(getattr(go, "m_IsActive", True)),
+                    "layer": int(getattr(go, "m_Layer", 0) or 0),
+                    "tag": self.tag_name(int(getattr(go, "m_Tag", 0) or 0)),
                     "pos": [p.x, p.y, p.z], "rot": [r.x, r.y, r.z, r.w], "scale": [s.x, s.y, s.z],
                     "mesh": None, "skinned": False, "renderer_enabled": True}
             comps = _components(go)
@@ -1093,6 +1103,47 @@ class UnitySession(GameSession):
                     continue
                 nodes[index].setdefault("components", []).append({"type": name, "props": props})
         return nodes
+
+    def _settings_objects(self):
+        return [o for o in self.env.objects if o.type.name in SETTINGS_TYPES + ("BuildSettings", "PlayerSettings")]
+
+    def tag_name(self, tag_id):
+        """A GameObject's m_Tag number as the tag's name (custom tags are 20000 + their index)."""
+        if tag_id in BUILTIN_TAGS:
+            return BUILTIN_TAGS[tag_id]
+        if self._tags is None:
+            self._tags = []
+            for obj in self._settings_objects():
+                if obj.type.name == "TagManager":
+                    try:
+                        self._tags = list(obj.read_typetree().get("tags") or [])
+                    except Exception as e:
+                        log.debug("TagManager: %s", e)
+        i = tag_id - 20000
+        return self._tags[i] if 0 <= i < len(self._tags) else ""
+
+    def project_settings(self):
+        """{"managers": [{"type", "props" (unity_components.flatten)}], "tags", "scene_order": [original scene
+        paths in build order], "product", "company"} from globalgamemanagers."""
+        from .unity_components import flatten
+        out = {"managers": [], "tags": [], "scene_order": [], "product": "", "company": ""}
+        with self.lock:
+            for obj in self._settings_objects():
+                try:
+                    tree = obj.read_typetree()
+                except Exception as e:
+                    log.debug("Settings %s: %s", obj.type.name, e)
+                    continue
+                name = obj.type.name
+                if name == "BuildSettings":
+                    out["scene_order"] = list(tree.get("scenes") or tree.get("m_Scenes") or [])
+                elif name == "PlayerSettings":
+                    out["product"], out["company"] = tree.get("productName", ""), tree.get("companyName", "")
+                else:
+                    if name == "TagManager":
+                        out["tags"] = list(tree.get("tags") or [])
+                    out["managers"].append({"type": name, "props": flatten(tree, lambda file_id, path_id: None)})
+        return out
 
     def material_details(self, uid):
         """read_material_details() of a material named by hierarchy() ("material:<file>:<id>"), with texture

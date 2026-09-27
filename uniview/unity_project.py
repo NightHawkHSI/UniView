@@ -274,7 +274,8 @@ def prefab_description(nodes, target, model_paths, root, builtin_meshes=None, ki
                     # The game's renderer has no materials, so the game never draws it (collision/helper meshes).
                     "noMaterials": "materials" in n and not n["materials"] and bool(model or builtin),
                     "components": [{"type": c["type"], "props": component_props(c["props"], model_paths, root, materials)}
-                                   for c in n.get("components") or ()]})
+                                   for c in n.get("components") or ()],
+                    "layer": int(n.get("layer", 0)), "tag": n.get("tag", "")})
         light = n.get("light")
         if light:
             out[-1]["light"] = {"present": True, "type": light["type"], "color": [float(c) for c in light["color"]],
@@ -363,6 +364,35 @@ def write_static_batches(session, nodes, folder, texture_paths):
         write_glb(session, md, materials, path, image_uri=image_uri, normal_maps=True)
         written.append((path, uids))
     return written
+
+
+def write_settings_description(session, root, assets_dir, scene_targets):
+    """Assets/UniView/Build/ProjectSettings.json: the game's tags, layers, physics, input, time, audio, quality and
+    NavMesh settings, and its scenes in build order. Returns True if written."""
+    if not hasattr(session, "project_settings"):
+        return False
+    try:
+        settings = session.project_settings()
+    except Exception as e:
+        log.warning("Could not read the project settings: %s", e)
+        return False
+    by_level = {}
+    for asset, target in scene_targets:
+        m = re.match(r"level(\d+)$", asset.source or "", re.I)
+        if m:
+            by_level[int(m.group(1))] = unity_path(root, target)
+    desc = {"version": 1, "kind": "settings", "target": "ProjectSettings/TagManager.asset",
+            "managers": settings["managers"], "scenes": [by_level[i] for i in sorted(by_level)],
+            "product": settings.get("product", ""), "company": settings.get("company", ""), "nodes": []}
+    path = os.path.join(assets_dir, *BUILD_DIR, "ProjectSettings.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(desc, f, separators=(",", ":"))
+    write_meta(path, asset_guid("uniview:settings"))
+    write_folder_metas(assets_dir, os.path.dirname(path))
+    log.info("Project settings: %d manager(s), %d tag(s), %d scene(s) in build order",
+             len(settings["managers"]), len(settings.get("tags", [])), len(desc["scenes"]))
+    return True
 
 
 def write_scene_descriptions(session, root, assets_dir, model_paths, texture_paths, cancelled=None, materials=None):
@@ -550,6 +580,9 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
             progress(len(jobs), len(jobs), "scenes")
         scenes, scene_failed = write_scene_descriptions(session, root, assets_dir, model_paths, texture_paths,
                                                         cancelled, library)
+        if (prefabs or scenes) and write_settings_description(session, root, assets_dir,
+                                                                plan_scenes(session.assets, assets_dir)):
+            written += 1
         written += prefabs + scenes + (library.written if library else 0)
         failed += prefab_failed + scene_failed + (library.failed if library else 0)
         log.info("Unity project: %d prefab and %d scene file(s) for UniViewBuilder.cs", prefabs, scenes)

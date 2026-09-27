@@ -63,6 +63,8 @@ namespace UniView
         public bool noMaterials;
         public LightInfo light;
         public Comp[] components;
+        public int layer;
+        public string tag;
     }
 
     [Serializable]
@@ -73,6 +75,13 @@ namespace UniView
     }
 
     [Serializable]
+    public class Manager
+    {
+        public string type;
+        public Prop[] props;
+    }
+
+    [Serializable]
     public class Description
     {
         public int version;
@@ -80,6 +89,10 @@ namespace UniView
         public string target;
         public Node[] nodes;
         public BatchRef[] batches;
+        public Manager[] managers;   // kind "settings" only
+        public string[] scenes;
+        public string product;
+        public string company;
     }
 
     [InitializeOnLoad]
@@ -93,9 +106,12 @@ namespace UniView
             EditorApplication.delayCall += BuildMissingIfAny;
         }
 
+        const string SettingsMarker = "ProjectSettings/UniViewSettingsApplied.txt";
+
         static void BuildMissingIfAny()
         {
             if (EditorApplication.isPlayingOrWillChangePlaymode) return;
+            if (!File.Exists(SettingsMarker) && File.Exists(BuildDir + "/ProjectSettings.json")) { BuildMissing(); return; }
             foreach (string file in Descriptions())
             {
                 Description d = Load(file);
@@ -129,11 +145,17 @@ namespace UniView
             foreach (string file in Descriptions())
             {
                 Description d = Load(file);
+                if (d != null && d.kind == "settings")
+                {
+                    // First: tags and layers must exist before objects can use them.
+                    if (!onlyMissing || !File.Exists(SettingsMarker)) ApplySettings(d);
+                    continue;
+                }
                 if (d == null || d.nodes == null || d.nodes.Length == 0) continue;
                 if (onlyMissing && File.Exists(d.target)) continue;
                 todo.Add(d);
             }
-            if (todo.Count == 0) return;
+            if (todo.Count == 0) { AssetDatabase.SaveAssets(); return; }
             // Prefabs first, then scenes (building a scene replaces the open one).
             todo.Sort(delegate(Description a, Description b) { return (a.kind == "scene").CompareTo(b.kind == "scene"); });
             bool anyScene = todo.Exists(delegate(Description d) { return d.kind == "scene"; });
@@ -194,6 +216,11 @@ namespace UniView
                 go.transform.localPosition = V(n.pos, Vector3.zero);
                 go.transform.localRotation = Q(n.rot);
                 go.transform.localScale = V(n.scale, Vector3.one);
+                if (n.layer > 0 && n.layer < 32) go.layer = n.layer;
+                if (!string.IsNullOrEmpty(n.tag) && n.tag != "Untagged")
+                {
+                    try { go.tag = n.tag; } catch (Exception) { }  // a tag the settings didn't define
+                }
                 objects[i] = go;
             }
             for (int i = 0; i < d.nodes.Length; i++)
@@ -251,6 +278,51 @@ namespace UniView
             }
             Directory.CreateDirectory(Path.GetDirectoryName(d.target));
             EditorSceneManager.SaveScene(scene, d.target);
+        }
+
+        // ---- the game's project settings
+        static readonly Dictionary<string, string> SettingsFiles = new Dictionary<string, string>
+        {
+            { "TagManager", "ProjectSettings/TagManager.asset" },
+            { "PhysicsManager", "ProjectSettings/DynamicsManager.asset" },
+            { "Physics2DSettings", "ProjectSettings/Physics2DSettings.asset" },
+            { "InputManager", "ProjectSettings/InputManager.asset" },
+            { "TimeManager", "ProjectSettings/TimeManager.asset" },
+            { "AudioManager", "ProjectSettings/AudioManager.asset" },
+            { "QualitySettings", "ProjectSettings/QualitySettings.asset" },
+            { "NavMeshProjectSettings", "ProjectSettings/NavMeshAreas.asset" },
+        };
+
+        static void ApplySettings(Description d)
+        {
+            int set = 0, skipped = 0;
+            if (d.managers != null)
+            {
+                foreach (Manager m in d.managers)
+                {
+                    string file;
+                    if (!SettingsFiles.TryGetValue(m.type, out file) || m.props == null) continue;
+                    UnityEngine.Object[] objs = AssetDatabase.LoadAllAssetsAtPath(file);
+                    if (objs == null || objs.Length == 0 || objs[0] == null) { Debug.LogWarning("UniView: can't open " + file); continue; }
+                    int before = valuesSet, beforeSkip = valuesSkipped;
+                    var so = new SerializedObject(objs[0]);
+                    foreach (Prop pr in m.props) SetProp(so, pr, null, null, null);
+                    so.ApplyModifiedPropertiesWithoutUndo();
+                    set += valuesSet - before;
+                    skipped += valuesSkipped - beforeSkip;
+                }
+            }
+            if (d.scenes != null && d.scenes.Length > 0)
+            {
+                var list = new List<EditorBuildSettingsScene>();
+                foreach (string scene in d.scenes) list.Add(new EditorBuildSettingsScene(scene, true));
+                EditorBuildSettings.scenes = list.ToArray();
+            }
+            if (!string.IsNullOrEmpty(d.product)) PlayerSettings.productName = d.product;
+            if (!string.IsNullOrEmpty(d.company)) PlayerSettings.companyName = d.company;
+            AssetDatabase.SaveAssets();
+            File.WriteAllText(SettingsMarker, "UniView applied the game's project settings (delete this file to apply them again).\n");
+            Debug.Log("UniView: project settings applied (" + set + " values set, " + skipped + " not applicable)");
         }
 
         // ---- built-in components (colliders, rigidbodies, audio sources, cameras...), set field by field
