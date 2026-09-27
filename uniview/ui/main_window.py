@@ -33,7 +33,6 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStyle,
     QToolButton,
-    QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -73,6 +72,7 @@ from uniview.model_display import is_place, model_info_rows, texture_groups, tex
 from uniview.projects import ProjectStore, detect_project_engine, engine_info_text, project_options
 from uniview.search import FILTER_HELP, AssetFilter, is_unreadable
 from uniview.settings import BLENDER_IMPORT, Settings, find_blender
+from uniview.ui.asset_tree import AssetTree
 from uniview.ui.console import ConsoleDock
 from uniview.ui.dialogs import ExportDialog, PluginsDialog, edit_project_notes, open_plugins_folder
 from uniview.ui.home import HomePage
@@ -167,7 +167,7 @@ class MainWindow(QMainWindow):
         type_row.addWidget(self.list_btn)
         type_row.addWidget(self.grid_btn)
 
-        self.tree = QTreeWidget()
+        self.tree = AssetTree()
         self.tree.setColumnCount(3)
         self.tree.setHeaderLabels(["Name", "Info", "Size"])
         header = self.tree.header()
@@ -175,15 +175,16 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.Interactive)
         header.setSectionResizeMode(2, QHeaderView.Interactive)
-        header.resizeSection(1, 105)
-        header.resizeSection(2, 78)
+        # Info / Size just wide enough for their usual values: the name gets the rest.
+        fm = self.tree.fontMetrics()
+        header.resizeSection(1, fm.horizontalAdvance("12,345 tris") + 14)
+        header.resizeSection(2, fm.horizontalAdvance("999.9 KB") + 14)
         # Sorting is done by hand (so live stat updates don't reshuffle rows constantly).
         header.setSectionsClickable(True)
         header.setSortIndicatorShown(True)
         header.setSortIndicator(0, Qt.AscendingOrder)
         header.sortIndicatorChanged.connect(lambda col, order: self.resort())
         self.tree.setIconSize(QSize(THUMB_SIZE, THUMB_SIZE))
-        self.tree.setTextElideMode(Qt.ElideLeft)  # long paths: keep the file name visible
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tree.itemSelectionChanged.connect(self.on_select)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -419,6 +420,7 @@ class MainWindow(QMainWindow):
         view = self.menuBar().addMenu("&View")
         add(view, "List view", lambda: self.list_btn.setChecked(True), "Ctrl+1")
         add(view, "Grid view", lambda: self.grid_btn.setChecked(True), "Ctrl+2")
+        add(view, "Collapse all groups", self.tree.collapse_all_groups, "Ctrl+Shift+C")
         if self.console is not None:
             toggle = self.console.toggleViewAction()
             toggle.setShortcut("Ctrl+`")
