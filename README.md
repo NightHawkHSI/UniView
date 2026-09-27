@@ -167,7 +167,7 @@ This creates:
 The packaged exe is automatically self-tested after building. To also test it against a real game:
 `build.bat release --test-game "D:\SteamLibrary\steamapps\common\Robocraft"`
 
-The version number is `__version__` at the top of `unity_viewer.py`.
+The version number is `__version__` in `uniview/__init__.py`.
 
 ## FAQ
 

@@ -6,18 +6,18 @@ import os
 
 import pytest
 
-import unity_viewer as uv
+from uniview import projects, settings, util
 
 
 def load(tmp_path, data):
     path = str(tmp_path / "settings.json")
     with open(path, "w", encoding="utf-8") as f:
         f.write(data if isinstance(data, str) else json.dumps(data))
-    return uv.Settings.load(path), path
+    return settings.Settings.load(path), path
 
 
 def test_defaults_when_missing(tmp_path):
-    s = uv.Settings.load(str(tmp_path / "none.json"))
+    s = settings.Settings.load(str(tmp_path / "none.json"))
     assert s.model_format == "obj" and s.volume == 0.7 and s.view == "list"
     assert s.option("hide_skybox") is True
     assert not os.path.exists(tmp_path / "none.json.bad")
@@ -63,11 +63,11 @@ def test_unknown_keys_survive_save(tmp_path):
 
 def test_roundtrip(tmp_path):
     path = str(tmp_path / "s.json")
-    s = uv.Settings.load(path)
+    s = settings.Settings.load(path)
     s.volume, s.model_format, s.blender_path = 0.25, "glb", "C:/b/blender.exe"
     s.set_option("hide_unreadable", False)
     s.save()
-    t = uv.Settings.load(path)
+    t = settings.Settings.load(path)
     assert t.to_json() == s.to_json()
     assert json.load(open(path))["opt_hide_unreadable"] is False  # flat file, readable by older versions
 
@@ -82,19 +82,19 @@ def test_roundtrip(tmp_path):
     ("view", "tiles", ValueError),
 ])
 def test_assignment_is_checked(name, value, error):
-    s = uv.Settings(path="unused")
+    s = settings.Settings(path="unused")
     with pytest.raises(error):
         setattr(s, name, value)
 
 
 def test_set_option_checked():
-    s = uv.Settings(path="unused")
+    s = settings.Settings(path="unused")
     with pytest.raises(TypeError):
         s.set_option("hide_lods", "no")
 
 
 def test_save_failure_is_logged_not_raised(tmp_path, caplog):
-    s = uv.Settings(path=str(tmp_path / "missing_dir" / "s.json"))
+    s = settings.Settings(path=str(tmp_path / "missing_dir" / "s.json"))
     with caplog.at_level(logging.WARNING, logger="viewer"):
         s.save()
     assert "Could not save settings" in caplog.text
@@ -102,9 +102,9 @@ def test_save_failure_is_logged_not_raised(tmp_path, caplog):
 
 def test_write_json_never_truncates(tmp_path):
     path = str(tmp_path / "p.json")
-    uv.write_json(path, [{"a": 1}])
+    util.write_json(path, [{"a": 1}])
     with pytest.raises(TypeError):
-        uv.write_json(path, [{"a": object()}])
+        util.write_json(path, [{"a": object()}])
     assert json.load(open(path)) == [{"a": 1}]
     assert not os.path.exists(path + ".tmp")
 
@@ -112,6 +112,6 @@ def test_write_json_never_truncates(tmp_path):
 def test_project_store_corrupt_file_kept(tmp_path):
     path = str(tmp_path / "projects.json")
     open(path, "w").write('[{"path": "C:/x"')
-    store = uv.ProjectStore(path)
+    store = projects.ProjectStore(path)
     assert store.projects == []
     assert open(path + ".bad").read() == '[{"path": "C:/x"'

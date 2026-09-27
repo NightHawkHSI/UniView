@@ -30,6 +30,17 @@ def test_plugin_contract(plugin):
     assert plugin.detect(os.path.join(ROOT, "no such folder")) in (0, None)
 
 
+def test_default_font_preview_uses_raw(tmp_path):
+    """Engines without their own font code (Source, Unreal ...) still preview TTF/OTF fonts."""
+    ttf = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "arial.ttf")
+    if not os.path.isfile(ttf):
+        pytest.skip("no system TTF font to test with")
+    session = GameSession(EnginePlugin(), str(tmp_path))
+    session.raw = lambda asset: open(ttf, "rb").read()
+    img = session.font(engines.sdk.Asset("font", "arial", "arial", ext="ttf"))
+    assert img.width > 500 and img.height > 100
+
+
 def load_template():
     spec = importlib.util.spec_from_file_location("uniview_template_test", os.path.join(PLUGINS_DIR, "_template.py"))
     module = importlib.util.module_from_spec(spec)

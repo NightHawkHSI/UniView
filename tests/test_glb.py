@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-import unity_viewer as uv
+from uniview import export as uv
 from engines.sdk import ALBEDO, NORMAL, Material, MeshData, TextureRef
 from engines.unity_skin import quat_to_mat
 

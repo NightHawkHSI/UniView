@@ -419,6 +419,10 @@ class GameSession:
         """Links shown under a texture: (title, [Asset], text when empty). E.g. models that use it."""
         return "", [], ""
 
+    def font(self, asset: Asset) -> Image:
+        """Sample sheet of a font asset. Default: render raw() (TTF/OTF bytes) with font_preview()."""
+        return font_preview(self.raw(asset), asset.name)
+
     def video(self, asset: Asset) -> tuple[bytes, str]:
         """(bytes, extension) of a video the player can open (mp4, webm, mov, avi, mkv...)."""
         return self.raw(asset), (asset.ext or "mp4").lower()

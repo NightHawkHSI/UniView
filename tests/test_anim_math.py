@@ -100,7 +100,7 @@ def test_trs_composition():
 
 def test_write_glb_rest_matrix_matches_quat_to_mat():
     """write_glb's _add_skeleton builds rest matrices with its own copy of the formula."""
-    import unity_viewer as uv
+    from uniview import export as uv
     q = axis_angle([1, 2, 3], 70)
     rig = {"joints": [{"name": "j", "parent": -1, "translation": [0, 0, 0], "rotation": list(q),
                        "scale": [1, 1, 1]}], "skin_joints": [], "inverse_bind": []}

@@ -75,7 +75,7 @@ leave out raises a clear "not supported" message in the viewer.
 * **`start_background()` / `close()`**: optional. `start_background()` can start indexing work
   after the game loads. `close()` should stop that work and close files when the game is unloaded.
 * **`video(asset)`**: `(bytes, extension)` of a video (mp4, webm, mov...). Default: the raw file.
-* Fonts use `image()` for their preview (see `engines.sdk.font_preview`) and `raw()` for the file.
+* Fonts: `font()` renders the preview (default: `font_preview(raw())`, so usually `raw()` returning the TTF/OTF bytes is enough) and `raw()` saves the file.
 * **`audio(asset)`**: return `(bytes, extension)` in a format the player decodes (wav, mp3, ogg, flac, aac).
   By default the raw file is used when its extension is one of those.
 * **`animation_targets(clip)` / `animate(model, clip)`**: for `animation` assets, list the models a clip fits,

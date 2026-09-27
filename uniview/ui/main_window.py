@@ -1,0 +1,1472 @@
+"""The main window: asset list, previews, menus, export."""
+
+import os
+import subprocess
+import tempfile
+import time
+import traceback
+import webbrowser
+from html import escape as html_escape
+
+import numpy as np
+from PIL import Image
+from PySide6.QtCore import QPoint, QSignalBlocker, QSize, Qt, QThread, QTimer
+from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QPixmap
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QButtonGroup,
+    QComboBox,
+    QFileDialog,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QListView,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QSplitter,
+    QStackedWidget,
+    QStyle,
+    QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+import engines
+from engines.sdk import IMAGE_KINDS, KIND_LABELS, KINDS, MODEL_KINDS, THUMB_KINDS, VIEW_OPTIONS
+from uniview import __version__
+from uniview.constants import (
+    APP_DIR,
+    APP_SHORT,
+    APP_TITLE,
+    CRASH_FILE,
+    GRID_LIMIT,
+    GRID_THUMB,
+    ICON_FILE,
+    LOG_FILE,
+    MAX_TEXT_CHARS,
+    REPO_URL,
+    SORT_ROLE,
+    THUMB_CACHE_MAX,
+    THUMB_SIZE,
+    TYPE_ROLE,
+    VIEW_OPTION_ITEMS,
+    log,
+)
+from uniview.export import display_texture, export_subfolder, material_for, render_uv_layout, write_glb, write_obj
+from uniview.projects import ProjectStore, detect_project_engine, engine_info_text, project_options
+from uniview.search import FILTER_HELP, AssetFilter, is_unreadable
+from uniview.settings import BLENDER_IMPORT, Settings, find_blender
+from uniview.ui.console import ConsoleDock
+from uniview.ui.dialogs import ExportDialog, PluginsDialog, edit_project_notes, open_plugins_folder
+from uniview.ui.home import HomePage
+from uniview.ui.media import AnimationView, AudioView, ImageView, ImageWindow, VideoView
+from uniview.ui.mesh_view import MeshView
+from uniview.util import blank_icon, fmt_size, norm_path, open_path, pil_to_pixmap, safe_filename
+from uniview.workers import Loader, StatsWorker, ThumbnailWorker, meshdata_to_polydata
+
+
+class SortItem(QTreeWidgetItem):
+    """Tree row that sorts by SORT_ROLE numbers/strings instead of display text."""
+
+    def __lt__(self, other):
+        tree = self.treeWidget()
+        col = tree.sortColumn() if tree is not None else 0
+        a, b = self.data(col, SORT_ROLE), other.data(col, SORT_ROLE)
+        if a is None or b is None or type(a) is not type(b):
+            a = -1 if a is None else a
+            b = -1 if b is None else b
+            if type(a) is not type(b):
+                return str(a) < str(b)
+        return a < b
+
+class MainWindow(QMainWindow):
+
+    def __init__(self, log_handler=None):
+        super().__init__()
+        self.setWindowTitle(APP_TITLE)
+        self.resize(1500, 900)
+        self.settings = Settings.load()
+        self.session = None      # GameSession of the game being viewed
+        self.current = None      # Asset shown on the right
+        self.thread = None
+        self.last_dir = self.settings.last_dir
+        self.loaded = {}  # norm path -> {"session", "thumbs", "stats", "favorites"}
+        self.loading_path = None
+        self.favorites = set()   # Asset.uid values
+        self.items_by_key = {}   # key -> tree item
+        self.grid_items = {}     # key -> grid item
+        self.stats = {}          # key -> stats dict (per game)
+        self.stats_remaining = 0
+        self._windows = []       # open UV-layout windows
+
+        # thumbnails / stats
+        self.blank = blank_icon(THUMB_SIZE)
+        self.blank_big = blank_icon(GRID_THUMB)
+        self.thumb_cache = {}  # key -> QIcon (insertion order = age, capped)
+        self.thumbs = ThumbnailWorker(GRID_THUMB)
+        self.thumbs.ready.connect(self.on_thumbnail)
+        self.thumb_timer = QTimer(self, singleShot=True, interval=120)
+        self.thumb_timer.timeout.connect(self.queue_visible_thumbs)
+        self.stats_worker = StatsWorker()
+        self.stats_worker.ready.connect(self.on_stats)
+        self.filter_timer = QTimer(self, singleShot=True, interval=250)
+        self.filter_timer.timeout.connect(self.apply_filter)
+        self.resort_timer = QTimer(self, singleShot=True, interval=1500)
+        self.resort_timer.timeout.connect(self.resort)
+
+        # left: buttons, search, type/view, list or grid
+        back = QPushButton("\u2190 Projects")
+        back.clicked.connect(self.show_home)
+        self.notes_btn = QPushButton("Notes")
+        self.notes_btn.setToolTip("Your notes for this game")
+        self.notes_btn.clicked.connect(self.edit_current_notes)
+        top_row = QHBoxLayout()
+        top_row.addWidget(back, 1)
+        top_row.addWidget(self.notes_btn)
+
+        self.search = QLineEdit(placeholderText="Search...  e.g.  gun tris>1000 size>1mb")
+        self.search.setClearButtonEnabled(True)
+        self.search.setToolTip(FILTER_HELP)
+        self.search.textChanged.connect(lambda _: self.filter_timer.start())
+        self.type_combo = QComboBox()
+        self.type_combo.addItem("All types", "all")
+        for kind in KINDS:
+            self.type_combo.addItem(KIND_LABELS[kind], kind)
+        self.type_combo.addItem("\u2605 Favorites", "fav")
+        self.type_combo.currentIndexChanged.connect(lambda _: self.apply_filter())
+        self.list_btn = QToolButton(text="\u2630 List", checkable=True, checked=True)
+        self.grid_btn = QToolButton(text="\u25a6 Grid", checkable=True)
+        self.grid_btn.setToolTip("Big thumbnails - use the arrow keys to flip through quickly")
+        view_group = QButtonGroup(self)
+        view_group.setExclusive(True)
+        view_group.addButton(self.list_btn)
+        view_group.addButton(self.grid_btn)
+        self.grid_btn.toggled.connect(self.set_grid_mode)
+        type_row = QHBoxLayout()
+        type_row.addWidget(self.type_combo, 1)
+        type_row.addWidget(self.list_btn)
+        type_row.addWidget(self.grid_btn)
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(3)
+        self.tree.setHeaderLabels(["Name", "Info", "Size"])
+        header = self.tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.Interactive)
+        header.resizeSection(1, 105)
+        header.resizeSection(2, 78)
+        # Sorting is done by hand (so live stat updates don't reshuffle rows constantly).
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        header.setSortIndicator(0, Qt.AscendingOrder)
+        header.sortIndicatorChanged.connect(lambda col, order: self.resort())
+        self.tree.setIconSize(QSize(THUMB_SIZE, THUMB_SIZE))
+        self.tree.setTextElideMode(Qt.ElideLeft)  # long paths: keep the file name visible
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.tree.itemSelectionChanged.connect(self.on_select)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(lambda pos: self.on_context_menu(self.tree, pos))
+        self.tree.verticalScrollBar().valueChanged.connect(lambda _: self.thumb_timer.start())
+        self.tree.itemExpanded.connect(lambda _: self.thumb_timer.start())
+
+        self.grid = QListWidget()
+        self.grid.setViewMode(QListView.IconMode)
+        self.grid.setResizeMode(QListView.Adjust)
+        self.grid.setMovement(QListView.Static)
+        self.grid.setUniformItemSizes(True)
+        self.grid.setIconSize(QSize(GRID_THUMB, GRID_THUMB))
+        self.grid.setGridSize(QSize(GRID_THUMB + 30, GRID_THUMB + 34))
+        self.grid.setTextElideMode(Qt.ElideMiddle)
+        self.grid.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.grid.currentItemChanged.connect(self.on_grid_current)
+        self.grid.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.grid.customContextMenuRequested.connect(lambda pos: self.on_context_menu(self.grid, pos))
+        self.grid.verticalScrollBar().valueChanged.connect(lambda _: self.thumb_timer.start())
+        self.grid_dirty = True
+
+        self.list_stack = QStackedWidget()
+        self.list_stack.addWidget(self.tree)
+        self.list_stack.addWidget(self.grid)
+
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.addLayout(top_row)
+        ll.addWidget(self.search)
+        ll.addLayout(type_row)
+        ll.addWidget(self.list_stack)
+
+        # right: stacked previews
+        self.mesh_view = MeshView()
+        self.mesh_view.uv_layout_requested.connect(self.show_uv_layout)
+        panel = self.mesh_view.panel
+        panel.apply_texture.connect(self.apply_texture)
+        panel.open_texture.connect(lambda asset: self.goto_asset(asset.key))
+        panel.save_texture.connect(self.export_item)
+        panel.save_model.connect(self.export_selected_mesh)
+        panel.open_blender.connect(self.open_in_blender)
+        self.image_view = ImageView()
+        self.image_view.save_requested.connect(self.save_shown_image)
+        self.image_view.goto_requested.connect(self.goto_asset)
+        self.text_view = QPlainTextEdit(readOnly=True)
+        self.anim_view = AnimationView()
+        self.anim_view.play_requested.connect(self.play_animation)
+        self.anim_view.export_requested.connect(self.export_animated)
+        self.anim_view.flipbook_requested.connect(self.play_flipbook)
+        self.flipbook_timer = QTimer(self, interval=15)
+        self.flipbook_timer.timeout.connect(self._flipbook_tick)
+        self._flipbook = None
+        self.audio_view = AudioView(self.settings)
+        self.video_view = VideoView(self.settings)
+        self.video_view.save_requested.connect(lambda: self.current and self.export_item(self.current))
+        self.audio_view.save_requested.connect(lambda: self.current and self.export_item(self.current))
+
+        self.placeholder = QLabel("Loading...", alignment=Qt.AlignCenter)
+        self.load_bar = QProgressBar()
+        self.load_bar.setFixedWidth(420)
+        self.load_bar.hide()
+        self.placeholder_page = QWidget()
+        pl = QVBoxLayout(self.placeholder_page)
+        pl.addStretch()
+        pl.addWidget(self.placeholder)
+        pl.addWidget(self.load_bar, 0, Qt.AlignHCenter)
+        pl.addStretch()
+
+        self.stack = QStackedWidget()
+        for w in (self.placeholder_page, self.mesh_view, self.image_view, self.text_view, self.audio_view,
+                  self.anim_view, self.video_view):
+            self.stack.addWidget(w)
+
+        self.viewer = QSplitter()
+        self.viewer.addWidget(left)
+        self.viewer.addWidget(self.stack)
+        self.viewer.setSizes([430, 1070])
+
+        self.store = ProjectStore()
+        self.home = HomePage(self.store, self.is_loaded, self.settings)
+        self.home.open_requested.connect(self.open_project)
+        self.home.unload_requested.connect(self.unload_game)
+
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self.home)
+        self.pages.addWidget(self.viewer)
+        self.setCentralWidget(self.pages)
+
+        self.progress = QProgressBar()
+        self.progress.setMaximumWidth(260)
+        self.progress.hide()
+        self.statusBar().addPermanentWidget(self.progress)
+        self.engine_label = QLabel()
+        self.engine_label.setStyleSheet("color: gray; padding: 0 6px;")
+        self.statusBar().addPermanentWidget(self.engine_label)
+
+        self.console = None
+        if log_handler is not None:
+            self.console = ConsoleDock(log_handler, self)
+            self.addDockWidget(Qt.BottomDockWidgetArea, self.console)
+            self.resizeDocks([self.console], [170], Qt.Vertical)
+
+        for key in VIEW_OPTIONS:
+            VIEW_OPTIONS[key] = self.settings.option(key)
+        self._build_menu()
+        if self.settings.view == "grid":
+            self.grid_btn.setChecked(True)
+        self.statusBar().showMessage("Ready")
+        log.info(APP_SHORT + " %s started - engine plugins: %s", __version__,
+                 ", ".join(f"{p.name} {p.version}" for p in engines.plugins()) or "none")
+
+    # ---- projects / games
+    def current_project(self):
+        return self.store.get(self.loading_path) if self.loading_path else None
+
+    def is_loaded(self, path):
+        return norm_path(path) in self.loaded
+
+    def unload_game(self, path):
+        entry = self.loaded.pop(norm_path(path), None)
+        if entry is None:
+            return
+        entry["session"].close()
+        if self.session is entry["session"]:
+            self._reset_viewer()
+            self.placeholder.setText("This game was unloaded. Go back to Projects to open it again.")
+            self.statusBar().showMessage("Unloaded")
+        del entry
+        import gc
+        gc.collect()
+        log.info("Unloaded %s from memory", path)
+        self.home.refresh()
+
+    def show_home(self):
+        self.home.refresh()
+        self.pages.setCurrentWidget(self.home)
+        self.setWindowTitle(APP_TITLE)
+        self.engine_label.clear()
+
+    def focus_search(self):
+        search = self.home.search if self.pages.currentWidget() is self.home else self.search
+        search.setFocus()
+        search.selectAll()
+
+    def open_project(self, path):
+        if self.thread is not None and self.thread.isRunning():
+            QMessageBox.information(self, "Busy", "Still loading the previous game, try again in a moment.")
+            return
+        project = self.store.get(path)
+        name = project["name"] if project else os.path.basename(path)
+        if project is not None and not project.get("engine"):
+            self.store.update(path, **detect_project_engine(path))  # only reads listings/headers
+        info = engine_info_text(project) if project else ""
+        self.setWindowTitle(f"{APP_SHORT} - {name}" + (f"  ({info})" if info else ""))
+        self.engine_label.setText(info)
+        log.info("Opening game '%s'%s", name, f" ({info})" if info else "")
+        self.load(path)
+
+    def edit_current_notes(self):
+        project = self.current_project()
+        if project is None:
+            QMessageBox.information(self, "Notes", "Notes are saved per game. Open a game from Projects first.")
+            return
+        if edit_project_notes(self, project):
+            self.store.save()
+            self._update_notes_button()
+
+    def _update_notes_button(self):
+        project = self.current_project()
+        self.notes_btn.setEnabled(project is not None)
+        self.notes_btn.setText("Notes \U0001F4DD" if project and project.get("notes") else "Notes")
+        self.notes_btn.setToolTip(project.get("notes") or "Your notes for this game" if project else
+                                  "Notes are saved per game (open a game from Projects)")
+
+    def _build_menu(self):
+        def add(menu, text, slot, key=None):
+            act = QAction(text, self)
+            if key:
+                act.setShortcut(key)
+            act.triggered.connect(slot)
+            menu.addAction(act)
+            return act
+
+        m = self.menuBar().addMenu("&File")
+        add(m, "Projects", self.show_home, "Ctrl+Home")
+        m.addSeparator()
+        add(m, "Open file...", self.open_file, "Ctrl+O")
+        add(m, "Open game folder...", self.open_folder, "Ctrl+Shift+O")
+        m.addSeparator()
+        add(m, "Export all models...", lambda: self.export_all(("model",)))
+        add(m, "Export all textures...", lambda: self.export_all(IMAGE_KINDS))
+        add(m, "Export everything shown in the list...", self.export_shown)
+        m.addSeparator()
+        add(m, "Quit", self.close, "Ctrl+Q")
+
+        a = self.menuBar().addMenu("&Asset")
+        add(a, "Save selected...", self.export_selected, "Ctrl+S")
+        add(a, "Toggle favorite", self.toggle_favorite_selected, "Ctrl+D")
+        add(a, "Open model in Blender", self.open_in_blender, "Ctrl+B")
+        add(a, "Show UV layout", self.show_uv_layout, "Ctrl+U")
+        a.addSeparator()
+        add(a, "Find (search box)", self.focus_search, "Ctrl+F")
+        add(a, "Set Blender location...", self.choose_blender)
+
+        view = self.menuBar().addMenu("&View")
+        add(view, "List view", lambda: self.list_btn.setChecked(True), "Ctrl+1")
+        add(view, "Grid view", lambda: self.grid_btn.setChecked(True), "Ctrl+2")
+        if self.console is not None:
+            toggle = self.console.toggleViewAction()
+            toggle.setShortcut("Ctrl+`")
+            view.addAction(toggle)
+
+        options = self.menuBar().addMenu("&Options")
+        for key, text, tip in VIEW_OPTION_ITEMS:
+            act = QAction(text, self, checkable=True)
+            act.setChecked(self.settings.option(key))
+            act.setToolTip(tip)
+            act.setStatusTip(tip)
+            act.toggled.connect(lambda on, key=key: self._set_view_option(key, on))
+            options.addAction(act)
+        options.setToolTipsVisible(True)
+
+        help_menu = self.menuBar().addMenu("&Help")
+        online = QAction("Download community compatibility list", self, checkable=True)
+        online.setChecked(self.settings.online_compat)
+        online.setToolTip(f"Fetches compat.json from {REPO_URL} at startup")
+        online.toggled.connect(self._set_online_compat)
+        help_menu.addAction(online)
+        help_menu.addAction("Project page on GitHub", lambda: webbrowser.open(REPO_URL))
+        help_menu.addSeparator()
+        help_menu.addAction("Engine plugins...", lambda: PluginsDialog(self).exec())
+        help_menu.addAction("Install sound decoder (vgmstream)...", self.install_sound_decoder)
+        help_menu.addAction("Open plugins folder", open_plugins_folder)
+        help_menu.addSeparator()
+        help_menu.addAction("Open log file", lambda: open_path(LOG_FILE))
+        help_menu.addAction("Open crash log", lambda: open_path(CRASH_FILE))
+        help_menu.addAction("Open app folder", lambda: os.startfile(APP_DIR))
+
+    def _set_view_option(self, key, on):
+        self.settings.set_option(key, on)
+        self.settings.save()
+        if key == "hide_unreadable":
+            self.apply_filter()
+            return
+        VIEW_OPTIONS[key] = on
+        for entry in self.loaded.values():
+            session = entry.get("session")
+            if session is not None:
+                with session.lock:
+                    session.options_changed()
+        if self.current is not None and self.current.kind in MODEL_KINDS:
+            self.show_asset(self.current)  # rebuild the map / scene with the new setting
+
+    def _set_online_compat(self, on):
+        self.settings.online_compat = on
+        self.settings.save()
+        if on:
+            self.home.fetch_compat()
+
+    # ---- progress
+    def set_progress(self, done, total):
+        for bar in (self.progress, self.load_bar):
+            if total <= 0:
+                bar.setRange(0, 0)  # busy animation
+            else:
+                bar.setRange(0, total)
+                bar.setValue(done)
+            bar.show()
+
+    def hide_progress(self):
+        self.progress.hide()
+        self.load_bar.hide()
+
+    # ---- loading
+    def open_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open a game file (.assets, _dir.vpk, .pak ...)")
+        if path:
+            self.load(path)
+
+    def open_folder(self):
+        path = QFileDialog.getExistingDirectory(self, "Open game folder")
+        if path:
+            self.load(path)
+
+    def _reset_viewer(self):
+        self.thumbs.clear()
+        self.stats_worker.start([])
+        self.session = self.current = None
+        self.thumb_cache, self.items_by_key, self.grid_items, self.stats = {}, {}, {}, {}
+        self.mesh_view.poly = self.mesh_view.texture_img = self.mesh_view.override = None
+        self.mesh_view.parts = []
+        self.mesh_view.plotter.clear()
+        self.tree.clear()
+        self.grid.clear()
+        self.stack.setCurrentWidget(self.placeholder_page)
+
+    def load(self, path):
+        if self.thread is not None and self.thread.isRunning():
+            return
+        self.pages.setCurrentWidget(self.viewer)
+        self._reset_viewer()
+        self.placeholder.setText("Loading...")
+        self.loading_path = path
+        self._update_notes_button()
+        if self.current_project() is None:
+            self.engine_label.clear()
+        entry = self.loaded.get(norm_path(path))
+        if entry is not None:
+            log.info("Already loaded - reusing assets in memory for %s", path)
+            self.on_loaded(entry["session"])
+            return
+        project = self.current_project()
+        plugin = engines.get(project.get("engine") or "") if project else None
+        if plugin is None:
+            plugin, _score = engines.detect(path)
+        if plugin is None:
+            self.placeholder.setText("No engine plugin recognizes this game.")
+            QMessageBox.warning(self, "Unknown engine",
+                                "None of the engine plugins recognize:\n" + path + "\n\nInstalled: "
+                                + ", ".join(p.name for p in engines.plugins())
+                                + "\n\nSee Help \u2192 Engine plugins to add one.")
+            return
+        self.set_progress(0, 0)
+        self.thread = QThread()
+        options = project_options(project, plugin) if project else {}
+        self.loader = Loader(path, plugin, options)
+        self.loader.moveToThread(self.thread)
+        self.thread.started.connect(self.loader.run)
+        self.loader.progress.connect(self.statusBar().showMessage)
+        self.loader.progress.connect(self.placeholder.setText)
+        self.loader.progress_value.connect(self.set_progress)
+        self.loader.finished.connect(self.on_loaded)
+        self.loader.failed.connect(self.on_load_failed)
+        self.loader.finished.connect(self.thread.quit)
+        self.loader.failed.connect(self.thread.quit)
+        self.thread.start()
+
+    def on_loaded(self, session):
+        self.hide_progress()
+        key = norm_path(self.loading_path)
+        entry = self.loaded.get(key)
+        if entry is None or entry["session"] is not session:
+            entry = {"session": session, "thumbs": {}, "stats": {}, "favorites": set()}
+            session.start_background()
+            self.loaded[key] = entry
+            if session.warnings:
+                QTimer.singleShot(0, lambda: QMessageBox.information(
+                    self, "Loaded with notes", "\n\n".join(session.warnings)))
+        self.session = session
+        self.thumb_cache = entry["thumbs"]
+        self.stats = entry["stats"]
+        project = self.current_project()
+        self.favorites = set(project.get("favorites", [])) if project else entry["favorites"]
+        file_icon = self.style().standardIcon(QStyle.SP_FileIcon)
+        kind_icons = {"audio": self.style().standardIcon(QStyle.SP_MediaVolume),
+                      "video": self.style().standardIcon(QStyle.SP_MediaPlay),
+                      "font": self.style().standardIcon(QStyle.SP_FileDialogDetailedView),
+                      "data": self.style().standardIcon(QStyle.SP_FileDialogInfoView),
+                      "animation": self.style().standardIcon(QStyle.SP_BrowserReload)}
+
+        by_kind = {}
+        for asset in session.assets:
+            by_kind.setdefault(asset.kind, []).append(asset)
+        tops, total, jobs = [], 0, []
+        for kind in list(KINDS) + sorted(k for k in by_kind if k not in KINDS):
+            items = by_kind.get(kind)
+            if not items:
+                continue
+            label = KIND_LABELS.get(kind, kind)
+            top = SortItem([label, "", ""])
+            top.setData(0, TYPE_ROLE, kind)
+            top.setData(0, SORT_ROLE, f"{KINDS.index(kind) if kind in KINDS else 99:02d}")
+            top.setFlags(top.flags() & ~Qt.ItemIsSelectable)
+            children = []
+            for asset in items:
+                child = SortItem([asset.name, "", fmt_size(asset.size)])
+                child.setData(0, Qt.UserRole, asset)
+                child.setData(0, SORT_ROLE, asset.name.lower())
+                child.setData(2, SORT_ROLE, asset.size if asset.size is not None else -1)
+                child.setIcon(0, self.thumb_cache.get(asset.key, self.blank) if kind in THUMB_KINDS else
+                              kind_icons.get(kind, file_icon))
+                if asset.uid in self.favorites:
+                    self._mark_favorite(child, True)
+                stats = self.stats.get(asset.key)
+                if stats is not None:
+                    self._apply_stats(child, stats)
+                else:
+                    jobs.append((asset.key, session, asset))
+                self.items_by_key[asset.key] = child
+                children.append(child)
+            top.addChildren(children)
+            tops.append(top)
+            total += len(items)
+        self.tree.addTopLevelItems(tops)
+        self.resort()
+
+        # Measure everything in the background: models first, then textures, sprites, text...
+        order = {k: i for i, k in enumerate(KINDS)}
+        jobs.sort(key=lambda j: order.get(j[2].kind, 99))
+        self.stats_remaining = len(jobs)
+        self.stats_worker.start(jobs)
+
+        self.store.set_counts(self.loading_path, files=session.file_count, assets=total)
+        if project is not None:
+            updates = {}
+            if session.engine_version and not project.get("engine_version"):
+                updates["engine_version"] = session.engine_version
+            if not project.get("engine"):
+                updates["engine"] = session.plugin.id
+            if updates:
+                self.store.update(self.loading_path, **updates)
+                self.engine_label.setText(engine_info_text(project))
+        self.placeholder.setText("Pick something from the list on the left." if total else
+                                 "This game loaded, but the plugin found nothing to show.")
+        self.statusBar().showMessage(f"Loaded {total:,} assets from {session.file_count} file(s)")
+        self.grid_dirty = True
+        self.apply_filter()
+
+    def on_load_failed(self, tb):
+        self.hide_progress()
+        self.statusBar().showMessage("Load failed - see the console")
+        self.placeholder.setText("Load failed.")
+        QMessageBox.critical(self, "Load failed", tb[-3000:])
+
+    # ---- stats, sorting, filtering
+    def _apply_stats(self, item, stats):
+        item.setText(1, stats.get("info", ""))
+        item.setData(1, SORT_ROLE, stats.get("sort", -1))
+        item.setText(2, fmt_size(stats.get("size")))
+        item.setData(2, SORT_ROLE, stats.get("size", -1))
+
+    def on_stats(self, batch, remaining):
+        for key, stats in batch:
+            self.stats[key] = stats
+            item = self.items_by_key.get(key)
+            if item is not None:
+                self._apply_stats(item, stats)
+        self.stats_remaining = remaining
+        if remaining:
+            self.statusBar().showMessage(f"Measuring assets for sort/search... {remaining:,} left", 2000)
+        else:
+            log.info("Finished measuring all assets (tris, sizes)")
+        if self.tree.header().sortIndicatorSection() in (1, 2) and not self.resort_timer.isActive():
+            self.resort_timer.start()
+        unreadable = self.settings.option("hide_unreadable") and any(is_unreadable(st) for _k, st in batch)
+        if (unreadable or AssetFilter(self.search.text()).conditions) and not self.filter_timer.isActive():
+            self.filter_timer.start()
+
+    def resort(self):
+        header = self.tree.header()
+        self.tree.sortItems(header.sortIndicatorSection(), header.sortIndicatorOrder())
+        self.grid_dirty = True
+        if self.list_stack.currentWidget() is self.grid:
+            self.rebuild_grid()
+        self.thumb_timer.start()
+
+    def apply_filter(self):
+        filt = AssetFilter(self.search.text())
+        want = self.type_combo.currentData()
+        hide_unreadable = self.settings.option("hide_unreadable")
+        self.tree.setUpdatesEnabled(False)
+        try:
+            for i in range(self.tree.topLevelItemCount()):
+                top = self.tree.topLevelItem(i)
+                kind = top.data(0, TYPE_ROLE)
+                label = KIND_LABELS.get(kind, kind)
+                group_ok = want in ("all", "fav") or want == kind
+                shown = 0
+                if group_ok:
+                    for j in range(top.childCount()):
+                        child = top.child(j)
+                        asset = child.data(0, Qt.UserRole)
+                        stats = self.stats.get(asset.key)
+                        ok = filt.matches(asset.name, kind, stats)
+                        if ok and hide_unreadable and is_unreadable(stats):
+                            ok = False
+                        if ok and want == "fav":
+                            ok = asset.uid in self.favorites
+                        child.setHidden(not ok)
+                        shown += ok
+                count = top.childCount()
+                top.setText(0, f"{label} ({shown:,})" if shown == count else f"{label} ({shown:,} of {count:,})")
+                searching = want == "fav" or bool(self.search.text().strip())
+                top.setHidden(not group_ok or (searching and not shown))
+                if want not in ("all", "fav") and group_ok:
+                    top.setExpanded(True)
+        finally:
+            self.tree.setUpdatesEnabled(True)
+        if filt.conditions and self.stats_remaining:
+            self.statusBar().showMessage(
+                f"Still measuring {self.stats_remaining:,} assets - more results will appear", 4000)
+        self.grid_dirty = True
+        if self.list_stack.currentWidget() is self.grid:
+            self.rebuild_grid()
+        self.thumb_timer.start()
+
+    def visible_assets(self):
+        """(tree item, data) for every row that passes the current filter, in list order."""
+        out = []
+        for i in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(i)
+            if top.isHidden():
+                continue
+            for j in range(top.childCount()):
+                child = top.child(j)
+                if not child.isHidden():
+                    out.append((child, child.data(0, Qt.UserRole)))
+        return out
+
+    # ---- grid view
+    def set_grid_mode(self, grid):
+        self.list_stack.setCurrentWidget(self.grid if grid else self.tree)
+        self.settings.view = "grid" if grid else "list"
+        self.settings.save()
+        if grid:
+            self.rebuild_grid()
+        self.thumb_timer.start()
+
+    def rebuild_grid(self):
+        if not self.grid_dirty:
+            return
+        self.grid_dirty = False
+        rows = self.visible_assets()
+        with QSignalBlocker(self.grid):
+            self.grid.clear()
+            self.grid_items = {}
+            file_icon = self.style().standardIcon(QStyle.SP_FileIcon)
+            for _item, asset in rows[:GRID_LIMIT]:
+                key = asset.key
+                fav = asset.uid in self.favorites
+                icon = self.thumb_cache.get(key, self.blank_big) if asset.kind in THUMB_KINDS else file_icon
+                it = QListWidgetItem(icon, ("\u2605 " if fav else "") + os.path.basename(asset.name))
+                it.setData(Qt.UserRole, asset)
+                stats = self.stats.get(key) or {}
+                it.setToolTip(f"{asset.name}\n{KIND_LABELS.get(asset.kind, asset.kind)}  {stats.get('info', '')}  "
+                              f"{fmt_size(stats.get('size'))}".strip())
+                self.grid.addItem(it)
+                self.grid_items[key] = it
+        if len(rows) > GRID_LIMIT:
+            self.statusBar().showMessage(f"Grid shows the first {GRID_LIMIT:,} of {len(rows):,} - "
+                                         "use search or the type filter to narrow it down", 6000)
+        if self.current:
+            current = self.grid_items.get(self.current.key)
+            if current is not None:
+                with QSignalBlocker(self.grid):
+                    self.grid.setCurrentItem(current)
+        self.thumb_timer.start()
+
+    def on_grid_current(self, item, _previous):
+        data = item.data(Qt.UserRole) if item else None
+        if not data:
+            return
+        tree_item = self.items_by_key.get(data.key)
+        if tree_item is not None:
+            with QSignalBlocker(self.tree):
+                self.tree.setCurrentItem(tree_item)
+        self.show_asset(data)
+
+    # ---- thumbnails
+    def queue_visible_thumbs(self):
+        """Ask for thumbnails of what's on screen (plus a little beyond)."""
+        if self.session is None:
+            return
+        jobs = []
+        if self.list_stack.currentWidget() is self.grid:
+            vp = self.grid.viewport()
+            first = max(self.grid.indexAt(QPoint(8, 8)).row(), 0)
+            last = self.grid.indexAt(QPoint(vp.width() - 8, vp.height() - 8)).row()
+            if last < 0:
+                last = first + 150
+            for row in range(first, min(self.grid.count(), last + 40)):
+                asset = self.grid.item(row).data(Qt.UserRole)
+                if asset and asset.kind in THUMB_KINDS and asset.key not in self.thumb_cache:
+                    jobs.append((asset.key, self.session, asset))
+        else:
+            height = self.tree.viewport().height()
+            item = self.tree.itemAt(QPoint(4, 4))
+            extra = 0
+            while item is not None and extra < 20:
+                if self.tree.visualItemRect(item).top() > height:
+                    extra += 1
+                asset = item.data(0, Qt.UserRole)
+                if asset and asset.kind in THUMB_KINDS and asset.key not in self.thumb_cache:
+                    jobs.append((asset.key, self.session, asset))
+                item = self.tree.itemBelow(item)
+        self.thumbs.request_visible(jobs)
+
+    def on_thumbnail(self, key, qimg):
+        icon = QIcon(QPixmap.fromImage(qimg)) if not qimg.isNull() else self.blank
+        self.thumb_cache[key] = icon
+        while len(self.thumb_cache) > THUMB_CACHE_MAX:  # forget the oldest to cap memory
+            old = next(iter(self.thumb_cache))
+            del self.thumb_cache[old]
+            self._set_icon(old, None)
+        self._set_icon(key, icon)
+
+    def _set_icon(self, key, icon):
+        item = self.items_by_key.get(key)
+        if item is not None:
+            item.setIcon(0, icon or self.blank)
+        grid_item = self.grid_items.get(key)
+        if grid_item is not None:
+            grid_item.setIcon(icon or self.blank_big)
+        if icon is not None:
+            self.mesh_view.panel.set_icon(key, icon)
+            self.image_view.set_link_icon(key, icon)
+
+    def _request_icons(self, assets, setter):
+        """Use cached icons now, request the rest at high priority."""
+        missing = []
+        for asset in assets:
+            if asset.key in self.thumb_cache:
+                setter(asset.key, self.thumb_cache[asset.key])
+            elif asset.kind in THUMB_KINDS:
+                missing.append((asset.key, self.session, asset))
+        self.thumbs.request_priority(missing)
+
+    # ---- preview
+    def on_select(self):
+        items = self.tree.selectedItems()
+        data = items[0].data(0, Qt.UserRole) if items else None
+        if not data:
+            return
+        grid_item = self.grid_items.get(data.key)
+        if grid_item is not None:
+            with QSignalBlocker(self.grid):
+                self.grid.setCurrentItem(grid_item)
+        self.show_asset(data)
+
+    def show_asset(self, asset):
+        self.current = asset
+        session = self.session
+        self.audio_view.stop()
+        self.video_view.stop()
+        self.flipbook_timer.stop()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            with session.lock:
+                if asset.kind in MODEL_KINDS:
+                    self.show_mesh(asset)
+                elif asset.kind in IMAGE_KINDS:
+                    self.show_texture(asset, session.image(asset))
+                elif asset.kind == "audio":
+                    self.stack.setCurrentWidget(self.audio_view)
+                    rows = list(session.describe(asset)) + [("Size", fmt_size(asset.size))]
+                    try:
+                        data, ext = session.audio(asset)
+                        self.audio_view.load(asset.name, data, ext, rows)
+                    except Exception as e:
+                        if not isinstance(e, NotImplementedError):
+                            log.exception("Couldn't decode the sound '%s'", asset.name)
+                        self.audio_view.show_error(asset.name, str(e), rows)
+                elif asset.kind == "font":
+                    self.show_texture(asset, session.font(asset))
+                elif asset.kind == "video":
+                    self.stack.setCurrentWidget(self.video_view)
+                    try:
+                        data, ext = session.video(asset)
+                        self.video_view.load(asset.name, data, ext)
+                    except Exception as e:
+                        if not isinstance(e, (ValueError, NotImplementedError)):
+                            log.exception("Couldn't read the video '%s'", asset.name)
+                        self.video_view.show_error(asset.name, str(e))
+                elif asset.kind == "data":
+                    self.text_view.setPlainText(session.text(asset)[:MAX_TEXT_CHARS])
+                    self.stack.setCurrentWidget(self.text_view)
+                elif asset.kind == "animation":
+                    text = session.text(asset)
+                    try:
+                        targets = session.animation_targets(asset)
+                    except Exception:
+                        log.exception("Finding models for animation '%s' failed", asset.name)
+                        targets = []
+                    try:
+                        frames, _length = session.sprite_frames(asset)
+                    except Exception:
+                        log.exception("Reading the sprite frames of '%s' failed", asset.name)
+                        frames = []
+                    self.anim_view.show_clip(text, targets, flipbook=len(frames))
+                    self.stack.setCurrentWidget(self.anim_view)
+                elif asset.kind == "text":
+                    text = session.text(asset)
+                    if isinstance(text, bytes):
+                        text = text.decode("utf-8", "replace")
+                    self.text_view.setPlainText(text[:MAX_TEXT_CHARS])
+                    self.stack.setCurrentWidget(self.text_view)
+                else:
+                    rows = [f"{label}: {value}" for label, value in session.describe(asset)]
+                    self.text_view.setPlainText(
+                        f"{asset.name}\n\n" + "\n".join(rows) + f"\nSize: {fmt_size(asset.size)}\n\n"
+                        "No preview for this kind of file. Right-click \u2192 Save... exports it as-is.")
+                    self.stack.setCurrentWidget(self.text_view)
+        except (ValueError, NotImplementedError) as e:
+            # Expected cases (nothing visible, unsupported format...): a plain message is enough.
+            log.info("No preview for %s '%s': %s", asset.kind, asset.name, e)
+            self.stack.setCurrentWidget(self.text_view)
+            self.text_view.setPlainText(f"{asset.name}\n\n{e}")
+        except Exception as e:
+            log.exception("Could not preview %s '%s'", asset.kind, asset.name)
+            self.stack.setCurrentWidget(self.text_view)
+            self.text_view.setPlainText(f"Could not preview {asset.name}:\n\n{e}\n\n{traceback.format_exc()}")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def install_sound_decoder(self):
+        from engines import extdecode
+        existing = extdecode.vgmstream_path()
+        text = ("vgmstream is a free, open-source decoder for game audio formats (Wwise .wem/.bnk, FMOD "
+                ".bank/.fsb and many more). UniView will download the official Windows build from GitHub "
+                f"into:\n{os.path.join(extdecode.tools_dir(), 'vgmstream')}")
+        if existing:
+            text = f"vgmstream is already installed:\n{existing}\n\nDownload the latest version again?"
+        if QMessageBox.question(self, "Install sound decoder", text) != QMessageBox.Yes:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            exe = extdecode.install_vgmstream()
+            QMessageBox.information(self, "Install sound decoder", f"Installed:\n{exe}")
+        except Exception as e:
+            log.exception("Installing vgmstream failed")
+            QMessageBox.warning(self, "Install sound decoder", f"Download failed: {e}")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def play_flipbook(self):
+        """Play the current clip's sprite frames in the image view."""
+        clip, session = self.current, self.session
+        if clip is None or session is None:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            with session.lock:
+                frames, length = session.sprite_frames(clip)
+                cache = {}
+                images = []
+                for t, sprite in frames:
+                    if sprite.key not in cache:
+                        cache[sprite.key] = session.image(sprite)
+                    images.append((t, cache[sprite.key]))
+        except Exception as e:
+            log.exception("Playing the sprite animation '%s' failed", clip.name)
+            QMessageBox.warning(self, "Sprite animation", str(e))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not images:
+            return
+        # Frames have different sizes: pad them all to one canvas so the animation doesn't jump.
+        w = max(img.width for _t, img in images)
+        h = max(img.height for _t, img in images)
+        padded = []
+        for t, img in images:
+            canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            canvas.paste(img.convert("RGBA"), ((w - img.width) // 2, h - img.height))
+            padded.append((t, canvas))
+        step = length / len(padded) if length > 0 else 1 / 12
+        self._flipbook = {"frames": padded, "length": max(length, padded[-1][0] + step), "start": time.time(),
+                          "index": -1, "name": clip.name}
+        self.stack.setCurrentWidget(self.image_view)
+        self.image_view.set_links("Sprite animation", [], f"{len(padded)} frames, {self._flipbook['length']:.2f} s "
+                                                        "(select another asset to stop)")
+        self._flipbook_tick()
+        self.image_view.fit()
+        self.flipbook_timer.start()
+
+    def _flipbook_tick(self):
+        fb = self._flipbook
+        if fb is None or self.stack.currentWidget() is not self.image_view:
+            self.flipbook_timer.stop()
+            return
+        t = (time.time() - fb["start"]) % fb["length"]
+        index = 0
+        for i, (ft, _img) in enumerate(fb["frames"]):
+            if ft <= t:
+                index = i
+        if index != fb["index"]:
+            fb["index"] = index
+            self.image_view.show_image(fb["frames"][index][1],
+                                       f"{fb['name']}  frame {index + 1}/{len(fb['frames'])}", fit=False)
+
+    def play_animation(self, model):
+        """Show `model` and play the current animation clip on it."""
+        clip = self.current
+        session = self.session
+        if clip is None or clip.kind != "animation" or session is None:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            with session.lock:
+                animator = session.animate(model, clip)
+                self.show_mesh(model)
+            self.mesh_view.play_animation(animator, clip.name)
+            log.info("Playing '%s' on '%s' (%d animated bones)", clip.name, model.name,
+                     getattr(animator, "matched", 0))
+        except Exception as e:
+            log.exception("Playing '%s' on '%s' failed", clip.name, model.name)
+            QMessageBox.warning(self, "Play animation", str(e))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _materials(self, asset):
+        """Materials of a model, or [] (logged) if the plugin fails."""
+        try:
+            with self.session.lock:
+                return self.session.materials(asset)
+        except Exception:
+            log.exception("Finding the materials of '%s' failed", asset.name)
+            return []
+
+    def show_mesh(self, asset):
+        session = self.session
+        md = session.mesh(asset)
+        poly = meshdata_to_polydata(md)
+        materials = []
+        if not session.materials_ready():
+            # Still indexing in the background: show the bare model now, textures once it's done.
+            self.statusBar().showMessage("Finding materials and textures (first time for this game)...")
+            self._retry_when_indexed(self.current)
+        else:
+            materials = self._materials(asset)
+        # Group the submeshes by the texture they show: one drawn part per texture.
+        groups = {}  # (texture key, color) -> (texture Asset, color, [triangle arrays])
+        if materials:
+            for j, tris in enumerate(md.submeshes):
+                mat = material_for(materials, md, j)
+                main = mat.main_texture() if mat is not None else None
+                color = mat.color if (mat is not None and main is None and mat.color is not None) else None
+                if color is not None:
+                    color = tuple(min(1.0, max(0.0, c)) for c in color[:3])
+                key = (main.asset.key if main is not None else None, color)
+                groups.setdefault(key, (main.asset if main is not None else None, color, []))[2].append(tris)
+        # Big scenes (maps) use hundreds of textures: show them smaller to keep memory in check.
+        max_side = 256 if len(groups) > 32 else 1024
+        images = {}  # texture asset key -> display image (or None if it failed)
+
+        def image_of(tex_asset):
+            if tex_asset is None:
+                return None
+            if tex_asset.key not in images:
+                try:
+                    img = session.image(tex_asset)
+                    if max(img.size) > max_side:
+                        img = img.copy()
+                        img.thumbnail((max_side, max_side))
+                    images[tex_asset.key] = img
+                except Exception as e:
+                    log.debug("Texture '%s' failed: %s", tex_asset.name, e)
+                    images[tex_asset.key] = None
+            return images[tex_asset.key]
+
+        tex = image_of(display_texture(md, materials))
+        parts = [(np.concatenate(tris_list) if len(tris_list) > 1 else tris_list[0], image_of(tex_asset), color)
+                 for tex_asset, color, tris_list in groups.values()]
+        self.stack.setCurrentWidget(self.mesh_view)
+        self.mesh_view.show_mesh(poly, tex, parts)
+        # Walk through places (scenes, maps, terrains); orbit around single models.
+        place = (asset.kind == "scene" or asset.name.startswith("Terrain:")
+                 or (isinstance(asset.ref, str) and asset.ref.lower().endswith(".bsp")))
+        self.mesh_view.set_fly(place)
+        n_tex = sum(len(m.textures) for m in materials)
+        log.info("Model '%s': %s verts, %s tris, %d material(s), %d texture(s)%s", asset.name,
+                 f"{poly.n_points:,}", f"{poly.n_cells:,}", len(materials), n_tex,
+                 "" if tex is not None else " - no texture found")
+        if md.skipped:
+            log.info("Skipped %d line/point part(s) of '%s'", md.skipped, asset.name)
+
+        channels = self.mesh_view.uv_channels()
+        rows = [
+            f"<b>Vertices:</b> {poly.n_points:,}",
+            f"<b>Triangles:</b> {poly.n_cells:,}",
+            f"<b>Submeshes:</b> {len(md.submeshes)}",
+            f"<b>UV sets:</b> {', '.join(channels) if channels else 'none'}",
+        ]
+        try:
+            rows += [f"<b>{html_escape(label)}:</b> {html_escape(value)}" for label, value in session.describe(asset)]
+        except Exception:
+            log.exception("describe() failed for '%s'", asset.name)
+        if asset.uid in self.favorites:
+            rows.insert(0, "<span style='color:#f4c542'>\u2605 Favorite</span>")
+        jobs = self.mesh_view.panel.set_info(asset.name, "<br>".join(rows), materials, self.blank_big)
+        self._request_icons(jobs, self.mesh_view.panel.set_icon)
+
+    def _retry_when_indexed(self, data):
+        session = self.session
+
+        def check():
+            if self.current is not data or self.session is not session:
+                return  # user moved on
+            if not session.materials_ready():
+                QTimer.singleShot(250, check)
+                return
+            self.statusBar().clearMessage()
+            self.show_asset(data)
+
+        QTimer.singleShot(250, check)
+
+    def show_texture(self, asset, img):
+        name = asset.name
+        log.info("Texture '%s': %dx%d %s", name, img.width, img.height, img.mode)
+        try:
+            rects = self.session.sprite_rects(asset) if self.session is not None else []
+        except Exception:
+            log.exception("Finding the sprites of '%s' failed", name)
+            rects = []
+        self.image_view.show_image(img, ("\u2605 " if asset.uid in self.favorites else "") + name, rects)
+        self.stack.setCurrentWidget(self.image_view)
+        self.statusBar().showMessage(f"{name}  {img.width}x{img.height}")
+        try:
+            title, links, empty = self.session.related(asset)
+        except Exception:
+            log.exception("Finding what's related to %s failed", name)
+            title, links, empty = "", [], ""
+        entries = [(a.key, os.path.basename(a.name) + ("\n(sprite sheet)" if asset.kind == "sprite" else ""),
+                    self.blank_big) for a in links]
+        self.image_view.set_links(title, entries, empty)
+        self._request_icons(links, self.image_view.set_link_icon)
+
+    def goto_asset(self, key):
+        """Select an asset in the list/grid (clearing the search if it's filtered out)."""
+        item = self.items_by_key.get(key)
+        if item is None:
+            self.statusBar().showMessage("That asset isn't in this game's list (it may be in a file that wasn't loaded)", 5000)
+            return
+        if item.isHidden() or (item.parent() is not None and item.parent().isHidden()):
+            with QSignalBlocker(self.search), QSignalBlocker(self.type_combo):
+                self.search.clear()
+                self.type_combo.setCurrentIndex(0)
+            self.apply_filter()
+        if item.parent() is not None:
+            item.parent().setExpanded(True)
+        self.tree.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+        self.tree.setCurrentItem(item)  # triggers on_select -> preview (+ grid sync)
+        grid_item = self.grid_items.get(key)
+        if grid_item is not None:
+            self.grid.scrollToItem(grid_item, QAbstractItemView.PositionAtCenter)
+
+    def show_uv_layout(self):
+        poly = self.mesh_view.poly
+        channel = self.mesh_view.uv_combo.currentText()
+        if poly is None or channel not in poly.point_data:
+            QMessageBox.information(self, "UV layout", "Open a model that has UVs first.")
+            return
+        name = self.current.name if self.current else "model"
+        img = render_uv_layout(poly, channel, self.mesh_view.texture_img)
+        window = ImageWindow(img, f"UV layout - {name} ({channel})", self)
+        window.show()
+        self._windows = [w for w in self._windows if w.isVisible()] + [window]
+
+    # ---- favorites
+    def _mark_favorite(self, item, fav):
+        name = item.data(0, Qt.UserRole).name
+        item.setText(0, ("\u2605 " if fav else "") + name)
+        item.setForeground(0, QBrush(QColor("#f4c542")) if fav else QBrush())
+
+    def selected_assets(self):
+        widget = self.list_stack.currentWidget()
+        if widget is self.grid:
+            datas = [i.data(Qt.UserRole) for i in self.grid.selectedItems()]
+        else:
+            datas = [i.data(0, Qt.UserRole) for i in self.tree.selectedItems()]
+        datas = [d for d in datas if d]
+        return datas or ([self.current] if self.current else [])
+
+    def toggle_favorite_selected(self):
+        self.toggle_favorites(self.selected_assets())
+
+    def toggle_favorites(self, datas):
+        if not datas:
+            return
+        make_fav = any(a.uid not in self.favorites for a in datas)
+        for asset in datas:
+            (self.favorites.add if make_fav else self.favorites.discard)(asset.uid)
+            item = self.items_by_key.get(asset.key)
+            if item is not None:
+                self._mark_favorite(item, make_fav)
+            grid_item = self.grid_items.get(asset.key)
+            if grid_item is not None:
+                grid_item.setText(("\u2605 " if make_fav else "") + os.path.basename(asset.name))
+        project = self.current_project()
+        if project is not None:
+            project["favorites"] = sorted(self.favorites)
+            self.store.save()
+        log.info("%s %d asset(s) %s favorites", "Added" if make_fav else "Removed", len(datas),
+                 "to" if make_fav else "from")
+        if self.type_combo.currentData() == "fav":
+            self.apply_filter()
+
+    # ---- context menu
+    def on_context_menu(self, widget, pos):
+        if widget is self.grid:
+            item = self.grid.itemAt(pos)
+            data = item.data(Qt.UserRole) if item else None
+        else:
+            item = self.tree.itemAt(pos)
+            data = item.data(0, Qt.UserRole) if item else None
+        if not data:
+            return
+        selected = self.selected_assets()
+        if data not in selected:
+            selected = [data]
+        menu = QMenu(self)
+        if data.kind in IMAGE_KINDS and self.mesh_view.poly is not None:
+            menu.addAction("Apply as texture to current model", lambda: self.apply_texture(data))
+        if data.kind in MODEL_KINDS:
+            menu.addAction("Open in Blender", lambda: self.open_in_blender(data))
+        fav = all(d.uid in self.favorites for d in selected)
+        menu.addAction(("Remove from favorites" if fav else "Add to favorites") + "   Ctrl+D",
+                       lambda: self.toggle_favorites(selected))
+        menu.addSeparator()
+        menu.addAction("Save...", lambda: self.export_item(data))
+        if len(selected) > 1:
+            menu.addAction(f"Export {len(selected)} selected...", lambda: self.export_many(selected))
+        menu.exec(widget.viewport().mapToGlobal(pos))
+
+    def apply_texture(self, data):
+        try:
+            with self.session.lock:
+                img = self.session.image(data)
+            self.mesh_view.set_texture(img)
+            self.stack.setCurrentWidget(self.mesh_view)
+        except Exception as e:
+            log.exception("Applying the texture '%s' failed", getattr(data, "name", data))
+            QMessageBox.warning(self, "Texture", str(e))
+
+    # ---- Blender
+    def choose_blender(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Where is blender.exe?", self.settings.blender_path,
+                                              "Blender (blender.exe);;Programs (*.exe)")
+        if path:
+            self.settings.blender_path = path
+            self.settings.save()
+            log.info("Blender location set to %s", path)
+        return path or None
+
+    def open_in_blender(self, data=None):
+        data = data or self.current
+        if not data or data.kind not in MODEL_KINDS:
+            QMessageBox.information(self, "Open in Blender", "Select a model first.")
+            return
+        blender = find_blender(self.settings.blender_path)
+        if blender is None:
+            if QMessageBox.question(self, "Blender not found",
+                                    "Couldn't find Blender on this PC.\n\nPoint to blender.exe yourself?") != QMessageBox.Yes:
+                return
+            blender = self.choose_blender()
+            if not blender:
+                return
+        name = data.name
+        out_dir = os.path.join(tempfile.gettempdir(), APP_SHORT)
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"{safe_filename(os.path.basename(name))}.glb")
+        try:
+            self.write_asset(data, path)
+            subprocess.Popen([blender, "--python-expr", BLENDER_IMPORT.format(path=path)])
+            log.info("Opened '%s' in Blender (%s)", name, blender)
+            self.statusBar().showMessage(f"Opening {name} in Blender...", 5000)
+        except Exception as e:
+            log.exception("Opening '%s' in Blender failed", name)
+            QMessageBox.warning(self, "Open in Blender", str(e))
+
+    # ---- export
+    def ask_save_path(self, default_name, filter_text):
+        path, chosen = QFileDialog.getSaveFileName(
+            self, "Save", os.path.join(self.last_dir, default_name), filter_text)
+        if path:
+            self.last_dir = os.path.dirname(path)
+            self.settings.last_dir = self.last_dir
+            self.settings.save()
+        return path, chosen
+
+    def export_selected(self):
+        datas = self.selected_assets()
+        if len(datas) > 1:
+            self.export_many(datas)
+        elif datas:
+            self.export_item(datas[0])
+
+    def export_selected_mesh(self):
+        if self.current and self.current.kind in MODEL_KINDS:
+            self.export_item(self.current)
+
+    def save_shown_image(self):
+        img = self.image_view.image
+        if img is None:
+            return
+        name = os.path.basename(self.current.name) if self.current else "texture"
+        path, _ = self.ask_save_path(f"{safe_filename(name)}.png", "PNG image (*.png)")
+        if path:
+            try:
+                img.save(path)
+                self.statusBar().showMessage(f"Saved {path}")
+                log.info("Saved %s", path)
+            except Exception as e:
+                log.exception("Saving %s failed", path)
+                QMessageBox.warning(self, "Save failed", str(e))
+
+    @staticmethod
+    def export_ext(asset, model_format="obj"):
+        if asset.kind in MODEL_KINDS:
+            return model_format
+        if asset.kind in IMAGE_KINDS:
+            return "png"
+        if asset.kind == "audio" and asset.ext in ("vsnd_c", ""):
+            return "wav"  # decoded on save (the real extension is used if it differs)
+        return asset.ext or ("txt" if asset.kind == "text" else "bin")
+
+    def export_item(self, asset):
+        if asset.kind in MODEL_KINDS:
+            filters = "Wavefront OBJ + textures (*.obj);;glTF binary, textures inside (*.glb)"
+        elif asset.kind in IMAGE_KINDS:
+            filters = "PNG image (*.png)"
+        else:
+            filters = "All files (*)"
+        ext = self.export_ext(asset, self.settings.model_format)
+        if asset.kind in ("font", "video") and ext:
+            label = {"ttf": "TrueType font", "otf": "OpenType font"}.get(ext, f"{ext.upper()} video")
+            filters = f"{label} (*.{ext});;All files (*)"
+        base = safe_filename(os.path.splitext(os.path.basename(asset.name))[0]
+                             if asset.kind in ("text", "file", "audio") else os.path.basename(asset.name))
+        path, chosen = self.ask_save_path(f"{base}.{ext}", filters)
+        if not path:
+            return
+        if asset.kind in MODEL_KINDS and not path.lower().endswith((".obj", ".glb")):
+            path += ".glb" if "glb" in chosen else ".obj"
+        try:
+            written = self.write_asset(asset, path)
+            self.statusBar().showMessage("Saved " + ", ".join(os.path.basename(w) for w in written))
+            for w in written:
+                log.info("Saved %s", w)
+        except Exception as e:
+            log.exception("Saving %s failed", asset.name)
+            QMessageBox.warning(self, "Save failed", str(e))
+
+    def _rig(self, asset, md):
+        """Skeleton for a rigged GLB of a skinned model, or None (static export)."""
+        if asset.kind != "model":
+            return None
+        try:
+            rig, _anim = self.session.skeleton(asset)
+        except (NotImplementedError, ValueError):
+            return None
+        except Exception:
+            log.exception("Reading the skeleton of '%s' failed; saving it without bones", asset.name)
+            return None
+        return rig if len(rig["joints_0"]) == len(md.points) else None
+
+    def export_animated(self, model):
+        """Save `model` as a GLB with its skeleton and the current animation clip."""
+        clip, session = self.current, self.session
+        if clip is None or clip.kind != "animation" or session is None:
+            return
+        base = safe_filename(f"{os.path.basename(model.name)}_{os.path.basename(clip.name)}")
+        path, _chosen = self.ask_save_path(f"{base}.glb", "glTF binary with skeleton and animation (*.glb)")
+        if not path:
+            return
+        if not path.lower().endswith(".glb"):
+            path += ".glb"
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            with session.lock:
+                md = session.mesh(model)
+                rig, animation = session.skeleton(model, clip)
+                materials = self._materials(model)
+                written = write_glb(session, md, materials, path, rig=rig, animation=animation)
+            self.statusBar().showMessage("Saved " + ", ".join(os.path.basename(w) for w in written))
+            log.info("Saved %s ('%s' on '%s', %d joints)", path, clip.name, model.name, len(rig["joints"]))
+        except Exception as e:
+            if not isinstance(e, (ValueError, NotImplementedError)):
+                log.exception("Saving the animated model '%s' failed", model.name)
+            QMessageBox.warning(self, "Save animated GLB", str(e))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def write_asset(self, asset, path):
+        """Save one asset to `path` (.obj/.glb for models); returns the list of files written."""
+        session = self.session
+        with session.lock:
+            if asset.kind in MODEL_KINDS:
+                md = session.mesh(asset)
+                materials = self._materials(asset)  # waits for background indexing if needed
+                if path.lower().endswith(".glb"):
+                    return write_glb(session, md, materials, path, rig=self._rig(asset, md))
+                return write_obj(session, md, materials, path)
+            if asset.kind in IMAGE_KINDS:
+                session.image(asset).save(path)
+                return [path]
+            if asset.kind == "audio":
+                try:
+                    data, ext = session.audio(asset)
+                    path = os.path.splitext(path)[0] + "." + ext
+                    with open(path, "wb") as f:
+                        f.write(data)
+                    return [path]
+                except NotImplementedError:
+                    pass  # not decodable: save the stored file below
+            try:
+                data = session.raw(asset)
+            except NotImplementedError:
+                text = session.text(asset)
+                data = text.encode("utf-8") if isinstance(text, str) else text
+            with open(path, "wb") as f:
+                f.write(data)
+            return [path]
+
+    def export_many(self, items):
+        self._export_with_dialog(items)
+
+    def export_all(self, kinds):
+        if self.session is None:
+            return
+        items = []
+        for i in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(i)
+            for j in range(top.childCount()):
+                asset = top.child(j).data(0, Qt.UserRole)
+                if asset and asset.kind in kinds:
+                    items.append(asset)
+        self._export_with_dialog(items)
+
+    def export_shown(self):
+        self._export_with_dialog([data for _item, data in self.visible_assets()])
+
+    def _export_with_dialog(self, items):
+        if not items:
+            QMessageBox.information(self, "Export", "Nothing to export.")
+            return
+        dlg = ExportDialog(len(items), any(a.kind in MODEL_KINDS for a in items), self.settings, self)
+        if dlg.exec():
+            folder, model_format, keep = dlg.values()
+            self._export_to_folder(items, folder, model_format, keep)
+
+    def _export_to_folder(self, items, folder, model_format="obj", keep_structure=False):
+        log.info("Exporting %d item(s) to %s (models as %s%s)", len(items), folder, model_format.upper(),
+                 ", keeping the game's folders" if keep_structure else "")
+        ok = fail = 0
+        used = set()
+        self.set_progress(0, len(items))
+        for n, asset in enumerate(items, 1):
+            name = asset.name
+            ext = self.export_ext(asset, model_format)
+            sub = export_subfolder(asset) if keep_structure else ""
+            target = os.path.normpath(os.path.join(folder, sub))
+            stem = os.path.basename(name.replace("\\", "/"))
+            if asset.kind in ("text", "file", "audio") and stem.lower().endswith("." + ext.lower()):
+                stem = stem[: -len(ext) - 1]
+            base = safe_filename(stem)
+            fname, i = base, 1
+            while (target.lower(), fname.lower()) in used:
+                i += 1
+                fname = f"{base}_{i}"
+            used.add((target.lower(), fname.lower()))
+            try:
+                os.makedirs(target, exist_ok=True)
+                self.write_asset(asset, os.path.join(target, f"{fname}.{ext}"))
+                ok += 1
+            except Exception as e:
+                fail += 1
+                log.warning("Could not export %s: %s", name, e)
+            if n % 10 == 0 or n == len(items):
+                self.set_progress(n, len(items))
+                self.statusBar().showMessage(f"Exporting ... {ok} done, {fail} failed")
+                QApplication.processEvents()
+        self.hide_progress()
+        self.statusBar().showMessage(f"Exported {ok} item(s) ({fail} failed) to {folder}")
+        log.info("Exported %d item(s), %d failed", ok, fail)
+
+    def closeEvent(self, event):
+        self.thumbs.clear()
+        self.stats_worker.start([])
+        self.settings.last_dir = self.last_dir
+        self.settings.save()
+        self.mesh_view.plotter.close()
+        super().closeEvent(event)
+
+def square_icon_image(img):
+    """Pad an image to a square (transparent borders) so icons never look stretched."""
+    img = img.convert("RGBA")
+    side = max(img.size)
+    square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    square.paste(img, ((side - img.width) // 2, (side - img.height) // 2))
+    return square
+
+def load_app_icon():
+    if not os.path.isfile(ICON_FILE):
+        return QIcon()
+    try:
+        square = square_icon_image(Image.open(ICON_FILE))
+    except Exception:
+        log.exception("Could not read %s", ICON_FILE)
+        return QIcon()
+    icon = QIcon()
+    for size in (16, 24, 32, 48, 64, 128, 256):
+        icon.addPixmap(pil_to_pixmap(square.resize((size, size), Image.LANCZOS)))
+    return icon

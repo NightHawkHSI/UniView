@@ -26,6 +26,7 @@ BUILDS = os.path.join(ROOT, "Builds")
 WORK = os.path.join(BUILDS, "_work")
 APP_NAME = "UniView"
 MAIN_SCRIPT = "unity_viewer.py"
+VERSION_FILE = os.path.join("uniview", "__init__.py")
 UNITYPY_PACKAGES = [
     "UnityPy", "fmod_toolkit", "pyfmodex", "astc_encoder", "archspec",
     "texture2ddecoder", "etcpak", "tpk_ar", "brotli", "lz4",
@@ -35,7 +36,7 @@ UNITYPY_PACKAGES = [
 
 # Files that make up the project (what goes in the GitHub folder).
 SOURCE_FILES = [
-    "unity_viewer.py", "requirements.txt", "run.bat", "build.bat", "build.py",
+    "unity_viewer.py", "uniview", "requirements.txt", "run.bat", "build.bat", "build.py",
     "Icon.png", "README.md", ".gitignore", "ScreenShots", "compat.json",
     "engines", "plugins", "PLUGINS.md", "tests",
     ".github", "ruff.toml", "requirements-dev.txt",
@@ -47,10 +48,10 @@ def step(msg):
 
 
 def read_version():
-    with open(os.path.join(ROOT, MAIN_SCRIPT), encoding="utf-8") as f:
+    with open(os.path.join(ROOT, VERSION_FILE), encoding="utf-8") as f:
         match = re.search(r'^__version__\s*=\s*"([^"]+)"', f.read(), re.M)
     if not match:
-        sys.exit(f"Could not find __version__ in {MAIN_SCRIPT}")
+        sys.exit(f"Could not find __version__ in {VERSION_FILE}")
     return match.group(1)
 
 
@@ -145,10 +146,12 @@ def build_release(version, test_game=None):
         *[arg for pkg in UNITYPY_PACKAGES for arg in ("--collect-all", pkg)],
         "--collect-submodules", "vtkmodules",
         # Built-in engine plugins are imported by name at runtime, so list them explicitly.
-        "--paths", ROOT, "--collect-submodules", "engines",
+        "--paths", ROOT, "--collect-submodules", "engines", "--collect-submodules", "uniview",
         # The app uses PySide6; other Qt bindings on the machine would break the build.
-        # IPython/jedi get dragged in by optional imports and just add size.
-        *[arg for mod in ("PyQt5", "PyQt6", "PySide2", "IPython", "jedi", "parso")
+        # IPython/jedi get dragged in by optional imports and just add size. The dev tools too, and
+        # mypy must stay out: pyvista imports it if present, and a bundled mypy crashes on launch.
+        *[arg for mod in ("PyQt5", "PyQt6", "PySide2", "IPython", "jedi", "parso",
+                          "mypy", "mypyc", "pytest", "_pytest")
           for arg in ("--exclude-module", mod)],
         *icon_args,
         os.path.join(ROOT, MAIN_SCRIPT),
