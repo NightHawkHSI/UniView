@@ -20,6 +20,8 @@ from uniview.constants import log
 from uniview.export import (export_ext, export_stem, export_subfolder, rig_for_export, session_materials,
                             write_asset, write_glb, write_obj)
 from uniview.search import is_unreadable
+from uniview.unity_builder import BUILDER_CS
+from uniview.util import safe_filename
 
 FILE_KINDS = ("texture", "audio", "text", "font", "video")
 MODEL_KINDS = ("model",)
@@ -150,6 +152,96 @@ def write_manifest(root, editor_exe, gltfast):
     return True
 
 
+# --------------------------------------------------------------------------- prefabs (built by Unity)
+
+BUILD_DIR = ("UniView", "Build")        # JSON descriptions, under Assets/
+BUILDER_PATH = ("UniView", "Editor", "UniViewBuilder.cs")
+# Meshes from Unity's built-in resources that every editor has (Resources.GetBuiltinResource<Mesh>).
+BUILTIN_MESHES = ("Cube", "Sphere", "Capsule", "Cylinder", "Plane", "Quad")
+
+
+def is_prefab(asset):
+    return asset.kind == "scene" and isinstance(asset.key, tuple) and asset.key[:1] in (("prefab",), ("root",))
+
+
+def plan_prefabs(assets, assets_dir):
+    """[(prefab asset, target .prefab path)], unique per folder."""
+    out, used = [], set()
+    for asset in assets:
+        if not is_prefab(asset) or asset.source in BUILTIN_SOURCES:
+            continue
+        sub = export_subfolder(asset) if asset.path else os.path.join(safe_filename(asset.source or "prefabs"), "Prefabs")
+        folder = os.path.normpath(os.path.join(assets_dir, sub))
+        base = safe_filename(os.path.basename(asset.name.split(": ", 1)[-1].replace("\\", "/"))) or "prefab"
+        name, i = base, 1
+        while (folder.lower(), name.lower()) in used:
+            i += 1
+            name = f"{base}_{i}"
+        used.add((folder.lower(), name.lower()))
+        out.append((asset, os.path.join(folder, f"{name}.prefab")))
+    return out
+
+
+def unity_path(root, path):
+    """'Assets/...' path Unity uses for a file in the project."""
+    return os.path.relpath(path, root).replace("\\", "/")
+
+
+def prefab_description(nodes, target, model_paths, root, builtin_meshes=None):
+    """The JSON UniViewBuilder.cs reads: nodes with their model GLB/OBJ (or built-in mesh) instead of mesh uids."""
+    out = []
+    for n in nodes:
+        model = model_paths.get(n.get("mesh"))
+        builtin = (builtin_meshes or {}).get(n.get("mesh"), "") if not model else ""
+        out.append({"name": n["name"], "parent": n["parent"], "active": n["active"],
+                    "rendererEnabled": n.get("renderer_enabled", True),
+                    "pos": [float(v) for v in n["pos"]], "rot": [float(v) for v in n["rot"]],
+                    "scale": [float(v) for v in n["scale"]],
+                    "model": unity_path(root, model) if model else "", "builtin": builtin,
+                    "skinned": bool(n.get("skinned"))})
+    return {"version": 1, "kind": "prefab", "target": unity_path(root, target), "nodes": out}
+
+
+def write_builder(root, assets_dir):
+    path = os.path.join(assets_dir, *BUILDER_PATH)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(BUILDER_CS)
+    write_meta(path, asset_guid("uniview:builder"))
+    write_folder_metas(assets_dir, os.path.dirname(path))
+
+
+def write_prefab_descriptions(session, root, assets_dir, model_paths, cancelled=None):
+    """One JSON per prefab under Assets/UniView/Build/; returns (written, failed)."""
+    if not hasattr(session, "hierarchy"):
+        return 0, 0
+    written = failed = 0
+    build_dir = os.path.join(assets_dir, *BUILD_DIR)
+    builtin_meshes = {a.uid: a.name for a in session.assets
+                      if a.kind in MODEL_KINDS and a.source in BUILTIN_SOURCES and a.name in BUILTIN_MESHES}
+    for asset, target in plan_prefabs(session.assets, assets_dir):
+        if cancelled is not None and cancelled():
+            break
+        try:
+            nodes = session.hierarchy(asset)
+            if not nodes:
+                continue
+            desc = prefab_description(nodes, target, model_paths, root, builtin_meshes)
+            path = os.path.join(build_dir, os.path.relpath(target, assets_dir) + ".json")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(desc, f, separators=(",", ":"))
+            write_meta(path, asset_guid(f"{asset.uid}:description"))
+            write_folder_metas(assets_dir, os.path.dirname(path))
+            written += 1
+        except Exception as e:
+            failed += 1
+            log.warning("Could not describe prefab '%s': %s", asset.name, e)
+    if written:
+        write_builder(root, assets_dir)
+    return written, failed
+
+
 # --------------------------------------------------------------------------- exporting
 
 def exportable(asset):
@@ -246,5 +338,14 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
                 log.warning("Could not export %s '%s': %s", asset.kind, asset.name, e)
         if progress is not None and (n % 10 == 0 or n == len(jobs)):
             progress(n, len(jobs), asset.name)
+    if not (cancelled is not None and cancelled()):
+        if progress is not None:
+            progress(len(jobs), len(jobs), "prefabs")
+        model_paths = {asset.uid: path for asset, path in jobs
+                       if asset.kind in MODEL_KINDS and os.path.isfile(path)}
+        prefabs, prefab_failed = write_prefab_descriptions(session, root, assets_dir, model_paths, cancelled)
+        written += prefabs
+        failed += prefab_failed
+        log.info("Unity project: %d prefab description(s) for UniViewBuilder.cs", prefabs)
     log.info("Unity project: %d file(s) written, %d failed, %d skipped", written, failed, skipped)
     return written, failed, skipped

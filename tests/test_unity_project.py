@@ -173,3 +173,69 @@ def test_export_cancel(tmp_path):
     written, _, _ = up.export_unity_project(Session(assets), str(tmp_path), cancelled=lambda: True)
     assert written == 0
     assert not (tmp_path / "ProjectSettings" / "ProjectVersion.txt").exists()  # no version given
+
+
+# ---------------------------------------------------------------------------- prefabs
+
+class PrefabSession(Session):
+    def hierarchy(self, asset):
+        return [
+            {"name": "Crate", "parent": -1, "active": True, "pos": [1, 2, 3], "rot": [0, 0, 0, 1],
+             "scale": [1, 1, 1], "mesh": None, "skinned": False, "renderer_enabled": True},
+            {"name": "Body", "parent": 0, "active": False, "pos": [0, 0, 0], "rot": [0, 0, 0, 1],
+             "scale": [2, 2, 2], "mesh": "s:6", "skinned": False, "renderer_enabled": False},
+            {"name": "Ball", "parent": 0, "active": True, "pos": [0, 1, 0], "rot": [0, 0, 0, 1],
+             "scale": [1, 1, 1], "mesh": "builtin:1", "skinned": False, "renderer_enabled": True},
+            {"name": "Ghost", "parent": 0, "active": True, "pos": [0, 1, 0], "rot": [0, 0, 0, 1],
+             "scale": [1, 1, 1], "mesh": "missing:9", "skinned": True, "renderer_enabled": True},
+        ]
+
+
+def test_plan_prefabs(tmp_path):
+    assets = [Asset("scene", "Prefab: prefabs/cubes/corner", ("prefab", "c"), uid="prefab:c",
+                    path="assets/prefabs/cubes/corner.prefab", source="shared"),
+              Asset("scene", "Prefab: Boat", ("root", 1, 2), uid="prefab:b1", source="sharedassets1.assets"),
+              Asset("scene", "Prefab: Boat", ("root", 3, 2), uid="prefab:b2", source="sharedassets1.assets"),
+              Asset("scene", "Scene: Main", ("scene", 5), uid="scene:level0", source="level0")]
+    rel = [os.path.relpath(p, tmp_path).replace("\\", "/") for _a, p in up.plan_prefabs(assets, str(tmp_path))]
+    assert rel == ["assets/prefabs/cubes/corner.prefab", "sharedassets1.assets/Prefabs/Boat.prefab",
+                   "sharedassets1.assets/Prefabs/Boat_2.prefab"]
+
+
+def test_export_writes_prefab_descriptions_and_builder(tmp_path):
+    crate = Asset("model", "crate", "c", uid="s:6", source="sharedassets1.assets")
+    sphere = Asset("model", "Sphere", "b", uid="builtin:1", source="unity default resources")
+    prefab = Asset("scene", "Prefab: Crate", ("root", 1, 1), uid="prefab:crate", source="sharedassets1.assets")
+    root = tmp_path / "proj"
+    written, failed, _ = up.export_unity_project(PrefabSession([crate, sphere, prefab]), str(root), "6000.5.4f1",
+                                                 editor_exe=fake_editor(tmp_path))
+    assert (written, failed) == (2, 0)  # the GLB + one prefab description
+    desc_path = root / "Assets" / "UniView" / "Build" / "sharedassets1.assets" / "Prefabs" / "Crate.prefab.json"
+    desc = json.load(open(desc_path))
+    assert desc["kind"] == "prefab" and desc["target"] == "Assets/sharedassets1.assets/Prefabs/Crate.prefab"
+    nodes = desc["nodes"]
+    assert [n["name"] for n in nodes] == ["Crate", "Body", "Ball", "Ghost"]
+    assert nodes[1]["model"] == "Assets/sharedassets1.assets/Models/crate.glb" and not nodes[1]["active"]
+    assert nodes[1]["rendererEnabled"] is False and nodes[1]["scale"] == [2.0, 2.0, 2.0]
+    assert nodes[2]["model"] == "" and nodes[2]["builtin"] == "Sphere"
+    assert nodes[3]["model"] == "" and nodes[3]["builtin"] == "" and nodes[3]["skinned"] is True
+    builder = root / "Assets" / "UniView" / "Editor" / "UniViewBuilder.cs"
+    assert "PrefabUtility.SaveAsPrefabAsset" in builder.read_text() and (root / "Assets" / "UniView" / "Editor" / "UniViewBuilder.cs.meta").exists()
+    assert (root / "Assets" / "UniView.meta").exists() and str(desc_path) + ".meta"
+
+
+def test_no_builder_without_prefabs(tmp_path):
+    up.export_unity_project(PrefabSession([Asset("text", "t", 1, uid="t", source="x", ext="txt")]), str(tmp_path))
+    assert not (tmp_path / "Assets" / "UniView").exists()
+
+
+def test_builder_json_fields_match_the_cs_classes():
+    """JsonUtility silently ignores unknown fields: every key we write must exist in the C# Node class."""
+    from uniview.unity_builder import BUILDER_CS
+    import re
+    cs_node = re.search(r"public class Node\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
+    fields = set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_node))
+    desc = up.prefab_description(PrefabSession([]).hierarchy(None), "Assets/x.prefab", {}, "")
+    assert set(desc["nodes"][0]) <= fields
+    cs_desc = re.search(r"public class Description\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
+    assert set(desc) <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_desc))

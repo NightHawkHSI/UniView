@@ -58,6 +58,7 @@ def run_export(parent, session, root, version, editor_exe=None, game_version="")
             + (f", {skipped:,} skipped (no data in the game files)" if skipped else "") + f".\n\n{root}\n\n"
             + (f"Open it with Unity {version}{made_with}: Unity Hub → Add → this folder." if version else
                "Open this folder with Unity Hub (Add → this folder).")
-            + "\nThe first time, Unity takes a while to import everything.\n\nOpen the folder now?")
+            + "\nThe first time, Unity takes a while to import everything, then builds the game's prefabs "
+              "(menu: UniView → Rebuild prefabs).\n\nOpen the folder now?")
     if QMessageBox.question(parent, "Export as Unity project", text) == QMessageBox.Yes:
         open_path(root)

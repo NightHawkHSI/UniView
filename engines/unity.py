@@ -870,6 +870,58 @@ class UnitySession(GameSession):
             transform = father.deref()
         return [transform]
 
+    def hierarchy(self, asset):
+        """GameObject tree of a scene/prefab asset as a flat list (parents before children):
+        [{"name", "parent" (index or -1), "active", "pos" (x,y,z), "rot" (x,y,z,w), "scale",
+          "mesh" (uid of the Mesh asset or None), "skinned" (bool), "renderer_enabled"}], in Unity's own space."""
+        from .unity_scene import _components
+        nodes = []
+
+        def visit(transform_reader, parent, depth):
+            if depth > 200:
+                return
+            try:
+                t = transform_reader.read()
+                go = t.m_GameObject.deref().read()
+            except Exception:
+                return
+            p, r, s = t.m_LocalPosition, t.m_LocalRotation, t.m_LocalScale
+            node = {"name": getattr(go, "m_Name", "") or "GameObject", "parent": parent,
+                    "active": bool(getattr(go, "m_IsActive", True)),
+                    "pos": [p.x, p.y, p.z], "rot": [r.x, r.y, r.z, r.w], "scale": [s.x, s.y, s.z],
+                    "mesh": None, "skinned": False, "renderer_enabled": True}
+            comps = _components(go)
+            mesh_ptr = None
+            for name, reader in comps:
+                try:
+                    if name == "SkinnedMeshRenderer":
+                        renderer = reader.read()
+                        mesh_ptr, node["skinned"] = renderer.m_Mesh, True
+                        node["renderer_enabled"] = bool(getattr(renderer, "m_Enabled", True))
+                    elif name == "MeshFilter" and mesh_ptr is None:
+                        mesh_ptr = reader.read().m_Mesh
+                    elif name == "MeshRenderer":
+                        node["renderer_enabled"] = bool(getattr(reader.read(), "m_Enabled", True))
+                except Exception:
+                    continue
+            if mesh_ptr is not None and getattr(mesh_ptr, "path_id", 0):
+                try:
+                    node["mesh"] = self._asset_for(mesh_ptr.deref(), "Mesh").uid
+                except Exception:
+                    pass
+            index = len(nodes)
+            nodes.append(node)
+            for child in t.m_Children or []:
+                try:
+                    visit(child.deref(), index, depth + 1)
+                except Exception:
+                    continue
+
+        with self.lock:
+            for root in self._scene_roots(asset):
+                visit(root, -1, 0)
+        return nodes
+
     def _scene(self, asset):
         """(MeshData, materials, info rows) of a scene/prefab, cached (the last few)."""
         from .unity_scene import build
