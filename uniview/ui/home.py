@@ -28,15 +28,9 @@ from PySide6.QtWidgets import (
 )
 
 import engines
+from uniview.catalog import UNKNOWN_ENGINE, UNTAGGED, compat_entry, group_projects, project_shown
 from uniview.constants import APP_TITLE, log
-from uniview.projects import (
-    detect_project_engine,
-    engine_group,
-    engine_info_text,
-    find_steam_games,
-    game_exe,
-    version_key,
-)
+from uniview.projects import detect_project_engine, engine_info_text, find_steam_games, game_exe
 from uniview.settings import COMPAT_STATUS, compat_report_url, fetch_compat, load_compat
 from uniview.ui.dialogs import EngineOptionsDialog, SteamPickDialog, TagsDialog, edit_project_notes
 
@@ -166,8 +160,8 @@ class HomePage(QWidget):
     _games_found = Signal(object)
     _find_progress = Signal(int, int, str)  # done, total, folder name
     ADD, FIND = "__add__", "__find__"
-    UNTAGGED = "__untagged__"
-    UNKNOWN_ENGINE = "__unknown_engine__"
+    UNTAGGED = UNTAGGED
+    UNKNOWN_ENGINE = UNKNOWN_ENGINE
     GROUPS = (("No grouping", ""), ("Group by tag", "tag"), ("Group by engine", "engine"),
               ("Group by engine version", "version"), ("Group by compatibility", "status"),
               ("Group by loaded / not loaded", "state"))
@@ -290,7 +284,7 @@ class HomePage(QWidget):
         self.refresh()
 
     def compat_entry(self, path):
-        return self.compat.get(os.path.basename(os.path.normpath(path)).lower())
+        return compat_entry(self.compat, path)
 
     # ---- drag and drop
     @staticmethod
@@ -432,57 +426,6 @@ class HomePage(QWidget):
             if item.sizeHint().width() != width:
                 item.setSizeHint(QSize(width, self.HEADER_HEIGHT))
 
-    def _groups_of(self, project, group_by):
-        """[(sort key, group title)] a game belongs to (a game with several tags is in several groups)."""
-        if group_by == "tag":
-            return [((0, t.lower()), f"#{t}") for t in project.get("tags", [])] or [((1,), "Untagged")]
-        if group_by == "engine":
-            plugin = engines.get(project.get("engine") or "")
-            return [((0, plugin.name.lower()), plugin.name)] if plugin else [((1,), "Unknown engine")]
-        if group_by == "version":
-            title = engine_group(project)
-            if title == "Unknown engine":
-                return [((1,), title)]
-            return [((0, project.get("engine") or "", tuple(-n for n in version_key(title))), title)]
-        if group_by == "status":
-            status = (self.compat_entry(project["path"]) or {}).get("status")
-            order = list(COMPAT_STATUS)
-            if status in COMPAT_STATUS:
-                return [((order.index(status),), COMPAT_STATUS[status])]
-            return [((len(order),), "Not rated yet")]
-        if group_by == "state":
-            if not os.path.isdir(project["path"]):
-                return [((2,), "Folder missing")]
-            if self.is_loaded(project["path"]):
-                return [((0,), "Loaded")]
-            return [((1,), "Not loaded")]
-        return [((0,), "")]
-
-    def _matches(self, project, terms):
-        """Plain words match anywhere (name, tags, notes, engine...); tag:/engine:/version:/backend:/status: narrow it."""
-        compat = self.compat_entry(project["path"]) or {}
-        tags = [t.lower() for t in project.get("tags", [])]
-        fields = {
-            "tag": tags,
-            "engine": [(project.get("engine") or "").lower(),
-                       (getattr(engines.get(project.get("engine") or ""), "name", "") or "").lower()],
-            "version": [(project.get("engine_version") or "").lower()],
-            "unity": [(project.get("engine_version") or "").lower()] if project.get("engine") == "unity" else [],
-            "backend": [w.strip(",") for w in (project.get("engine_detail") or "").lower().split()],
-            "status": [(compat.get("status") or "").lower()],
-        }
-        haystack = " ".join([project["name"], os.path.basename(os.path.normpath(project["path"])),
-                             project.get("notes", ""), engine_info_text(project), compat.get("status", ""),
-                             " ".join("#" + t for t in tags)]).lower()
-        for term in terms:
-            key, sep, value = term.partition(":")
-            if sep and key in fields:
-                if not any(v.startswith(value) for v in fields[key] if v):
-                    return False
-            elif term not in haystack:
-                return False
-        return True
-
     def refresh(self):
         self.refresh_timer.stop()
         self._update_tag_combo()
@@ -501,21 +444,11 @@ class HomePage(QWidget):
                     self._detect_engine(path, project.get("engine"))
                 elif project.get("file_count") is None:
                     self._count_files(path, project.get("engine"))
-            if tag == self.UNTAGGED and project.get("tags"):
-                continue
-            if tag and tag != self.UNTAGGED and tag not in project.get("tags", []):
-                continue
-            if engine_filter and (project.get("engine") or self.UNKNOWN_ENGINE) != engine_filter:
-                continue
-            if self._matches(project, terms):
+            if project_shown(project, tag, engine_filter, terms, self.compat):
                 shown.append(project)
 
         if group_by:
-            groups = {}  # title -> (sort key, [projects])
-            for project in shown:
-                for order, title in self._groups_of(project, group_by):
-                    groups.setdefault(title, (order, []))[1].append(project)
-            for title, (_order, projects) in sorted(groups.items(), key=lambda kv: (kv[1][0], kv[0].lower())):
+            for title, projects in group_projects(shown, group_by, self.compat, self.is_loaded):
                 self.grid.addItem(self._header_item(f"{title}   ({len(projects)})"))
                 for project in projects:
                     self.grid.addItem(self._card_item(project))

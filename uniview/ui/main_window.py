@@ -6,9 +6,7 @@ import tempfile
 import time
 import traceback
 import webbrowser
-from html import escape as html_escape
 
-import numpy as np
 from PIL import Image
 from PySide6.QtCore import QPoint, QSignalBlocker, QSize, Qt, QThread, QTimer
 from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QPixmap
@@ -62,7 +60,16 @@ from uniview.constants import (
     VIEW_OPTION_ITEMS,
     log,
 )
-from uniview.export import display_texture, export_subfolder, material_for, render_uv_layout, write_glb, write_obj
+from uniview.export import (
+    display_texture,
+    export_ext,
+    plan_export,
+    render_uv_layout,
+    session_materials,
+    write_animated_glb,
+    write_asset,
+)
+from uniview.model_display import is_place, model_info_rows, texture_groups, texture_loader
 from uniview.projects import ProjectStore, detect_project_engine, engine_info_text, project_options
 from uniview.search import FILTER_HELP, AssetFilter, is_unreadable
 from uniview.settings import BLENDER_IMPORT, Settings, find_blender
@@ -977,13 +984,7 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
 
     def _materials(self, asset):
-        """Materials of a model, or [] (logged) if the plugin fails."""
-        try:
-            with self.session.lock:
-                return self.session.materials(asset)
-        except Exception:
-            log.exception("Finding the materials of '%s' failed", asset.name)
-            return []
+        return session_materials(self.session, asset)
 
     def show_mesh(self, asset):
         session = self.session
@@ -996,65 +997,21 @@ class MainWindow(QMainWindow):
             self._retry_when_indexed(self.current)
         else:
             materials = self._materials(asset)
-        # Group the submeshes by the texture they show: one drawn part per texture.
-        groups = {}  # (texture key, color) -> (texture Asset, color, [triangle arrays])
-        if materials:
-            for j, tris in enumerate(md.submeshes):
-                mat = material_for(materials, md, j)
-                main = mat.main_texture() if mat is not None else None
-                color = mat.color if (mat is not None and main is None and mat.color is not None) else None
-                if color is not None:
-                    color = tuple(min(1.0, max(0.0, c)) for c in color[:3])
-                key = (main.asset.key if main is not None else None, color)
-                groups.setdefault(key, (main.asset if main is not None else None, color, []))[2].append(tris)
-        # Big scenes (maps) use hundreds of textures: show them smaller to keep memory in check.
-        max_side = 256 if len(groups) > 32 else 1024
-        images = {}  # texture asset key -> display image (or None if it failed)
-
-        def image_of(tex_asset):
-            if tex_asset is None:
-                return None
-            if tex_asset.key not in images:
-                try:
-                    img = session.image(tex_asset)
-                    if max(img.size) > max_side:
-                        img = img.copy()
-                        img.thumbnail((max_side, max_side))
-                    images[tex_asset.key] = img
-                except Exception as e:
-                    log.debug("Texture '%s' failed: %s", tex_asset.name, e)
-                    images[tex_asset.key] = None
-            return images[tex_asset.key]
-
+        groups = texture_groups(md, materials)
+        image_of = texture_loader(session, len(groups))
         tex = image_of(display_texture(md, materials))
-        parts = [(np.concatenate(tris_list) if len(tris_list) > 1 else tris_list[0], image_of(tex_asset), color)
-                 for tex_asset, color, tris_list in groups.values()]
+        parts = [(tris, image_of(tex_asset), color) for tex_asset, color, tris in groups]
         self.stack.setCurrentWidget(self.mesh_view)
         self.mesh_view.show_mesh(poly, tex, parts)
-        # Walk through places (scenes, maps, terrains); orbit around single models.
-        place = (asset.kind == "scene" or asset.name.startswith("Terrain:")
-                 or (isinstance(asset.ref, str) and asset.ref.lower().endswith(".bsp")))
-        self.mesh_view.set_fly(place)
+        self.mesh_view.set_fly(is_place(asset))
         n_tex = sum(len(m.textures) for m in materials)
         log.info("Model '%s': %s verts, %s tris, %d material(s), %d texture(s)%s", asset.name,
                  f"{poly.n_points:,}", f"{poly.n_cells:,}", len(materials), n_tex,
                  "" if tex is not None else " - no texture found")
         if md.skipped:
             log.info("Skipped %d line/point part(s) of '%s'", md.skipped, asset.name)
-
-        channels = self.mesh_view.uv_channels()
-        rows = [
-            f"<b>Vertices:</b> {poly.n_points:,}",
-            f"<b>Triangles:</b> {poly.n_cells:,}",
-            f"<b>Submeshes:</b> {len(md.submeshes)}",
-            f"<b>UV sets:</b> {', '.join(channels) if channels else 'none'}",
-        ]
-        try:
-            rows += [f"<b>{html_escape(label)}:</b> {html_escape(value)}" for label, value in session.describe(asset)]
-        except Exception:
-            log.exception("describe() failed for '%s'", asset.name)
-        if asset.uid in self.favorites:
-            rows.insert(0, "<span style='color:#f4c542'>\u2605 Favorite</span>")
+        rows = model_info_rows(session, asset, md, poly.n_points, poly.n_cells, self.mesh_view.uv_channels(),
+                               favorite=asset.uid in self.favorites)
         jobs = self.mesh_view.panel.set_info(asset.name, "<br>".join(rows), materials, self.blank_big)
         self._request_icons(jobs, self.mesh_view.panel.set_icon)
 
@@ -1228,7 +1185,7 @@ class MainWindow(QMainWindow):
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, f"{safe_filename(os.path.basename(name))}.glb")
         try:
-            self.write_asset(data, path)
+            write_asset(self.session, data, path)
             subprocess.Popen([blender, "--python-expr", BLENDER_IMPORT.format(path=path)])
             log.info("Opened '%s' in Blender (%s)", name, blender)
             self.statusBar().showMessage(f"Opening {name} in Blender...", 5000)
@@ -1272,16 +1229,6 @@ class MainWindow(QMainWindow):
                 log.exception("Saving %s failed", path)
                 QMessageBox.warning(self, "Save failed", str(e))
 
-    @staticmethod
-    def export_ext(asset, model_format="obj"):
-        if asset.kind in MODEL_KINDS:
-            return model_format
-        if asset.kind in IMAGE_KINDS:
-            return "png"
-        if asset.kind == "audio" and asset.ext in ("vsnd_c", ""):
-            return "wav"  # decoded on save (the real extension is used if it differs)
-        return asset.ext or ("txt" if asset.kind == "text" else "bin")
-
     def export_item(self, asset):
         if asset.kind in MODEL_KINDS:
             filters = "Wavefront OBJ + textures (*.obj);;glTF binary, textures inside (*.glb)"
@@ -1289,7 +1236,7 @@ class MainWindow(QMainWindow):
             filters = "PNG image (*.png)"
         else:
             filters = "All files (*)"
-        ext = self.export_ext(asset, self.settings.model_format)
+        ext = export_ext(asset, self.settings.model_format)
         if asset.kind in ("font", "video") and ext:
             label = {"ttf": "TrueType font", "otf": "OpenType font"}.get(ext, f"{ext.upper()} video")
             filters = f"{label} (*.{ext});;All files (*)"
@@ -1301,26 +1248,13 @@ class MainWindow(QMainWindow):
         if asset.kind in MODEL_KINDS and not path.lower().endswith((".obj", ".glb")):
             path += ".glb" if "glb" in chosen else ".obj"
         try:
-            written = self.write_asset(asset, path)
+            written = write_asset(self.session, asset, path)
             self.statusBar().showMessage("Saved " + ", ".join(os.path.basename(w) for w in written))
             for w in written:
                 log.info("Saved %s", w)
         except Exception as e:
             log.exception("Saving %s failed", asset.name)
             QMessageBox.warning(self, "Save failed", str(e))
-
-    def _rig(self, asset, md):
-        """Skeleton for a rigged GLB of a skinned model, or None (static export)."""
-        if asset.kind != "model":
-            return None
-        try:
-            rig, _anim = self.session.skeleton(asset)
-        except (NotImplementedError, ValueError):
-            return None
-        except Exception:
-            log.exception("Reading the skeleton of '%s' failed; saving it without bones", asset.name)
-            return None
-        return rig if len(rig["joints_0"]) == len(md.points) else None
 
     def export_animated(self, model):
         """Save `model` as a GLB with its skeleton and the current animation clip."""
@@ -1335,11 +1269,7 @@ class MainWindow(QMainWindow):
             path += ".glb"
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            with session.lock:
-                md = session.mesh(model)
-                rig, animation = session.skeleton(model, clip)
-                materials = self._materials(model)
-                written = write_glb(session, md, materials, path, rig=rig, animation=animation)
+            written, rig = write_animated_glb(session, model, clip, path)
             self.statusBar().showMessage("Saved " + ", ".join(os.path.basename(w) for w in written))
             log.info("Saved %s ('%s' on '%s', %d joints)", path, clip.name, model.name, len(rig["joints"]))
         except Exception as e:
@@ -1350,35 +1280,8 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
 
     def write_asset(self, asset, path):
-        """Save one asset to `path` (.obj/.glb for models); returns the list of files written."""
-        session = self.session
-        with session.lock:
-            if asset.kind in MODEL_KINDS:
-                md = session.mesh(asset)
-                materials = self._materials(asset)  # waits for background indexing if needed
-                if path.lower().endswith(".glb"):
-                    return write_glb(session, md, materials, path, rig=self._rig(asset, md))
-                return write_obj(session, md, materials, path)
-            if asset.kind in IMAGE_KINDS:
-                session.image(asset).save(path)
-                return [path]
-            if asset.kind == "audio":
-                try:
-                    data, ext = session.audio(asset)
-                    path = os.path.splitext(path)[0] + "." + ext
-                    with open(path, "wb") as f:
-                        f.write(data)
-                    return [path]
-                except NotImplementedError:
-                    pass  # not decodable: save the stored file below
-            try:
-                data = session.raw(asset)
-            except NotImplementedError:
-                text = session.text(asset)
-                data = text.encode("utf-8") if isinstance(text, str) else text
-            with open(path, "wb") as f:
-                f.write(data)
-            return [path]
+        """Save one asset of the loaded game to `path`; returns the list of files written."""
+        return write_asset(self.session, asset, path)
 
     def export_many(self, items):
         self._export_with_dialog(items)
@@ -1411,29 +1314,15 @@ class MainWindow(QMainWindow):
         log.info("Exporting %d item(s) to %s (models as %s%s)", len(items), folder, model_format.upper(),
                  ", keeping the game's folders" if keep_structure else "")
         ok = fail = 0
-        used = set()
         self.set_progress(0, len(items))
-        for n, asset in enumerate(items, 1):
-            name = asset.name
-            ext = self.export_ext(asset, model_format)
-            sub = export_subfolder(asset) if keep_structure else ""
-            target = os.path.normpath(os.path.join(folder, sub))
-            stem = os.path.basename(name.replace("\\", "/"))
-            if asset.kind in ("text", "file", "audio") and stem.lower().endswith("." + ext.lower()):
-                stem = stem[: -len(ext) - 1]
-            base = safe_filename(stem)
-            fname, i = base, 1
-            while (target.lower(), fname.lower()) in used:
-                i += 1
-                fname = f"{base}_{i}"
-            used.add((target.lower(), fname.lower()))
+        for n, (asset, path) in enumerate(plan_export(items, folder, model_format, keep_structure), 1):
             try:
-                os.makedirs(target, exist_ok=True)
-                self.write_asset(asset, os.path.join(target, f"{fname}.{ext}"))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                write_asset(self.session, asset, path)
                 ok += 1
             except Exception as e:
                 fail += 1
-                log.warning("Could not export %s: %s", name, e)
+                log.warning("Could not export %s: %s", asset.name, e)
             if n % 10 == 0 or n == len(items):
                 self.set_progress(n, len(items))
                 self.statusBar().showMessage(f"Exporting ... {ok} done, {fail} failed")

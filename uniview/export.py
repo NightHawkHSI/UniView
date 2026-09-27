@@ -8,7 +8,7 @@ import struct
 import numpy as np
 from PIL import Image, ImageDraw
 
-from engines.sdk import KIND_LABELS, NORMAL, main_texture
+from engines.sdk import IMAGE_KINDS, KIND_LABELS, MODEL_KINDS, NORMAL, main_texture
 from uniview import __version__
 from uniview.constants import APP_SHORT, log
 from uniview.util import safe_filename
@@ -283,3 +283,105 @@ def render_uv_layout(poly, channel, texture_img, max_tris=80000):
         a, b, c = pts[tri]
         draw.line([tuple(a), tuple(b), tuple(c), tuple(a)], fill=(0, 255, 140, 210), width=1)
     return base
+
+
+# --------------------------------------------------------------------------- saving assets (no UI)
+
+def session_materials(session, asset):
+    """Materials of a model, or [] (logged) if the plugin fails."""
+    try:
+        with session.lock:
+            return session.materials(asset)
+    except Exception:
+        log.exception("Finding the materials of '%s' failed", asset.name)
+        return []
+
+
+def export_ext(asset, model_format="obj"):
+    """File extension an asset is saved with."""
+    if asset.kind in MODEL_KINDS:
+        return model_format
+    if asset.kind in IMAGE_KINDS:
+        return "png"
+    if asset.kind == "audio" and asset.ext in ("vsnd_c", ""):
+        return "wav"  # decoded on save (the real extension is used if it differs)
+    return asset.ext or ("txt" if asset.kind == "text" else "bin")
+
+
+def export_stem(asset, ext=None):
+    """File name (without extension) for saving an asset: its base name, minus a duplicate extension."""
+    stem = os.path.basename(asset.name.replace("\\", "/"))
+    if ext and asset.kind in ("text", "file", "audio") and stem.lower().endswith("." + ext.lower()):
+        stem = stem[: -len(ext) - 1]
+    return safe_filename(stem)
+
+
+def rig_for_export(session, asset, md):
+    """Skeleton for a rigged GLB of a skinned model, or None (static export)."""
+    if asset.kind != "model":
+        return None
+    try:
+        rig, _anim = session.skeleton(asset)
+    except (NotImplementedError, ValueError):
+        return None
+    except Exception:
+        log.exception("Reading the skeleton of '%s' failed; saving it without bones", asset.name)
+        return None
+    return rig if len(rig["joints_0"]) == len(md.points) else None
+
+
+def write_asset(session, asset, path):
+    """Save one asset to `path` (.obj/.glb for models); returns the list of files written."""
+    with session.lock:
+        if asset.kind in MODEL_KINDS:
+            md = session.mesh(asset)
+            materials = session_materials(session, asset)  # waits for background indexing if needed
+            if path.lower().endswith(".glb"):
+                return write_glb(session, md, materials, path, rig=rig_for_export(session, asset, md))
+            return write_obj(session, md, materials, path)
+        if asset.kind in IMAGE_KINDS:
+            session.image(asset).save(path)
+            return [path]
+        if asset.kind == "audio":
+            try:
+                data, ext = session.audio(asset)
+                path = os.path.splitext(path)[0] + "." + ext
+                with open(path, "wb") as f:
+                    f.write(data)
+                return [path]
+            except NotImplementedError:
+                pass  # not decodable: save the stored file below
+        try:
+            data = session.raw(asset)
+        except NotImplementedError:
+            text = session.text(asset)
+            data = text.encode("utf-8") if isinstance(text, str) else text
+        with open(path, "wb") as f:
+            f.write(data)
+        return [path]
+
+
+def write_animated_glb(session, model, clip, path):
+    """`model` with its skeleton and `clip` as a GLB. Returns (files written, rig)."""
+    with session.lock:
+        md = session.mesh(model)
+        rig, animation = session.skeleton(model, clip)
+        materials = session_materials(session, model)
+        return write_glb(session, md, materials, path, rig=rig, animation=animation), rig
+
+
+def plan_export(items, folder, model_format="obj", keep_structure=False):
+    """[(asset, target path)] for a bulk export: optionally mirrored game folders, unique file names."""
+    plan, used = [], set()
+    for asset in items:
+        ext = export_ext(asset, model_format)
+        sub = export_subfolder(asset) if keep_structure else ""
+        target = os.path.normpath(os.path.join(folder, sub))
+        base = export_stem(asset, ext)
+        fname, i = base, 1
+        while (target.lower(), fname.lower()) in used:
+            i += 1
+            fname = f"{base}_{i}"
+        used.add((target.lower(), fname.lower()))
+        plan.append((asset, os.path.join(target, f"{fname}.{ext}")))
+    return plan
