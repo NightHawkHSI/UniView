@@ -11,34 +11,46 @@ engines/unreal.py for real examples (archives, binary formats, materials).
 
 Only the standard library, numpy and Pillow (PIL) are guaranteed to be available, also in the
 packaged UniView.exe. Anything else you import has to be installed next to it yourself.
+
+The type hints are optional, but with them an editor (or `py -m mypy plugins/my_engine.py`) tells
+you when a method returns the wrong shape - see the TypedDicts at the top of engines/sdk.py.
 """
 
+from __future__ import annotations
+
 import os
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from engines.sdk import (
-    ALBEDO, Asset, EnginePlugin, GameSession, Material, MeshData, TextureRef,
-    kind_for_extension, pil_image_from_bytes,
+    ALBEDO, Asset, AssetStats, EnginePlugin, GameInfo, GameSession, Kind, Material, MeshData, Progress,
+    TextureRef, kind_for_extension, pil_image_from_bytes,
 )
+
+if TYPE_CHECKING:
+    from PIL.Image import Image
 
 
 class TemplateSession(GameSession):
     """One loaded game. self.assets is filled by the plugin's open()."""
 
-    def raw(self, asset):
+    def raw(self, asset: Asset) -> bytes:
         # asset.ref is whatever you stored when listing the asset - here, the real file path.
         with open(asset.ref, "rb") as f:
             return f.read()
 
-    def image(self, asset):
+    def image(self, asset: Asset) -> Image:
         # Return a PIL image. Decode your engine's texture format here.
         return pil_image_from_bytes(self.raw(asset))
 
-    def mesh(self, asset):
+    def mesh(self, asset: Asset) -> MeshData:
         # Return MeshData: right-handed, Y up, counter-clockwise triangles, UV origin bottom-left.
         # (Use engines.sdk.z_up_to_y_up() for Z-up engines, and flip v for DirectX-style UVs.)
-        points, uvs, tris, face_uvs = [], [], [], {}
+        points: list[list[float]] = []
+        uvs: list[list[float]] = []
+        tris: list[list[int]] = []
+        face_uvs: dict[int, int] = {}
         with open(asset.ref, encoding="utf-8", errors="replace") as f:
             for line in f:
                 parts = line.split()
@@ -66,7 +78,7 @@ class TemplateSession(GameSession):
                         uvs={"UV0": uv0} if uv0 is not None else None,
                         name=os.path.splitext(os.path.basename(asset.ref))[0])
 
-    def materials(self, asset):
+    def materials(self, asset: Asset) -> list[Material]:
         # Optional: [Material(name, [TextureRef(slot, name, texture Asset, role)])].
         # The first ALBEDO texture is shown on the model and exported with it.
         # Here: a texture next to the .obj with the same name, if there is one.
@@ -76,7 +88,7 @@ class TemplateSession(GameSession):
                 return [Material(os.path.basename(stem), [TextureRef("diffuse", tex.name, tex, ALBEDO)])]
         return []
 
-    def stats(self, asset):
+    def stats(self, asset: Asset) -> AssetStats:
         # Optional: cheap numbers for sorting and search filters (tris>1000, w>=512 ...).
         return {"size": asset.size, "info": "", "sort": asset.size or 0}
 
@@ -88,20 +100,20 @@ class TemplatePlugin(EnginePlugin):
     author = "you"
     description = "Images, text files and .obj models lying loose in a folder."
 
-    def detect(self, path):
+    def detect(self, path: str) -> int:
         # 0 = not mine ... 100 = certainly mine. Keep it fast (folder listings, a few file headers).
         # Real engine plugins return 90+ when they see their marker files; this one stays low so it
         # only wins when nothing else recognizes the folder.
         return 5 if os.path.isdir(path) else 0
 
-    def game_info(self, path):
+    def game_info(self, path: str) -> GameInfo:
         # Shown on the game's box on the Projects page. Only read small things here.
         return {"engine_version": "", "detail": "loose files"}
 
-    def count_files(self, path):
+    def count_files(self, path: str) -> int:
         return sum(len(files) for _root, _dirs, files in os.walk(path))
 
-    def open(self, path, progress):
+    def open(self, path: str, progress: Progress) -> TemplateSession:
         # Runs on a worker thread. progress(text, done, total) updates the loading screen.
         session = TemplateSession(self, path)
         progress("Listing files ...")
@@ -110,7 +122,7 @@ class TemplatePlugin(EnginePlugin):
                 full = os.path.join(root, name)
                 rel = os.path.relpath(full, path).replace("\\", "/")
                 ext = os.path.splitext(name)[1].lower().lstrip(".")
-                kind = "model" if ext == "obj" else kind_for_extension(ext)
+                kind: Kind = "model" if ext == "obj" else kind_for_extension(ext)
                 if kind == "file":
                     continue  # skip what we can't show
                 session.assets.append(Asset(

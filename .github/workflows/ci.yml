@@ -29,5 +29,8 @@ jobs:
       - name: Lint
         run: python -m ruff check --output-format github .
 
+      - name: Type check (plugin SDK)
+        run: python -m mypy --ignore-missing-imports --follow-imports=silent --check-untyped-defs engines/sdk.py plugins
+
       - name: Tests
         run: python -m pytest tests -v

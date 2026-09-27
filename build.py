@@ -7,7 +7,8 @@
 Add a game folder to also self-test the packaged exe against a real game:
     py build.py release --test-game "D:/SteamLibrary/steamapps/common/Robocraft"
 
-Every build first runs the lint (ruff) and the tests (pytest) and stops if they fail.
+Every build first runs the lint (ruff), the plugin SDK type check (mypy) and the tests (pytest)
+and stops if any fail.
 --skip-checks skips them (emergencies only).
 """
 
@@ -68,11 +69,14 @@ def clear_folder(path, keep=(".git",)):
 
 def run_checks():
     """Lint + tests (what CI would run). Exits if anything fails."""
-    step("Checks (ruff + pytest)")
-    missing = [m for m in ("ruff", "pytest") if importlib.util.find_spec(m) is None]
+    step("Checks (ruff + mypy + pytest)")
+    missing = [m for m in ("ruff", "mypy", "pytest") if importlib.util.find_spec(m) is None]
     if missing:
         sys.exit(f"Missing {', '.join(missing)}. Install the dev tools: py -m pip install -r requirements-dev.txt")
-    for cmd in (["ruff", "check", "."], ["pytest", "tests", "-q"]):
+    # mypy: the plugin SDK and plugins/ (the contract third-party plugins are written against).
+    mypy = ["mypy", "--ignore-missing-imports", "--follow-imports=silent",
+            "--check-untyped-defs", "engines/sdk.py", "plugins"]
+    for cmd in (["ruff", "check", "."], mypy, ["pytest", "tests", "-q"]):
         if subprocess.run([sys.executable, "-m", *cmd], cwd=ROOT).returncode != 0:
             sys.exit(f"{cmd[0]} failed - fix the problems above (or build with --skip-checks).")
 

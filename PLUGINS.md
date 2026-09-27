@@ -18,6 +18,21 @@ You don't need to change UniView itself.
 As shipped, the template is a working "loose files" engine that shows images, text files and
 `.obj` models found in a folder, so you can try it before changing anything.
 
+### Type checking (optional)
+
+`engines/sdk.py` is fully type-annotated. The dicts your plugin returns have named shapes
+(`GameInfo`, `AssetStats`, `PluginOption`, `Rig`, `AnimationData`), and `Kind` lists the valid
+asset kinds. Keep the template's type hints and an editor like VS Code will flag mistakes as you
+type, or check from the command line:
+
+```
+py -m pip install mypy
+py -m mypy --ignore-missing-imports --follow-imports=silent plugins/my_engine.py
+```
+
+It catches things like a misspelled stats key (`"tri"` instead of `"tris"`), an unknown asset
+kind (`"mesh"` instead of `"model"`), or a `describe()` row whose value isn't a string.
+
 ## How it fits together
 
 ```

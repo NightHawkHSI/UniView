@@ -1,4 +1,5 @@
 -r requirements.txt
 pytest
 ruff
+mypy
 trimesh  # tests/test_glb.py cross-checks exported files with it

@@ -21,21 +21,37 @@ Conventions for decoded data
   convention). Convert from the engine's own space in the plugin (see ``z_up_to_y_up``).
 * UVs: origin at the **bottom-left** (OpenGL). DirectX-style engines flip v (``1 - v``).
 * Images: any ``PIL.Image`` (converted to RGBA by the app when needed).
+
+Types
+-----
+Everything here is type-annotated; the dict shapes plugins return (``GameInfo``, ``AssetStats``,
+``Rig`` ...) are ``TypedDict``s, so an editor or ``mypy plugins/my_engine.py`` can check a plugin
+against this contract. They're plain dicts at runtime.
 """
+
+from __future__ import annotations
 
 import logging
 import os
 import threading
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict
 
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
+
+if TYPE_CHECKING:
+    from PIL.Image import Image
 
 log = logging.getLogger("viewer.sdk")
 
 API_VERSION = 1
 
 # Asset kinds the app knows how to show. Anything else should be "file" (raw export only).
-KINDS = ("model", "scene", "texture", "sprite", "animation", "font", "video", "data", "text", "audio", "file")
-KIND_LABELS = {
+Kind = Literal["model", "scene", "texture", "sprite", "animation", "font", "video", "data", "text", "audio", "file"]
+KINDS: tuple[Kind, ...] = ("model", "scene", "texture", "sprite", "animation", "font", "video", "data", "text",
+                          "audio", "file")
+KIND_LABELS: dict[str, str] = {
     "model": "Models",
     "scene": "Scenes & prefabs",
     "texture": "Textures",
@@ -48,12 +64,82 @@ KIND_LABELS = {
     "audio": "Audio",
     "file": "Other files",
 }
-IMAGE_KINDS = ("texture", "sprite")
-MODEL_KINDS = ("model", "scene")  # shown in 3D (a scene/prefab is many placed models)
-THUMB_KINDS = ("model", "texture", "sprite")
+IMAGE_KINDS: tuple[Kind, ...] = ("texture", "sprite")
+MODEL_KINDS: tuple[Kind, ...] = ("model", "scene")  # shown in 3D (a scene/prefab is many placed models)
+THUMB_KINDS: tuple[Kind, ...] = ("model", "texture", "sprite")
 
 # Texture roles in a material (used to pick the texture shown on a model / exported as base color).
 ALBEDO, NORMAL, OTHER = "albedo", "normal", "other"
+
+Buffer = bytes | bytearray | memoryview
+
+
+# --------------------------------------------------------------------------- dict shapes plugins return
+
+class GameInfo(TypedDict, total=False):
+    """EnginePlugin.game_info()."""
+    engine_version: str  # e.g. "2019.4.40f1"
+    detail: str          # extra text on the game's box (backend, archive format ...)
+
+
+class AssetStats(TypedDict, total=False):
+    """GameSession.stats(). size/info/sort are what the list shows; the rest can be searched (e.g. tris>1000)."""
+    size: int | None
+    info: str
+    sort: float
+    tris: int
+    verts: int
+    w: int
+    h: int
+
+
+class _PluginOptionRequired(TypedDict):
+    id: str
+    label: str
+
+
+class PluginOption(_PluginOptionRequired, total=False):
+    """One entry of EnginePlugin.options (a per-game setting the user fills in)."""
+    help: str
+    multiline: bool
+
+
+class Joint(TypedDict):
+    name: str
+    parent: int                      # joint index, -1 for a root
+    translation: Sequence[float]     # x, y, z
+    rotation: Sequence[float]        # quaternion x, y, z, w
+    scale: Sequence[float]
+
+
+class Rig(TypedDict):
+    """GameSession.skeleton(): a skinned model's skeleton, in UniView's space (the one mesh() uses)."""
+    joints: list[Joint]
+    skin_joints: list[int]           # joint index of each skin bone
+    inverse_bind: NDArray[Any]       # (B, 4, 4) row-major, one per skin bone
+    joints_0: NDArray[Any]           # (N, 4) skin bone indices per vertex
+    weights_0: NDArray[Any]          # (N, 4)
+
+
+class AnimationChannel(TypedDict):
+    joint: int
+    path: Literal["translation", "rotation", "scale"]
+    values: NDArray[Any]             # (F, 3), or (F, 4) for rotations
+
+
+class AnimationData(TypedDict):
+    name: str
+    times: NDArray[Any]              # (F,) seconds
+    channels: list[AnimationChannel]
+
+
+class Animated(Protocol):
+    """What GameSession.animate() returns."""
+    length: float  # seconds
+
+    def points_at(self, t: float) -> NDArray[np.float32]:
+        """(N, 3) vertex positions at time t, same order as mesh(model)."""
+        ...
 
 
 class Asset:
@@ -72,7 +158,18 @@ class Asset:
 
     __slots__ = ("kind", "name", "key", "uid", "size", "path", "source", "ref", "ext")
 
-    def __init__(self, kind, name, key, uid=None, size=None, path="", source="", ref=None, ext=""):
+    kind: Kind
+    name: str
+    key: Hashable
+    uid: str
+    size: int | None
+    path: str
+    source: str
+    ref: Any
+    ext: str
+
+    def __init__(self, kind: Kind, name: str, key: Hashable, uid: str | None = None, size: int | None = None,
+                 path: str = "", source: str = "", ref: Any = None, ext: str = "") -> None:
         self.kind = kind
         self.name = name
         self.key = key
@@ -83,7 +180,7 @@ class Asset:
         self.ref = ref
         self.ext = ext
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<Asset {self.kind} {self.name!r}>"
 
 
@@ -99,8 +196,18 @@ class MeshData:
     skipped     parts that couldn't be shown (lines/points), for the log
     """
 
-    def __init__(self, points, submeshes, normals=None, uvs=None, colors=None, material_slots=None,
-                 name="", skipped=0):
+    points: NDArray[np.float32]
+    submeshes: list[NDArray[np.int64]]
+    normals: NDArray[np.float32] | None
+    uvs: dict[str, NDArray[np.float32]]
+    colors: NDArray[np.float32] | None
+    material_slots: list[int]
+    name: str
+    skipped: int
+
+    def __init__(self, points: ArrayLike, submeshes: Iterable[ArrayLike], normals: ArrayLike | None = None,
+                 uvs: Mapping[str, ArrayLike] | None = None, colors: ArrayLike | None = None,
+                 material_slots: Iterable[int] | None = None, name: str = "", skipped: int = 0) -> None:
         self.points = np.ascontiguousarray(points, dtype=np.float32).reshape(-1, 3)
         self.submeshes = [np.asarray(s, dtype=np.int64).reshape(-1, 3) for s in submeshes]
         self.submeshes = [s for s in self.submeshes if len(s)] or self.submeshes[:1]
@@ -117,15 +224,15 @@ class MeshData:
             raise ValueError("Mesh has no triangles.")
 
     @property
-    def triangles(self):
+    def triangles(self) -> NDArray[np.int64]:
         return np.concatenate([s for s in self.submeshes if len(s)]) if self.submeshes else np.zeros((0, 3), np.int64)
 
     @property
-    def triangle_count(self):
+    def triangle_count(self) -> int:
         return sum(len(s) for s in self.submeshes)
 
 
-def _checked(arr, n, width):
+def _checked(arr: ArrayLike | None, n: int, width: int) -> NDArray[np.float32] | None:
     if arr is None:
         return None
     arr = np.asarray(arr, dtype=np.float32)
@@ -136,13 +243,13 @@ def _checked(arr, n, width):
     return np.ascontiguousarray(arr[:, :width])
 
 
-def z_up_to_y_up(points):
+def z_up_to_y_up(points: ArrayLike) -> NDArray[np.float32]:
     """Right-handed Z-up (Source, Blender) -> Y-up: (x, y, z) -> (x, z, -y). Works for normals too."""
     p = np.asarray(points, dtype=np.float32)
     return np.ascontiguousarray(np.stack([p[:, 0], p[:, 2], -p[:, 1]], axis=1))
 
 
-def orient_to_normals(points, tris, normals):
+def orient_to_normals(points: ArrayLike, tris: NDArray[Any], normals: ArrayLike | None) -> NDArray[Any]:
     """Flip triangle winding if most faces point against the vertex normals. Returns tris."""
     if normals is None or not len(tris):
         return tris
@@ -159,7 +266,12 @@ class TextureRef:
 
     __slots__ = ("slot", "name", "asset", "role")
 
-    def __init__(self, slot, name, asset, role=OTHER):
+    slot: str
+    name: str
+    asset: Asset
+    role: str
+
+    def __init__(self, slot: str, name: str, asset: Asset, role: str = OTHER) -> None:
         self.slot, self.name, self.asset, self.role = slot, name, asset, role
 
 
@@ -170,20 +282,21 @@ class Material:
     texture in GLB exports. properties: [(name, value text)] shown in the info panel.
     """
 
-    def __init__(self, name, textures=(), color=None, properties=None):
+    def __init__(self, name: str, textures: Iterable[TextureRef] = (), color: Sequence[float] | None = None,
+                 properties: Iterable[tuple[str, str]] | None = None) -> None:
         self.name = name
         self.textures = list(textures)
         self.color = tuple(color) if color is not None else None
         self.properties = list(properties or [])
 
-    def main_texture(self):
+    def main_texture(self) -> TextureRef | None:
         for t in self.textures:
             if t.role == ALBEDO:
                 return t
         return next((t for t in self.textures if t.role != NORMAL), None)
 
 
-def main_texture(materials):
+def main_texture(materials: Iterable[Material]) -> Asset | None:
     """Texture Asset to show on a model: the first material's albedo, else any non-normal map."""
     for mat in materials:
         tex = mat.main_texture()
@@ -199,12 +312,14 @@ class Progress:
     (right-click a game -> Engine settings...), e.g. {"aes_keys": "0x1234..."}.
     """
 
-    def __init__(self, text_fn=None, value_fn=None, options=None):
-        self._text = text_fn or (lambda s: None)
-        self._value = value_fn or (lambda d, t: None)
-        self.options = dict(options or {})
+    def __init__(self, text_fn: Callable[[str], object] | None = None,
+                 value_fn: Callable[[int, int], object] | None = None,
+                 options: Mapping[str, Any] | None = None) -> None:
+        self._text: Callable[[str], object] = text_fn or (lambda s: None)
+        self._value: Callable[[int, int], object] = value_fn or (lambda d, t: None)
+        self.options: dict[str, Any] = dict(options or {})
 
-    def __call__(self, text, done=0, total=0):
+    def __call__(self, text: str, done: int = 0, total: int = 0) -> None:
         """Status text, plus done/total for a progress bar (total 0 = busy animation)."""
         self._text(text)
         self._value(done, total)
@@ -212,7 +327,7 @@ class Progress:
 
 # Display options from the app's Options menu (all on by default). Plugins read them with
 # view_option(); when one changes the app calls GameSession.options_changed() so caches can be dropped.
-VIEW_OPTIONS = {
+VIEW_OPTIONS: dict[str, bool] = {
     "hide_skybox": True,         # maps: leave out the 3D skybox (the small scenery copy around the map)
     "hide_tool_surfaces": True,  # maps: leave out nodraw, trigger, clip, hint and sky brushes
     "hide_lods": True,           # scenes: show only the most detailed LOD of each object
@@ -220,35 +335,35 @@ VIEW_OPTIONS = {
 }
 
 
-def view_option(name):
+def view_option(name: str) -> bool:
     return VIEW_OPTIONS.get(name, True)
 
 
 class GameSession:
     """A loaded game. Created by EnginePlugin.open(). Override what your engine supports."""
 
-    def __init__(self, plugin, path):
+    def __init__(self, plugin: EnginePlugin, path: str) -> None:
         self.plugin = plugin
         self.path = path
-        self.lock = threading.RLock()  # the app holds this around every call below
-        self.assets = []               # [Asset] - fill this in open()
-        self.file_count = 0            # game files that were read (shown on the project box)
-        self.engine_version = ""       # set if you learn it while loading (else game_info's is kept)
-        self.warnings = []             # things the user should know (shown once after loading)
+        self.lock = threading.RLock()     # the app holds this around every call below
+        self.assets: list[Asset] = []     # fill this in open()
+        self.file_count = 0               # game files that were read (shown on the project box)
+        self.engine_version = ""          # set if you learn it while loading (else game_info's is kept)
+        self.warnings: list[str] = []     # things the user should know (shown once after loading)
 
-    def options_changed(self):
+    def options_changed(self) -> None:
         """VIEW_OPTIONS changed: drop cached maps/scenes built with the old settings."""
 
     # ---- previews (raise an exception with a friendly message if something can't be decoded)
-    def image(self, asset):
+    def image(self, asset: Asset) -> Image:
         """PIL image of a texture/sprite asset."""
         raise NotImplementedError("This engine plugin can't show images yet.")
 
-    def mesh(self, asset):
+    def mesh(self, asset: Asset) -> MeshData:
         """MeshData of a model asset."""
         raise NotImplementedError("This engine plugin can't show models yet.")
 
-    def text(self, asset):
+    def text(self, asset: Asset) -> str | bytes:
         """str (or bytes) of a text asset. Default: decode raw() (binary text formats are decoded)."""
         data = self.raw(asset)
         if (asset.ext or "").lower() == "locres" and isinstance(data, (bytes, bytearray)):
@@ -259,11 +374,11 @@ class GameSession:
                 log.warning("Couldn't read the localization file '%s': %s", asset.name, e)
         return data.decode("utf-8", "replace") if isinstance(data, bytes) else data
 
-    def raw(self, asset):
+    def raw(self, asset: Asset) -> bytes:
         """The asset's bytes as stored (used to export text/file assets as-is)."""
         raise NotImplementedError("This engine plugin can't export raw files.")
 
-    def audio(self, asset):
+    def audio(self, asset: Asset) -> tuple[bytes, str]:
         """(bytes, extension) of a sound in a format a media player understands:
         wav, mp3, ogg, flac, m4a/aac. Default: the raw file if its extension is one of those."""
         ext = (asset.ext or "").lower()
@@ -275,7 +390,7 @@ class GameSession:
         raise NotImplementedError(f"Playing .{ext or '?'} sounds isn't supported yet (export saves the file as-is).")
 
     # ---- extra info (all optional)
-    def stats(self, asset):
+    def stats(self, asset: Asset) -> AssetStats:
         """Numbers for sorting/searching, cheap to compute (no full decoding if you can avoid it).
 
         Keys the app uses: size (bytes), info (short text for the Info column), sort (number for
@@ -283,15 +398,15 @@ class GameSession:
         """
         return {"size": asset.size, "info": "", "sort": asset.size or 0}
 
-    def materials(self, asset):
+    def materials(self, asset: Asset) -> list[Material]:
         """[Material] of a model asset (may be slow the first time)."""
         return []
 
-    def materials_ready(self):
+    def materials_ready(self) -> bool:
         """False while background indexing makes materials() slow; the app retries later."""
         return True
 
-    def describe(self, asset):
+    def describe(self, asset: Asset) -> list[tuple[str, str]]:
         """Extra (label, text) rows for the model/texture info panel."""
         rows = []
         if asset.source:
@@ -300,32 +415,32 @@ class GameSession:
             rows.append(("Path", asset.path))
         return rows
 
-    def related(self, asset):
+    def related(self, asset: Asset) -> tuple[str, list[Asset], str]:
         """Links shown under a texture: (title, [Asset], text when empty). E.g. models that use it."""
         return "", [], ""
 
-    def video(self, asset):
+    def video(self, asset: Asset) -> tuple[bytes, str]:
         """(bytes, extension) of a video the player can open (mp4, webm, mov, avi, mkv...)."""
         return self.raw(asset), (asset.ext or "mp4").lower()
 
-    def sprite_frames(self, asset):
+    def sprite_frames(self, asset: Asset) -> tuple[list[tuple[float, Asset]], float]:
         """2D (flipbook) animation: ([(time, sprite/texture Asset)], length in seconds), or ([], 0)."""
         return [], 0.0
 
-    def sprite_rects(self, asset):
+    def sprite_rects(self, asset: Asset) -> list[tuple[float, float, float, float]]:
         """Sprites cut from a texture (sprite sheet): [(x, y, w, h)] in pixels, y measured from the BOTTOM."""
         return []
 
-    def animation_targets(self, asset):
+    def animation_targets(self, asset: Asset) -> list[Asset]:
         """Models an animation clip can play on, best match first ([Asset])."""
         return []
 
-    def animate(self, model, clip):
+    def animate(self, model: Asset, clip: Asset) -> Animated:
         """An object with .length (seconds) and .points_at(t) -> (N, 3) vertex positions of `model`
         (same order as mesh(model)) posed by `clip` at time t."""
         raise NotImplementedError("This engine plugin can't play animations yet.")
 
-    def skeleton(self, model, clip=None):
+    def skeleton(self, model: Asset, clip: Asset | None = None) -> tuple[Rig, AnimationData | None]:
         """Rig of a skinned `model` for rigged glTF exports: (rig, animation or None).
 
         rig: {"joints": [{"name", "parent" (joint index or -1), "translation", "rotation" (x, y, z, w),
@@ -335,60 +450,60 @@ class GameSession:
         [{"joint", "path": "translation"/"rotation"/"scale", "values": (F, 3 or 4)}]}."""
         raise NotImplementedError("This engine plugin can't export skeletons yet.")
 
-    def start_background(self):
+    def start_background(self) -> None:
         """Called once after loading, on the UI thread: start background indexing if you have any."""
 
-    def close(self):
+    def close(self) -> None:
         """Game is being unloaded: stop background work, close files."""
 
 
 class EnginePlugin:
     """Describes one engine. Keep detect()/game_info() fast: they run for every game on the start page."""
 
-    id = "engine"            # short unique id, saved in projects.json
-    name = "Engine"          # shown to the user
-    version = "1.0"          # your plugin's version
-    author = ""
-    description = ""
-    api_version = API_VERSION
+    id: str = "engine"       # short unique id, saved in projects.json
+    name: str = "Engine"     # shown to the user
+    version: str = "1.0"     # your plugin's version
+    author: str = ""
+    description: str = ""
+    api_version: int = API_VERSION
     # Per-game settings the user can fill in (right-click a game -> Engine settings...), given to
     # open() as progress.options: [{"id": "aes_keys", "label": "AES keys", "help": "...", "multiline": True}]
-    options = []
+    options: list[PluginOption] = []
 
-    def detect(self, path):
+    def detect(self, path: str) -> int:
         """How sure are you this folder (or file) is a game of this engine? 0 = no ... 100 = certain.
 
         Only look at folder listings / a few file headers, no big reads.
         """
         return 0
 
-    def game_info(self, path):
+    def game_info(self, path: str) -> GameInfo:
         """{"engine_version": "...", "detail": "..."} read cheaply (file headers). Shown on the game's box."""
         return {"engine_version": "", "detail": ""}
 
-    def count_files(self, path):
+    def count_files(self, path: str) -> int:
         """Number of game data files this plugin would read (shown on the game's box)."""
         return 0
 
-    def open(self, path, progress):
+    def open(self, path: str, progress: Progress) -> GameSession:
         """Load the game at `path` and return a GameSession. Runs on a worker thread.
 
         progress(text, done, total) reports what's happening.
         """
         raise NotImplementedError
 
-    def label(self, info):
+    def label(self, info: GameInfo) -> str:
         """Engine + version shown on the game's box (e.g. 'Unity 2019.4.40f1'). info is game_info()'s dict."""
         return f"{self.name} {info.get('engine_version', '')}".strip()
 
-    def short_version(self, info):
+    def short_version(self, info: GameInfo) -> str:
         """Group title for 'Group by engine version' (e.g. 'Unity 2019.4'). Default: label()."""
         return self.label(info)
 
 
 # --------------------------------------------------------------------------- helpers for plugins
 
-def walk_files(root, exts=None, skip_dirs=()):
+def walk_files(root: str, exts: Iterable[str] | None = None, skip_dirs: Iterable[str] = ()) -> Iterator[str]:
     """Yield file paths under root (or root itself if it's a file), optionally only these extensions."""
     if os.path.isfile(root):
         yield root
@@ -402,7 +517,7 @@ def walk_files(root, exts=None, skip_dirs=()):
                 yield os.path.join(dirpath, name)
 
 
-def app_dir():
+def app_dir() -> str:
     """Folder next to UniView.exe (or the source), where user files live."""
     import sys
     if getattr(sys, "frozen", False):
@@ -410,14 +525,14 @@ def app_dir():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def cache_dir():
+def cache_dir() -> str:
     """A folder plugins can keep caches in (e.g. results of slow indexing), next to the app."""
     path = os.path.join(app_dir(), "cache")
     os.makedirs(path, exist_ok=True)
     return path
 
 
-def listdir_lower(path):
+def listdir_lower(path: str) -> dict[str, str]:
     try:
         return {n.lower(): n for n in os.listdir(path)}
     except OSError:
@@ -427,59 +542,59 @@ def listdir_lower(path):
 class BinReader:
     """Little-endian reader over bytes/memoryview (plugins parse binary formats with this)."""
 
-    def __init__(self, data, pos=0):
+    def __init__(self, data: Buffer, pos: int = 0) -> None:
         self.data = data
         self.pos = pos
 
-    def seek(self, pos):
+    def seek(self, pos: int) -> BinReader:
         self.pos = pos
         return self
 
-    def skip(self, n):
+    def skip(self, n: int) -> BinReader:
         self.pos += n
         return self
 
-    def read(self, n):
+    def read(self, n: int) -> bytes:
         out = bytes(self.data[self.pos:self.pos + n])
         if len(out) != n:
             raise EOFError(f"Unexpected end of data at {self.pos} (wanted {n} bytes)")
         self.pos += n
         return out
 
-    def _unpack(self, fmt, size):
+    def _unpack(self, fmt: str, size: int) -> Any:
         import struct
         value = struct.unpack_from("<" + fmt, self.data, self.pos)
         self.pos += size
         return value[0] if len(value) == 1 else value
 
-    def u8(self):
+    def u8(self) -> int:
         return self._unpack("B", 1)
 
-    def i8(self):
+    def i8(self) -> int:
         return self._unpack("b", 1)
 
-    def u16(self):
+    def u16(self) -> int:
         return self._unpack("H", 2)
 
-    def i16(self):
+    def i16(self) -> int:
         return self._unpack("h", 2)
 
-    def u32(self):
+    def u32(self) -> int:
         return self._unpack("I", 4)
 
-    def i32(self):
+    def i32(self) -> int:
         return self._unpack("i", 4)
 
-    def u64(self):
+    def u64(self) -> int:
         return self._unpack("Q", 8)
 
-    def i64(self):
+    def i64(self) -> int:
         return self._unpack("q", 8)
 
-    def f32(self):
+    def f32(self) -> float:
         return self._unpack("f", 4)
 
-    def cstr(self, encoding="utf-8"):
+    def cstr(self, encoding: str = "utf-8") -> str:
         end = bytes(self.data[self.pos:self.pos + 4096]).find(b"\0")
         if end < 0:
             data = bytes(self.data[self.pos:])
@@ -490,13 +605,13 @@ class BinReader:
         return data.decode(encoding, "replace")
 
 
-def cstr_at(data, offset, limit=512):
+def cstr_at(data: Buffer, offset: int, limit: int = 512) -> str:
     end = bytes(data[offset:offset + limit]).find(b"\0")
     raw = bytes(data[offset:offset + (limit if end < 0 else end)])
     return raw.decode("utf-8", "replace")
 
 
-TEXT_EXTS = {
+TEXT_EXTS: set[str] = {
     "txt", "json", "xml", "ini", "cfg", "csv", "tsv", "md", "log", "lua", "nut", "py", "js", "cs",
     "shader", "hlsl", "glsl", "fx", "fxc", "vmt", "vdf", "res", "vfe", "gi", "kv3", "yaml", "yml",
     "html", "htm", "css", "properties", "toml", "uplugin", "uproject", "cmd", "bat", "rad", "lst",
@@ -505,15 +620,15 @@ TEXT_EXTS = {
     "locres", "po", "pot", "lang", "srt", "vtt", "ass", "pop", "conf", "scr", "ts", "sh", "nfo", "sql",
     "tscn", "tres", "gd", "godot", "rpy", "mcmeta", "ron", "vcd", "cfg", "ent", "def", "mtr", "map",
 }
-IMAGE_EXTS = {"png", "jpg", "jpeg", "jfif", "bmp", "tga", "dds", "gif", "webp", "tif", "tiff", "svg", "ico", "cur",
+IMAGE_EXTS: set[str] = {"png", "jpg", "jpeg", "jfif", "bmp", "tga", "dds", "gif", "webp", "tif", "tiff", "svg", "ico", "cur",
               "psd", "pcx", "ppm", "pgm", "pbm", "sgi", "icns"}
-AUDIO_EXTS = {"wav", "mp3", "ogg", "flac", "opus", "m4a", "aac", "wem", "bnk", "bank", "fsb", "xwb", "vsnd_c"}
-PLAYABLE_AUDIO = {"wav", "mp3", "ogg", "flac", "opus", "m4a", "aac"}  # what the built-in player decodes
-VIDEO_EXTS = {"mp4", "webm", "mov", "avi", "mkv", "ogv", "m4v", "wmv", "bk2", "bik", "usm"}
-FONT_EXTS = {"ttf", "otf", "ttc"}
+AUDIO_EXTS: set[str] = {"wav", "mp3", "ogg", "flac", "opus", "m4a", "aac", "wem", "bnk", "bank", "fsb", "xwb", "vsnd_c"}
+PLAYABLE_AUDIO: set[str] = {"wav", "mp3", "ogg", "flac", "opus", "m4a", "aac"}  # what the built-in player decodes
+VIDEO_EXTS: set[str] = {"mp4", "webm", "mov", "avi", "mkv", "ogv", "m4v", "wmv", "bk2", "bik", "usm"}
+FONT_EXTS: set[str] = {"ttf", "otf", "ttc"}
 
 
-def kind_for_extension(ext):
+def kind_for_extension(ext: str) -> Kind:
     """Default kind for a loose file by extension (text / texture / audio / file)."""
     ext = ext.lower().lstrip(".")
     if ext in TEXT_EXTS:
@@ -529,7 +644,7 @@ def kind_for_extension(ext):
     return "file"
 
 
-def pil_image_from_bytes(data):
+def pil_image_from_bytes(data: Buffer) -> Image:
     """Open a png/jpg/tga/dds/ico/svg/... stored as bytes."""
     import io
     from PIL import Image
@@ -544,7 +659,7 @@ def pil_image_from_bytes(data):
     return img
 
 
-def svg_image(data, size=1024):
+def svg_image(data: Buffer, size: int = 1024) -> Image:
     """Render an SVG (bytes) to a PIL image about `size` pixels on its longest side (Qt's renderer)."""
     from PIL import Image
     from PySide6.QtCore import QByteArray, QRectF, Qt
@@ -556,8 +671,8 @@ def svg_image(data, size=1024):
     view = renderer.viewBoxF()
     w, h = (view.width(), view.height()) if view.width() > 0 and view.height() > 0 else (1.0, 1.0)
     scale = size / max(w, h)
-    img = QImage(max(1, round(w * scale)), max(1, round(h * scale)), QImage.Format_RGBA8888)
-    img.fill(Qt.transparent)
+    img = QImage(max(1, round(w * scale)), max(1, round(h * scale)), QImage.Format.Format_RGBA8888)
+    img.fill(Qt.GlobalColor.transparent)
     painter = QPainter(img)
     renderer.render(painter, QRectF(0, 0, img.width(), img.height()))
     painter.end()
@@ -565,7 +680,7 @@ def svg_image(data, size=1024):
                             img.bytesPerLine(), 1).copy()
 
 
-def find_cstrings(data, min_len=4, limit=20000):
+def find_cstrings(data: Buffer, min_len: int = 4, limit: int = 20000) -> list[str]:
     """Readable zero-terminated strings in binary data (file names, keys...), in order, without repeats."""
     import re
     out, seen = [], set()
@@ -579,7 +694,7 @@ def find_cstrings(data, min_len=4, limit=20000):
     return out
 
 
-def font_preview(data, name=""):
+def font_preview(data: bytes | None, name: str = "") -> Image:
     """A sample sheet rendered with a font (TTF/OTF bytes)."""
     import io
     if not data:
