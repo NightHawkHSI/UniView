@@ -241,6 +241,10 @@ def test_builder_json_fields_match_the_cs_classes():
     assert set(desc) <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_desc))
     cs_batch = re.search(r"public class BatchRef\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
     assert {"model", "materials"} <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_batch))
+    cs_prop = re.search(r"public class Prop\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
+    assert {"p", "t", "v", "s", "n"} <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_prop))
+    cs_comp = re.search(r"public class Comp\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
+    assert {"type", "props"} <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_comp))
     cs_light = re.search(r"public class LightInfo\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
     light = up.prefab_description([{**PrefabSession([]).hierarchy(None)[0],
                                     "light": {"type": 1, "color": [1, 1, 1, 1], "intensity": 1, "range": 1,

@@ -156,6 +156,10 @@ def convert(details, texture_guid):
 
 def _num(v):
     v = float(v)
+    if v != v:
+        return "NaN"
+    if v in (float("inf"), float("-inf")):
+        return "Infinity" if v > 0 else "-Infinity"  # how Unity writes them in YAML
     return str(int(v)) if v == int(v) and abs(v) < 1e15 else repr(v)
 
 

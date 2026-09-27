@@ -30,6 +30,23 @@ namespace UniView
     }
 
     [Serializable]
+    public class Prop
+    {
+        public string p;   // SerializedProperty path, e.g. m_Center.x or m_Materials.Array.data[0]
+        public string t;   // f/i/b number, s string, n object n of this prefab/scene, m mesh of model s, a asset s
+        public double v;
+        public string s;
+        public int n;
+    }
+
+    [Serializable]
+    public class Comp
+    {
+        public string type;
+        public Prop[] props;
+    }
+
+    [Serializable]
     public class Node
     {
         public string name;
@@ -45,6 +62,7 @@ namespace UniView
         public string[] materials;
         public bool noMaterials;
         public LightInfo light;
+        public Comp[] components;
     }
 
     [Serializable]
@@ -124,6 +142,7 @@ namespace UniView
 
             var parts = new Dictionary<string, Renderer>();
             int prefabs = 0, scenes = 0, failed = 0;
+            valuesSet = valuesSkipped = componentsAdded = componentsFailed = 0;
             try
             {
                 for (int i = 0; i < todo.Count; i++)
@@ -149,7 +168,9 @@ namespace UniView
                 else EditorSceneManager.NewScene(NewSceneSetup.DefaultGameObjects, NewSceneMode.Single);
             }
             Debug.Log("UniView: built " + prefabs + " prefab(s) and " + scenes + " scene(s)"
-                      + (failed > 0 ? ", " + failed + " failed (see warnings)" : ""));
+                      + (failed > 0 ? ", " + failed + " failed (see warnings)" : "")
+                      + "; components: " + componentsAdded + " added" + (componentsFailed > 0 ? ", " + componentsFailed + " not available" : "")
+                      + ", " + valuesSet + " values set, " + valuesSkipped + " not applicable");
         }
 
         static Vector3 V(float[] a, Vector3 fallback)
@@ -183,6 +204,7 @@ namespace UniView
                 else if (!string.IsNullOrEmpty(n.builtin)) AddBuiltin(objects[i], n);
                 if (n.light != null && n.light.present) AddLight(objects[i], n.light);
             }
+            AddComponents(d, objects, parts);
             for (int i = 0; i < d.nodes.Length; i++)
                 if (!d.nodes[i].active && (rootsCanBeInactive || d.nodes[i].parent >= 0)) objects[i].SetActive(false);
             return objects;
@@ -229,6 +251,121 @@ namespace UniView
             }
             Directory.CreateDirectory(Path.GetDirectoryName(d.target));
             EditorSceneManager.SaveScene(scene, d.target);
+        }
+
+        // ---- built-in components (colliders, rigidbodies, audio sources, cameras...), set field by field
+        static Dictionary<string, Type> componentTypes;
+        static int valuesSet, valuesSkipped, componentsAdded, componentsFailed;
+        static readonly HashSet<string> unknownTypes = new HashSet<string>();
+
+        static Type ComponentType(string name)
+        {
+            if (componentTypes == null)
+            {
+                componentTypes = new Dictionary<string, Type>();
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    Type[] types;
+                    try { types = asm.GetTypes(); } catch (Exception) { continue; }
+                    foreach (Type t in types)
+                        if (typeof(Component).IsAssignableFrom(t) && t.Namespace != null && t.Namespace.StartsWith("UnityEngine")
+                            && !componentTypes.ContainsKey(t.Name))
+                            componentTypes[t.Name] = t;
+                }
+            }
+            Type found;
+            return componentTypes.TryGetValue(name, out found) ? found : null;
+        }
+
+        static void AddComponents(Description d, GameObject[] objects, Dictionary<string, Renderer> parts)
+        {
+            var made = new Component[d.nodes.Length][];
+            var byNode = new Dictionary<string, Component>();  // "node|class" -> first such component
+            for (int i = 0; i < d.nodes.Length; i++)
+            {
+                Comp[] comps = d.nodes[i].components;
+                if (comps == null || comps.Length == 0) continue;
+                made[i] = new Component[comps.Length];
+                var reused = new HashSet<Component>();
+                for (int j = 0; j < comps.Length; j++)
+                {
+                    Type type = ComponentType(comps[j].type);
+                    if (type == null)
+                    {
+                        if (unknownTypes.Add(comps[j].type)) Debug.LogWarning("UniView: no component type " + comps[j].type + " in this Unity version");
+                        componentsFailed++;
+                        continue;
+                    }
+                    // A component the build already added (e.g. a Light) is filled in instead of added twice.
+                    Component comp = objects[i].GetComponent(type);
+                    if (comp == null || reused.Contains(comp)) comp = objects[i].AddComponent(type);
+                    if (comp == null) { componentsFailed++; continue; }
+                    reused.Add(comp);
+                    made[i][j] = comp;
+                    componentsAdded++;
+                    string key = i + "|" + comps[j].type;
+                    if (!byNode.ContainsKey(key)) byNode[key] = comp;
+                }
+            }
+            for (int i = 0; i < d.nodes.Length; i++)
+            {
+                if (made[i] == null) continue;
+                Comp[] comps = d.nodes[i].components;
+                for (int j = 0; j < comps.Length; j++)
+                {
+                    if (made[i][j] == null || comps[j].props == null) continue;
+                    var so = new SerializedObject(made[i][j]);
+                    foreach (Prop pr in comps[j].props) SetProp(so, pr, objects, byNode, parts);
+                    so.ApplyModifiedPropertiesWithoutUndo();
+                }
+            }
+        }
+
+        static void SetProp(SerializedObject so, Prop pr, GameObject[] objects, Dictionary<string, Component> byNode,
+                            Dictionary<string, Renderer> parts)
+        {
+            SerializedProperty sp = so.FindProperty(pr.p);
+            if (sp == null) { valuesSkipped++; return; }
+            try
+            {
+                if (pr.t == "n" || pr.t == "m" || pr.t == "a")
+                {
+                    if (sp.propertyType != SerializedPropertyType.ObjectReference) { valuesSkipped++; return; }
+                    UnityEngine.Object target = null;
+                    if (pr.t == "n" && pr.n >= 0 && pr.n < objects.Length)
+                    {
+                        if (pr.s == "GameObject") target = objects[pr.n];
+                        else if (pr.s == "Transform") target = objects[pr.n].transform;
+                        else { Component c; if (byNode.TryGetValue(pr.n + "|" + pr.s, out c)) target = c; }
+                    }
+                    else if (pr.t == "m")
+                    {
+                        Renderer r = ModelRenderer(pr.s, parts);
+                        var skinned = r as SkinnedMeshRenderer;
+                        if (skinned != null) target = skinned.sharedMesh;
+                        else if (r != null && r.GetComponent<MeshFilter>() != null) target = r.GetComponent<MeshFilter>().sharedMesh;
+                    }
+                    else target = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(pr.s);
+                    if (target == null) { valuesSkipped++; return; }
+                    sp.objectReferenceValue = target;
+                    valuesSet++;
+                    return;
+                }
+                switch (sp.propertyType)
+                {
+                    case SerializedPropertyType.Boolean: sp.boolValue = pr.v != 0; break;
+                    case SerializedPropertyType.Float: sp.doubleValue = pr.v; break;
+                    case SerializedPropertyType.Integer:
+                    case SerializedPropertyType.LayerMask:
+                    case SerializedPropertyType.Character: sp.longValue = (long)pr.v; break;
+                    case SerializedPropertyType.ArraySize: sp.intValue = (int)pr.v; break;
+                    case SerializedPropertyType.Enum: sp.intValue = (int)pr.v; break;
+                    case SerializedPropertyType.String: sp.stringValue = pr.s ?? ""; break;
+                    default: valuesSkipped++; return;
+                }
+                valuesSet++;
+            }
+            catch (Exception) { valuesSkipped++; }
         }
 
         static Renderer ModelRenderer(string path, Dictionary<string, Renderer> parts)

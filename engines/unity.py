@@ -945,11 +945,16 @@ class UnitySession(GameSession):
         [{"name", "parent" (index or -1), "active", "pos" (x,y,z), "rot" (x,y,z,w), "scale",
           "mesh" (uid of the Mesh asset or None), "skinned" (bool), "renderer_enabled",
           "batch" (static batching: {"mesh": combined mesh uid, "first", "count", "materials": [Material]}),
-          "light" ({"type", "color", "intensity", "range", "spot_angle"}), "terrain" (uid of the terrain model)}],
+          "light" ({"type", "color", "intensity", "range", "spot_angle"}), "terrain" (uid of the terrain model),
+          "components" ([{"type": Unity class, "props": unity_components.flatten() entries}] for the other
+          built-in components: colliders, rigidbodies, audio sources, cameras, LOD groups...)}],
         in Unity's own space. Optional keys are missing when they don't apply."""
+        from .unity_components import ASSET_KINDS, SKIP_COMPONENTS, flatten
         from .unity_scene import _components
         nodes = []
         material_cache = {}
+        node_keys = {}    # obj key of a GameObject / Transform / component -> (node index, class name)
+        pending = []      # (node index, class name, component reader) to flatten once every node is known
 
         def material_uids(renderer):
             out = []
@@ -992,9 +997,13 @@ class UnitySession(GameSession):
                 return
             try:
                 t = transform_reader.read()
-                go = t.m_GameObject.deref().read()
+                go_reader = t.m_GameObject.deref()
+                go = go_reader.read()
             except Exception:
                 return
+            index = len(nodes)
+            node_keys[obj_key(go_reader.assets_file, go_reader.path_id)] = (index, "GameObject")
+            node_keys[obj_key(transform_reader.assets_file, transform_reader.path_id)] = (index, "Transform")
             p, r, s = t.m_LocalPosition, t.m_LocalRotation, t.m_LocalScale
             node = {"name": getattr(go, "m_Name", "") or "GameObject", "parent": parent,
                     "active": bool(getattr(go, "m_IsActive", True)),
@@ -1004,6 +1013,9 @@ class UnitySession(GameSession):
             mesh_ptr = None
             batch = None
             for name, reader in comps:
+                node_keys.setdefault(obj_key(reader.assets_file, reader.path_id), (index, name))
+                if name not in SKIP_COMPONENTS:
+                    pending.append((index, name, reader))
                 try:
                     if name == "SkinnedMeshRenderer":
                         renderer = reader.read()
@@ -1044,7 +1056,6 @@ class UnitySession(GameSession):
                 # The mesh is a combined (world space) static batch: not this object's own mesh.
                 batch["mesh"], node["mesh"] = node["mesh"], None
                 node["batch"] = batch
-            index = len(nodes)
             nodes.append(node)
             for child in t.m_Children or []:
                 try:
@@ -1052,9 +1063,35 @@ class UnitySession(GameSession):
                 except Exception:
                     continue
 
+        def resolver(reader):
+            def resolve(file_id, path_id):
+                target_file = self.finder._file(reader.assets_file, file_id)
+                if target_file is None:
+                    return None
+                found = node_keys.get(obj_key(target_file, path_id))
+                if found is not None:
+                    return {"node": found[0], "cls": found[1]}
+                obj = target_file.objects.get(path_id)
+                kind = ASSET_KINDS.get(obj.type.name) if obj is not None else None
+                if kind == "material":
+                    uid = f"material:{obj.assets_file.name}:{obj.path_id}"
+                    self._material_readers[uid] = obj
+                    return {"asset": uid, "kind": kind}
+                if kind:
+                    return {"asset": self._asset_for(obj, obj.type.name).uid, "kind": kind}
+                return None
+            return resolve
+
         with self.lock:
             for root in self._scene_roots(asset):
                 visit(root, -1, 0)
+            for index, name, reader in pending:
+                try:
+                    props = flatten(reader.read_typetree(), resolver(reader))
+                except Exception as e:
+                    log.debug("Component %s of '%s': %s", name, nodes[index]["name"], e)
+                    continue
+                nodes[index].setdefault("components", []).append({"type": name, "props": props})
         return nodes
 
     def material_details(self, uid):

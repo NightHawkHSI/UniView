@@ -99,3 +99,7 @@ def test_mat_yaml():
 def test_mat_yaml_empty_sections():
     text = um.mat_yaml(um.convert(details("Unlit/Color"), guid))
     assert "m_TexEnvs: []" in text and "stringTagMap: {}" in text and "m_ShaderKeywords: \n" in text
+
+
+def test_number_format():
+    assert [um._num(v) for v in (1.0, 0.5, float("inf"), float("-inf"), float("nan"), 3)] ==         ["1", "0.5", "Infinity", "-Infinity", "NaN", "3"]

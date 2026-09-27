@@ -234,11 +234,34 @@ class MaterialLibrary:
         return unity_path(self.root, path)
 
 
+def component_props(props, asset_paths, root, materials=None):
+    """unity_components.flatten() entries with references turned into what UniViewBuilder.cs loads:
+    "n" (object n of this prefab/scene, s = "GameObject"/"Transform"/component class), "m" (the mesh of
+    the model file s) or "a" (the asset file s). References to things not in the project are dropped."""
+    out = []
+    for e in props:
+        if e["t"] != "ref":
+            out.append(e)
+        elif "node" in e:
+            out.append({"p": e["p"], "t": "n", "n": e["node"], "s": e["cls"]})
+        elif e.get("kind") == "material":
+            path = materials.path_for(e["asset"]) if materials is not None else ""
+            if path:
+                out.append({"p": e["p"], "t": "a", "s": path})
+        else:
+            path = asset_paths.get(e.get("asset"))
+            if path:
+                out.append({"p": e["p"], "t": "m" if e.get("kind") == "mesh" else "a", "s": unity_path(root, path)})
+    return out
+
+
 def prefab_description(nodes, target, model_paths, root, builtin_meshes=None, kind="prefab", materials=None):
     """The JSON UniViewBuilder.cs reads: nodes with their model GLB/OBJ (or built-in mesh) instead of mesh uids."""
     out = []
     for n in nodes:
         model = model_paths.get(n.get("mesh")) or model_paths.get(n.get("terrain"))
+        if model and not model.lower().endswith((".glb", ".obj")):
+            model = None
         builtin = (builtin_meshes or {}).get(n.get("mesh"), "") if not model else ""
         out.append({"name": n["name"], "parent": n["parent"], "active": n["active"],
                     "rendererEnabled": n.get("renderer_enabled", True),
@@ -249,7 +272,9 @@ def prefab_description(nodes, target, model_paths, root, builtin_meshes=None, ki
                     "materials": [materials.path_for(u) for u in n.get("materials") or ()]
                     if materials is not None and (model or builtin) else [],
                     # The game's renderer has no materials, so the game never draws it (collision/helper meshes).
-                    "noMaterials": "materials" in n and not n["materials"] and bool(model or builtin)})
+                    "noMaterials": "materials" in n and not n["materials"] and bool(model or builtin),
+                    "components": [{"type": c["type"], "props": component_props(c["props"], model_paths, root, materials)}
+                                   for c in n.get("components") or ()]})
         light = n.get("light")
         if light:
             out[-1]["light"] = {"present": True, "type": light["type"], "color": [float(c) for c in light["color"]],
@@ -518,8 +543,7 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
     if not (cancelled is not None and cancelled()):
         if progress is not None:
             progress(len(jobs), len(jobs), "prefabs")
-        model_paths = {asset.uid: path for asset, path in jobs
-                       if asset.kind in MODEL_KINDS and os.path.isfile(path)}
+        model_paths = {asset.uid: path for asset, path in jobs if os.path.isfile(path)}  # models, sounds, textures...
         library = MaterialLibrary(session, root, assets_dir, texture_paths) if hasattr(session, "material_details") else None
         prefabs, prefab_failed = write_prefab_descriptions(session, root, assets_dir, model_paths, cancelled, library)
         if progress is not None:
