@@ -154,6 +154,7 @@ class HomePage(QWidget):
 
     open_requested = Signal(str)  # project path
     unload_requested = Signal(str)
+    export_unity_requested = Signal(str)  # project path
     _counted = Signal(str, int)
     _detected = Signal(str, object)
     _compat_fetched = Signal(int)
@@ -635,6 +636,8 @@ class HomePage(QWidget):
         menu.addAction("Open", lambda: self.on_activate(item))
         if self.is_loaded(path):
             menu.addAction("Unload from memory", lambda: self.unload_requested.emit(path))
+        if project.get("engine") == "unity":
+            menu.addAction("Export as Unity project...", lambda: self.export_unity_requested.emit(path))
         menu.addAction("Unpin" if project.get("pinned") else "Pin to top", lambda: self.toggle_pin(project))
         menu.addAction("Notes...", lambda: self.edit_notes(project))
         menu.addAction("Tags...", lambda: self.edit_tags(project))

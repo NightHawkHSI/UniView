@@ -78,6 +78,8 @@ from uniview.ui.dialogs import ExportDialog, PluginsDialog, edit_project_notes, 
 from uniview.ui.home import HomePage
 from uniview.ui.media import AnimationView, AudioView, ImageView, ImageWindow, VideoView
 from uniview.ui.mesh_view import MeshView
+from uniview.ui.unity_export import ask_project_folder, run_export
+from uniview.unity_project import unity_version
 from uniview.util import blank_icon, fmt_size, norm_path, open_path, pil_to_pixmap, safe_filename
 from uniview.workers import Loader, StatsWorker, ThumbnailWorker, meshdata_to_polydata
 
@@ -120,6 +122,7 @@ class MainWindow(QMainWindow):
         self.blank = blank_icon(THUMB_SIZE)
         self.blank_big = blank_icon(GRID_THUMB)
         self.thumb_cache = {}  # key -> QIcon (insertion order = age, capped)
+        self._pending_unity_export = None  # (game path, project folder) waiting for the game to load
         self.thumbs = ThumbnailWorker(GRID_THUMB)
         self.thumbs.ready.connect(self.on_thumbnail)
         self.thumb_timer = QTimer(self, singleShot=True, interval=120)
@@ -265,6 +268,7 @@ class MainWindow(QMainWindow):
         self.home = HomePage(self.store, self.is_loaded, self.settings)
         self.home.open_requested.connect(self.open_project)
         self.home.unload_requested.connect(self.unload_game)
+        self.home.export_unity_requested.connect(self.export_unity_project)
 
         self.pages = QStackedWidget()
         self.pages.addWidget(self.home)
@@ -340,6 +344,29 @@ class MainWindow(QMainWindow):
         self.engine_label.setText(info)
         log.info("Opening game '%s'%s", name, f" ({info})" if info else "")
         self.load(path)
+
+    def export_unity_project(self, path):
+        """Projects page -> right-click a Unity game -> Export as Unity project..."""
+        project = self.store.get(path)
+        name = project["name"] if project else os.path.basename(path)
+        root = ask_project_folder(self, name, self.last_dir)
+        if root is None:
+            return
+        self.last_dir = os.path.dirname(root)
+        if norm_path(path) in self.loaded:
+            self._run_unity_export(path, root)
+            return
+        self._pending_unity_export = (path, root)  # runs when the game has loaded
+        self.open_project(path)
+
+    def _run_unity_export(self, path, root):
+        entry = self.loaded.get(norm_path(path))
+        if entry is None:
+            return
+        session = entry["session"]
+        project = self.store.get(path) or {}
+        version = unity_version(project.get("engine_version"), session.engine_version)
+        run_export(self, session, root, version)
 
     def edit_current_notes(self):
         project = self.current_project()
@@ -604,8 +631,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Loaded {total:,} assets from {session.file_count} file(s)")
         self.grid_dirty = True
         self.apply_filter()
+        pending, self._pending_unity_export = self._pending_unity_export, None
+        if pending is not None and norm_path(pending[0]) == key:
+            QTimer.singleShot(0, lambda: self._run_unity_export(*pending))
 
     def on_load_failed(self, tb):
+        self._pending_unity_export = None
         self.hide_progress()
         self.statusBar().showMessage("Load failed - see the console")
         self.placeholder.setText("Load failed.")
