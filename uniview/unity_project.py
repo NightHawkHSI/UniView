@@ -273,7 +273,8 @@ def prefab_description(nodes, target, model_paths, root, builtin_meshes=None, ki
                     if materials is not None and (model or builtin) else [],
                     # The game's renderer has no materials, so the game never draws it (collision/helper meshes).
                     "noMaterials": "materials" in n and not n["materials"] and bool(model or builtin),
-                    "components": [{"type": c["type"], "props": component_props(c["props"], model_paths, root, materials)}
+                    "components": [{"type": c["type"], "script": c.get("script", ""),
+                                    "props": component_props(c["props"], model_paths, root, materials)}
                                    for c in n.get("components") or ()],
                     "layer": int(n.get("layer", 0)), "tag": n.get("tag", "")})
         light = n.get("light")

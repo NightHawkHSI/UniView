@@ -10,7 +10,7 @@ asset the exporter wrote.
 
 # Handled elsewhere (the tree itself, renderers, terrains) or needing the game's code (scripts).
 SKIP_COMPONENTS = {"Transform", "RectTransform", "MeshFilter", "MeshRenderer", "SkinnedMeshRenderer",
-                   "MonoBehaviour", "Terrain", "TerrainCollider"}
+                   "Terrain", "TerrainCollider"}
 # Bookkeeping fields every object has; they describe the file, not the component.
 SKIP_FIELDS = {"m_GameObject", "m_ObjectHideFlags", "m_CorrespondingSourceObject", "m_PrefabInstance",
                "m_PrefabAsset", "m_PrefabParentObject", "m_PrefabInternal", "m_Script", "m_EditorHideFlags",
@@ -44,7 +44,7 @@ def flatten(tree, resolve):
                     add({"p": path, "t": "ref", **target})
                 return
             for key, item in value.items():
-                if not path and key in SKIP_FIELDS:
+                if not path and (key in SKIP_FIELDS or key.startswith("(")):  # "(text in undecoded data)"
                     continue
                 walk(item, f"{path}.{key}" if path else key, depth + 1)
         elif isinstance(value, (list, tuple)):

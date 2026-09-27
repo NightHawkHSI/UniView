@@ -955,7 +955,8 @@ class UnitySession(GameSession):
           "batch" (static batching: {"mesh": combined mesh uid, "first", "count", "materials": [Material]}),
           "light" ({"type", "color", "intensity", "range", "spot_angle"}), "terrain" (uid of the terrain model),
           "components" ([{"type": Unity class, "props": unity_components.flatten() entries}] for the other
-          built-in components: colliders, rigidbodies, audio sources, cameras, LOD groups...)}],
+          built-in components: colliders, rigidbodies, audio sources, cameras, LOD groups..., and
+          {"type": "MonoBehaviour", "script": "Namespace.Class", "props"} for script components)}],
         in Unity's own space. Optional keys are missing when they don't apply."""
         from .unity_components import ASSET_KINDS, SKIP_COMPONENTS, flatten
         from .unity_scene import _components
@@ -1023,9 +1024,14 @@ class UnitySession(GameSession):
             mesh_ptr = None
             batch = None
             for name, reader in comps:
-                node_keys.setdefault(obj_key(reader.assets_file, reader.path_id), (index, name))
-                if name not in SKIP_COMPONENTS:
+                if name == "MonoBehaviour":
+                    name = script_class(reader) or ""  # a script component is known by its class
+                    if not name:
+                        continue
                     pending.append((index, name, reader))
+                elif name not in SKIP_COMPONENTS:
+                    pending.append((index, name, reader))
+                node_keys.setdefault(obj_key(reader.assets_file, reader.path_id), (index, name))
                 try:
                     if name == "SkinnedMeshRenderer":
                         renderer = reader.read()
@@ -1096,16 +1102,32 @@ class UnitySession(GameSession):
             for root in self._scene_roots(asset):
                 visit(root, -1, 0)
             for index, name, reader in pending:
+                script = reader.type.name == "MonoBehaviour"
                 try:
-                    props = flatten(reader.read_typetree(), resolver(reader))
+                    tree = self._scripts().read(reader)[0] if script else reader.read_typetree()
+                    props = flatten(tree, resolver(reader))
                 except Exception as e:
                     log.debug("Component %s of '%s': %s", name, nodes[index]["name"], e)
                     continue
-                nodes[index].setdefault("components", []).append({"type": name, "props": props})
+                entry = {"type": "MonoBehaviour", "script": name, "props": props} if script else {"type": name, "props": props}
+                nodes[index].setdefault("components", []).append(entry)
         return nodes
 
     def _settings_objects(self):
         return [o for o in self.env.objects if o.type.name in SETTINGS_TYPES + ("BuildSettings", "PlayerSettings")]
+
+    def script_assemblies(self):
+        """Names of the assemblies (e.g. 'Assembly-CSharp.dll') the game's MonoScripts come from."""
+        names = set()
+        with self.lock:
+            for obj in self.env.objects:
+                if obj.type.name == "MonoScript":
+                    try:
+                        names.add(obj.read_typetree().get("m_AssemblyName") or "")
+                    except Exception:
+                        continue
+        names.discard("")
+        return sorted(names)
 
     def tag_name(self, tag_id):
         """A GameObject's m_Tag number as the tag's name (custom tags are 20000 + their index)."""

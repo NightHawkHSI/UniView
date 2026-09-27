@@ -43,6 +43,7 @@ namespace UniView
     public class Comp
     {
         public string type;
+        public string script;  // "Namespace.Class" for MonoBehaviour
         public Prop[] props;
     }
 
@@ -164,7 +165,9 @@ namespace UniView
 
             var parts = new Dictionary<string, Renderer>();
             int prefabs = 0, scenes = 0, failed = 0;
-            valuesSet = valuesSkipped = componentsAdded = componentsFailed = 0;
+            valuesSet = valuesSkipped = componentsAdded = componentsFailed = scriptsAdded = scriptsMissing = 0;
+            missingScripts.Clear();
+            scriptTypes = null;  // scripts may have been added or fixed since the last build
             try
             {
                 for (int i = 0; i < todo.Count; i++)
@@ -192,7 +195,9 @@ namespace UniView
             Debug.Log("UniView: built " + prefabs + " prefab(s) and " + scenes + " scene(s)"
                       + (failed > 0 ? ", " + failed + " failed (see warnings)" : "")
                       + "; components: " + componentsAdded + " added" + (componentsFailed > 0 ? ", " + componentsFailed + " not available" : "")
-                      + ", " + valuesSet + " values set, " + valuesSkipped + " not applicable");
+                      + ", " + valuesSet + " values set, " + valuesSkipped + " not applicable"
+                      + "; scripts: " + scriptsAdded + " attached"
+                      + (scriptsMissing > 0 ? ", " + scriptsMissing + " script classes not in the project (UniView > Add the game's scripts)" : ""));
         }
 
         static Vector3 V(float[] a, Vector3 fallback)
@@ -330,6 +335,29 @@ namespace UniView
         static int valuesSet, valuesSkipped, componentsAdded, componentsFailed;
         static readonly HashSet<string> unknownTypes = new HashSet<string>();
 
+        static Dictionary<string, Type> scriptTypes;
+        static int scriptsAdded, scriptsMissing;
+        static readonly HashSet<string> missingScripts = new HashSet<string>();
+
+        static Type ScriptType(string fullName)
+        {
+            if (scriptTypes == null)
+            {
+                scriptTypes = new Dictionary<string, Type>();
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    Type[] types;
+                    try { types = asm.GetTypes(); } catch (Exception) { continue; }
+                    foreach (Type t in types)
+                        if (typeof(MonoBehaviour).IsAssignableFrom(t) && !t.IsAbstract && !t.IsGenericTypeDefinition
+                            && !scriptTypes.ContainsKey(t.FullName))
+                            scriptTypes[t.FullName] = t;
+                }
+            }
+            Type found;
+            return scriptTypes.TryGetValue(fullName, out found) ? found : null;
+        }
+
         static Type ComponentType(string name)
         {
             if (componentTypes == null)
@@ -361,7 +389,14 @@ namespace UniView
                 var reused = new HashSet<Component>();
                 for (int j = 0; j < comps.Length; j++)
                 {
-                    Type type = ComponentType(comps[j].type);
+                    bool isScript = comps[j].type == "MonoBehaviour";
+                    Type type = isScript ? ScriptType(comps[j].script) : ComponentType(comps[j].type);
+                    if (type == null && isScript)
+                    {
+                        // The game's scripts aren't in the project (or don't compile yet): UniView > Add the game's scripts.
+                        if (missingScripts.Add(comps[j].script)) scriptsMissing++;
+                        continue;
+                    }
                     if (type == null)
                     {
                         if (unknownTypes.Add(comps[j].type)) Debug.LogWarning("UniView: no component type " + comps[j].type + " in this Unity version");
@@ -375,7 +410,8 @@ namespace UniView
                     reused.Add(comp);
                     made[i][j] = comp;
                     componentsAdded++;
-                    string key = i + "|" + comps[j].type;
+                    if (isScript) scriptsAdded++;
+                    string key = i + "|" + (isScript ? comps[j].script : comps[j].type);
                     if (!byNode.ContainsKey(key)) byNode[key] = comp;
                 }
             }
