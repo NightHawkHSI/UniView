@@ -1,18 +1,21 @@
-"""Export as Unity project: GUIDs, .meta files, layout, version."""
+"""Export as Unity project: GUIDs, .meta files, versions, package manifest, models referencing textures."""
 
+import json
 import os
+import struct
 import threading
 
 from PIL import Image
 
-from engines.sdk import Asset
+from engines.sdk import ALBEDO, NORMAL, Asset, Material, MeshData, TextureRef
 from uniview import unity_project as up
 
 
 class Session:
-    def __init__(self, assets):
+    def __init__(self, assets, materials=None):
         self.lock = threading.RLock()
         self.assets = assets
+        self._materials = materials or {}
 
     def image(self, a):
         if a.name == "empty":
@@ -25,6 +28,41 @@ class Session:
     def raw(self, a):
         return b"data"
 
+    def mesh(self, a):
+        if a.name == "lines":
+            raise ValueError("Mesh only has lines/points")
+        return MeshData([[0, 0, 0], [1, 0, 0], [0, 1, 0]], [[[0, 1, 2]]], uvs={"UV0": [[0, 0], [1, 0], [0, 1]]})
+
+    def materials(self, a):
+        return self._materials.get(a.key, [])
+
+    def skeleton(self, a, clip=None):
+        raise NotImplementedError
+
+    def stats(self, a):
+        if a.name == "empty":
+            return {"size": 0, "w": 0, "h": 0}
+        if a.name == "lines":
+            return {"size": 10, "tris": 0}
+        return {"size": 10}
+
+
+def glb_json(path):
+    data = open(path, "rb").read()
+    n = struct.unpack_from("<I", data, 12)[0]
+    return json.loads(data[20:20 + n])
+
+
+def fake_editor(tmp_path, modules=("audio", "ui", "video")):
+    root = tmp_path / "Hub" / "6000.5.4f1" / "Editor"
+    pkgs = root / "Data" / "Resources" / "PackageManager" / "BuiltInPackages"
+    for m in modules:
+        (pkgs / f"com.unity.modules.{m}").mkdir(parents=True)
+    (pkgs / "com.unity.modules.audio.sha1").write_text("x")  # not a package folder name
+    (pkgs / "com.unity.collections").mkdir()                # not a built-in module
+    (root / "Unity.exe").write_text("")
+    return str(root / "Unity.exe")
+
 
 def test_guid_is_stable_and_unity_shaped():
     g = up.asset_guid("sharedassets0.assets:42")
@@ -32,11 +70,45 @@ def test_guid_is_stable_and_unity_shaped():
     assert len(g) == 32 and int(g, 16) >= 0
 
 
-def test_unity_version():
+def test_unity_version_helpers():
     assert up.unity_version("", "2019.4.19f1") == "2019.4.19f1"
     assert up.unity_version("2022.3.62f2", "2019.4.11f1") == "2022.3.62f2"
-    assert up.unity_version("6000.0.23f1") == "6000.0.23f1"
-    assert up.unity_version("5.6.7f1", "Unity 2019", None) == ""  # Unity 5 has no 4-digit year
+    assert up.unity_version("5.6.7f1", "Unity 2019", None) == ""
+    assert up.version_tuple("2019.4.19f1") == (2019, 4, 19) and up.version_tuple("") == ()
+    assert not up.uses_gltf("2019.4.40f1") and up.uses_gltf("2020.3.0f1") and up.uses_gltf("6000.5.4f1")
+    assert up.gltfast_version("6000.0.1f1") == "6.14.1" and up.gltfast_version("2021.3.1f1") == "6.0.1"
+
+
+def test_target_version():
+    installed = {"2021.3.5f1": "a", "6000.5.4f1": "b", "6000.0.30f1": "c"}
+    assert up.target_version("2021.3.5f1", installed) == "2021.3.5f1"   # the game's own, when installed
+    assert up.target_version("2017.4.9f1", installed) == "6000.5.4f1"   # else the newest
+    assert up.target_version("2017.4.9f1", {}) == "2017.4.9f1"          # nothing installed
+
+
+def test_installed_editors(tmp_path):
+    exe = fake_editor(tmp_path)
+    (tmp_path / "Hub" / "junk" / "Editor").mkdir(parents=True)
+    assert up.installed_editors([str(tmp_path / "Hub")]) == {"6000.5.4f1": exe}
+
+
+def test_meta_text_textures_have_serialized_version():
+    assert up.meta_text("ab") == "fileFormatVersion: 2\nguid: ab\n"
+    assert up.meta_text("ab", 1).endswith("TextureImporter:\n  serializedVersion: 4\n  textureType: 1\n")
+
+
+def test_write_manifest(tmp_path):
+    exe = fake_editor(tmp_path)
+    assert up.write_manifest(str(tmp_path / "proj"), exe, "6.14.1")
+    deps = json.load(open(tmp_path / "proj" / "Packages" / "manifest.json"))["dependencies"]
+    assert deps == {"com.unity.cloud.gltfast": "6.14.1", "com.unity.modules.audio": "1.0.0",
+                    "com.unity.modules.ui": "1.0.0", "com.unity.modules.video": "1.0.0"}
+    # a package the user added later survives a re-export
+    json.dump({"dependencies": {**deps, "com.unity.textmeshpro": "3.0.6"}},
+              open(tmp_path / "proj" / "Packages" / "manifest.json", "w"))
+    up.write_manifest(str(tmp_path / "proj"), exe, "6.14.1")
+    assert "com.unity.textmeshpro" in json.load(open(tmp_path / "proj" / "Packages" / "manifest.json"))["dependencies"]
+    assert not up.write_manifest(str(tmp_path / "p2"), None, "6.14.1")
 
 
 def test_plan_skips_builtins_and_unhandled_kinds(tmp_path):
@@ -44,34 +116,60 @@ def test_plan_skips_builtins_and_unhandled_kinds(tmp_path):
               Asset("texture", "wall", 2, source="sharedassets0.assets"),
               Asset("texture", "wall", 3, source="sharedassets0.assets"),
               Asset("model", "crate", 4, source="sharedassets0.assets"),
+              Asset("scene", "Scene: Main", 6, source="level0"),
               Asset("audio", "boom", 5, source="resources.assets", ext="wav")]
     rel = [os.path.relpath(p, tmp_path).replace("\\", "/") for _a, p in up.plan(assets, str(tmp_path))]
     assert rel == ["sharedassets0.assets/Textures/wall.png", "sharedassets0.assets/Textures/wall_2.png",
-                   "resources.assets/Audio/boom.wav"]
+                   "sharedassets0.assets/Models/crate.glb", "resources.assets/Audio/boom.wav"]
+    assert up.plan(assets, str(tmp_path), "obj")[2][1].endswith("crate.obj")
 
 
-def test_export_writes_project(tmp_path):
-    assets = [Asset("texture", "wall", 1, uid="s:1", source="sharedassets0.assets"),
+def test_export_writes_project_with_models(tmp_path):
+    wall = Asset("texture", "wall", "w", uid="s:1", source="sharedassets0.assets")
+    bump = Asset("texture", "wall_n", "n", uid="s:5", source="sharedassets0.assets")
+    crate = Asset("model", "crate", "c", uid="s:6", source="sharedassets1.assets")
+    assets = [wall, bump, crate,
               Asset("texture", "empty", 2, uid="s:2", source="sharedassets0.assets"),
+              Asset("model", "lines", "l", uid="s:7", source="sharedassets1.assets"),
               Asset("audio", "boom", 3, uid="r:3", source="resources.assets", ext="wav"),
               Asset("text", "readme", 4, uid="r:4", source="resources.assets", ext="txt")]
+    mats = {"c": [Material("crate_mat", [TextureRef("_MainTex", "wall", wall, ALBEDO),
+                                         TextureRef("_BumpMap", "wall_n", bump, NORMAL)])]}
+    exe = fake_editor(tmp_path)
     calls = []
-    written, failed = up.export_unity_project(Session(assets), str(tmp_path), "2019.4.19f1",
-                                              progress=lambda d, t, n: calls.append((d, t)))
-    assert (written, failed) == (3, 1)
-    assert calls[-1] == (4, 4)
-    assert open(tmp_path / "ProjectSettings" / "ProjectVersion.txt").read() == "m_EditorVersion: 2019.4.19f1\n"
-    png = tmp_path / "Assets" / "sharedassets0.assets" / "Textures" / "wall.png"
-    assert png.exists()
-    assert open(str(png) + ".meta").read() == f"fileFormatVersion: 2\nguid: {up.asset_guid('s:1')}\n"
-    folder_meta = open(tmp_path / "Assets" / "sharedassets0.assets" / "Textures.meta").read()
-    assert "folderAsset: yes" in folder_meta
-    assert (tmp_path / "Assets" / "sharedassets0.assets.meta").exists()
-    assert not (tmp_path / "Assets.meta").exists()  # Assets/ itself never has a .meta
+    root = tmp_path / "proj"
+    written, failed, skipped = up.export_unity_project(Session(assets, mats), str(root), "6000.5.4f1",
+                                                       progress=lambda d, t, n: calls.append((d, t)), editor_exe=exe)
+    assert (written, failed, skipped) == (5, 0, 2)
+    assert calls[-1] == (7, 7)
+    assert open(root / "ProjectSettings" / "ProjectVersion.txt").read() == "m_EditorVersion: 6000.5.4f1\n"
+    assert "com.unity.cloud.gltfast" in open(root / "Packages" / "manifest.json").read()
+    tex = root / "Assets" / "sharedassets0.assets" / "Textures"
+    assert open(str(tex / "wall.png") + ".meta").read() == up.meta_text(up.asset_guid("s:1"), 0)
+    assert open(str(tex / "wall_n.png") + ".meta").read() == up.meta_text(up.asset_guid("s:5"), 1)  # normal map
+    glb = root / "Assets" / "sharedassets1.assets" / "Models" / "crate.glb"
+    assert open(str(glb) + ".meta").read() == up.meta_text(up.asset_guid("s:6"))
+    gltf = glb_json(glb)
+    uris = [img["uri"] for img in gltf["images"]]
+    assert uris == ["../../sharedassets0.assets/Textures/wall.png", "../../sharedassets0.assets/Textures/wall_n.png"]
+    assert "normalTexture" in gltf["materials"][0]
+    assert "bufferView" not in gltf["images"][0]  # referenced, not embedded
+    assert "folderAsset: yes" in open(root / "Assets" / "sharedassets0.assets" / "Textures.meta").read()
+    assert not (root / "Assets.meta").exists()
+
+
+def test_export_old_unity_uses_obj_without_manifest(tmp_path):
+    assets = [Asset("model", "crate", "c", uid="s:6", source="sharedassets1.assets")]
+    written, failed, _ = up.export_unity_project(Session(assets), str(tmp_path), "2019.4.19f1",
+                                                 editor_exe=fake_editor(tmp_path))
+    models = tmp_path / "Assets" / "sharedassets1.assets" / "Models"
+    assert failed == 0 and (models / "crate.obj").exists()
+    assert (models / "crate.obj.meta").exists()
+    assert not (tmp_path / "Packages").exists()
 
 
 def test_export_cancel(tmp_path):
     assets = [Asset("text", f"t{i}", i, uid=f"t{i}", source="x", ext="txt") for i in range(30)]
-    written, _ = up.export_unity_project(Session(assets), str(tmp_path), cancelled=lambda: True)
+    written, _, _ = up.export_unity_project(Session(assets), str(tmp_path), cancelled=lambda: True)
     assert written == 0
     assert not (tmp_path / "ProjectSettings" / "ProjectVersion.txt").exists()  # no version given

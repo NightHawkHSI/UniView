@@ -26,7 +26,7 @@ def ask_project_folder(parent, game_name, start_dir):
     return root
 
 
-def run_export(parent, session, root, version):
+def run_export(parent, session, root, version, editor_exe=None, game_version=""):
     """Export with a cancellable progress dialog, then offer to open the folder."""
     dlg = QProgressDialog("Exporting as a Unity project...", "Cancel", 0, 0, parent)
     dlg.setWindowTitle("Export as Unity project")
@@ -43,7 +43,8 @@ def run_export(parent, session, root, version):
 
     QApplication.processEvents()
     try:
-        written, failed = export_unity_project(session, root, version, progress, dlg.wasCanceled)
+        written, failed, skipped = export_unity_project(session, root, version, progress, dlg.wasCanceled,
+                                                        editor_exe)
     except Exception as e:
         log.exception("Exporting the Unity project failed")
         dlg.close()
@@ -51,10 +52,12 @@ def run_export(parent, session, root, version):
         return
     cancelled = dlg.wasCanceled()
     dlg.close()
+    made_with = f" (the game was made with {game_version})" if game_version and game_version != version else ""
     text = (f"{'Stopped' if cancelled else 'Done'}: {written:,} file(s) written"
-            + (f", {failed:,} couldn't be exported (see the log)" if failed else "") + f".\n\n{root}\n\n"
-            + (f"Open it with Unity {version} (Unity Hub → Add → this folder). " if version else
-               "Open this folder with Unity Hub (Add → this folder). ")
-            + "A newer Unity version works too; it upgrades the project.\n\nOpen the folder now?")
+            + (f", {failed:,} couldn't be exported (see the log)" if failed else "")
+            + (f", {skipped:,} skipped (no data in the game files)" if skipped else "") + f".\n\n{root}\n\n"
+            + (f"Open it with Unity {version}{made_with}: Unity Hub → Add → this folder." if version else
+               "Open this folder with Unity Hub (Add → this folder).")
+            + "\nThe first time, Unity takes a while to import everything.\n\nOpen the folder now?")
     if QMessageBox.question(parent, "Export as Unity project", text) == QMessageBox.Yes:
         open_path(root)

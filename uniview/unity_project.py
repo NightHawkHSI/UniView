@@ -1,23 +1,37 @@
 """Export a loaded Unity game as a Unity project folder that opens in the Unity editor. No Qt here.
 
 Layout: Assets/<game folder layout>/... with a .meta per file, ProjectSettings/ProjectVersion.txt
-set to the game's Unity version. GUIDs are derived from each asset's uid, so exporting the same game
-again gives the same GUIDs and references (materials -> textures, prefabs -> meshes) stay valid.
+set to the Unity version the project is meant for. GUIDs are derived from each asset's uid, so
+exporting the same game again gives the same GUIDs and references (model -> texture) stay valid.
+
+Models are GLB files read by Unity's glTFast package (added to Packages/manifest.json) when the
+project targets Unity 2020.3 or newer, else OBJ + MTL. GLBs reference the project's PNG textures
+instead of carrying copies.
 """
 
+import glob
 import hashlib
+import json
 import os
 import re
 
+from engines.sdk import NORMAL
 from uniview.constants import log
-from uniview.export import export_ext, export_stem, export_subfolder, write_asset
+from uniview.export import (export_ext, export_stem, export_subfolder, rig_for_export, session_materials,
+                            write_asset, write_glb, write_obj)
+from uniview.search import is_unreadable
 
-# Kinds copied as plain files in this version of the exporter.
 FILE_KINDS = ("texture", "audio", "text", "font", "video")
+MODEL_KINDS = ("model",)
 # Unity's own built-in resources: every Unity install has them already.
 BUILTIN_SOURCES = ("unity default resources", "unity_builtin_extra")
 VERSION_RE = re.compile(r"^\d{4}\.\d+\.\d+[abfp]\d+$|^\d{4}\.\d+\.\d+$")
+HUB_EDITORS = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Unity", "Hub", "Editor")
+GLTFAST_MIN = (2020, 3)
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tga")
 
+
+# --------------------------------------------------------------------------- versions
 
 def asset_guid(uid):
     """Stable 32-hex-digit Unity GUID for an asset."""
@@ -33,10 +47,64 @@ def unity_version(*candidates):
     return ""
 
 
-def write_meta(path, guid):
-    """Minimal .meta next to `path`; Unity fills in the importer settings with its defaults."""
+def version_tuple(version):
+    """'2019.4.19f1' -> (2019, 4, 19); '' -> ()."""
+    return tuple(int(n) for n in re.findall(r"\d+", version)[:3])
+
+
+def installed_editors(hub_dirs=None):
+    """{version: Unity.exe} of the editors installed through Unity Hub."""
+    dirs = list(hub_dirs) if hub_dirs is not None else [HUB_EDITORS] + _hub_secondary_dirs()
+    found = {}
+    for base in dirs:
+        for exe in glob.glob(os.path.join(base, "*", "Editor", "Unity.exe")):
+            version = os.path.basename(os.path.dirname(os.path.dirname(exe)))
+            if VERSION_RE.match(version):
+                found[version] = exe
+    return found
+
+
+def _hub_secondary_dirs():
+    try:
+        with open(os.path.join(os.environ.get("APPDATA", ""), "UnityHub", "secondaryInstallPath.json"),
+                  encoding="utf-8") as f:
+            path = json.load(f)
+        return [path] if isinstance(path, str) and path else []
+    except (OSError, ValueError):
+        return []
+
+
+def target_version(game_version, installed):
+    """The Unity version to set up the project for: the game's own if it's installed, else the newest
+    installed editor (it upgrades the project), else the game's."""
+    if game_version in installed or not installed:
+        return game_version
+    return max(installed, key=version_tuple)
+
+
+def uses_gltf(version):
+    return version_tuple(version) >= GLTFAST_MIN
+
+
+def gltfast_version(version):
+    return "6.14.1" if version_tuple(version) >= (6000,) else "6.0.1"
+
+
+# --------------------------------------------------------------------------- project files
+
+def meta_text(guid, texture_type=None):
+    """A minimal .meta; Unity fills in the rest. Textures need serializedVersion, else Unity reads the
+    settings as a very old format and imports them as cubemaps."""
+    text = f"fileFormatVersion: 2\nguid: {guid}\n"
+    if texture_type is not None:
+        text += f"TextureImporter:\n  serializedVersion: 4\n  textureType: {texture_type}\n"
+    return text
+
+
+def write_meta(path, guid, normal_map=False):
+    is_image = path.lower().endswith(IMAGE_EXTS)
     with open(path + ".meta", "w", encoding="utf-8", newline="\n") as f:
-        f.write(f"fileFormatVersion: 2\nguid: {guid}\n")
+        f.write(meta_text(guid, (1 if normal_map else 0) if is_image else None))
 
 
 def write_folder_metas(assets_dir, folder):
@@ -59,17 +127,42 @@ def write_project_settings(root, version):
             f.write(f"m_EditorVersion: {version}\n")
 
 
+def write_manifest(root, editor_exe, gltfast):
+    """Packages/manifest.json: every built-in module the editor ships (as Unity's own default) plus glTFast.
+    Without an editor to read the module list from, Unity's default manifest is left alone."""
+    builtin = os.path.join(os.path.dirname(editor_exe or ""), "Data", "Resources", "PackageManager", "BuiltInPackages")
+    if not editor_exe or not os.path.isdir(builtin):
+        return False
+    modules = sorted(n for n in os.listdir(builtin)
+                     if n.startswith("com.unity.modules.") and "." not in n[len("com.unity.modules."):])
+    deps = {m: "1.0.0" for m in modules}
+    deps["com.unity.cloud.gltfast"] = gltfast
+    path = os.path.join(root, "Packages", "manifest.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.isfile(path):  # keep packages the user added to an earlier export
+        try:
+            with open(path, encoding="utf-8") as f:
+                deps = {**json.load(f).get("dependencies", {}), **deps}
+        except (OSError, ValueError, AttributeError):
+            pass
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"dependencies": dict(sorted(deps.items()))}, f, indent=2)
+    return True
+
+
+# --------------------------------------------------------------------------- exporting
+
 def exportable(asset):
-    return asset.kind in FILE_KINDS and asset.source not in BUILTIN_SOURCES
+    return asset.kind in FILE_KINDS + MODEL_KINDS and asset.source not in BUILTIN_SOURCES
 
 
-def plan(assets, assets_dir):
+def plan(assets, assets_dir, model_format="glb"):
     """[(asset, target path)] for the files to write, with unique names per folder."""
     out, used = [], set()
     for asset in assets:
         if not exportable(asset):
             continue
-        ext = export_ext(asset)
+        ext = export_ext(asset, model_format)
         folder = os.path.normpath(os.path.join(assets_dir, export_subfolder(asset)))
         base = export_stem(asset, ext)
         name, i = base, 1
@@ -81,29 +174,77 @@ def plan(assets, assets_dir):
     return out
 
 
-def export_unity_project(session, root, version="", progress=None, cancelled=None):
-    """Write the project; returns (files written, failed count). progress(done, total, text) is called
-    now and then; cancelled() -> True stops early."""
+def _write_model(session, asset, path, texture_paths, normal_keys):
+    """GLB (textures referenced) or OBJ; returns the files written. Collects normal-map textures."""
+    with session.lock:
+        md = session.mesh(asset)
+        materials = session_materials(session, asset)
+        for mat in materials:
+            normal_keys.update(t.asset.key for t in mat.textures if t.role == NORMAL)
+        if not path.lower().endswith(".glb"):
+            return write_obj(session, md, materials, path)
+        folder = os.path.dirname(path)
+
+        def image_uri(tex_asset):
+            target = texture_paths.get(tex_asset.key)
+            return os.path.relpath(target, folder).replace("\\", "/") if target else None
+
+        return write_glb(session, md, materials, path, rig=rig_for_export(session, asset, md),
+                         image_uri=image_uri, normal_maps=True)
+
+
+def _skippable(session, asset):
+    """Nothing to export (e.g. a texture the game only fills in while running)?"""
+    try:
+        with session.lock:
+            stats = session.stats(asset)
+    except Exception:
+        return False
+    return is_unreadable(stats) or (asset.kind in MODEL_KINDS and not stats.get("tris"))
+
+
+def export_unity_project(session, root, version="", progress=None, cancelled=None, editor_exe=None):
+    """Write the project; returns (files written, failed, skipped). progress(done, total, text) is called
+    now and then; cancelled() -> True stops early. editor_exe: the Unity.exe the project is for (its
+    module list goes into the package manifest)."""
     assets_dir = os.path.join(root, "Assets")
     os.makedirs(assets_dir, exist_ok=True)
     write_project_settings(root, version)
-    jobs = plan(session.assets, assets_dir)
-    log.info("Exporting %d asset(s) as a Unity %s project to %s", len(jobs), version or "(unknown version)", root)
-    written = failed = 0
+    gltf = uses_gltf(version)
+    if gltf and not write_manifest(root, editor_exe, gltfast_version(version)):
+        log.warning("No Unity editor to read the package list from: models are saved as OBJ")
+        gltf = False
+    jobs = plan(session.assets, assets_dir, "glb" if gltf else "obj")
+    texture_paths = {a.key: p for a, p in jobs if a.kind == "texture"}
+    # Models first: they tell which textures are normal maps (their .meta says so).
+    jobs.sort(key=lambda job: job[0].kind not in MODEL_KINDS)
+    normal_keys = set()
+    log.info("Exporting %d asset(s) as a Unity %s project to %s (models as %s)", len(jobs),
+             version or "(unknown version)", root, "GLB" if gltf else "OBJ")
+    written = failed = skipped = 0
     for n, (asset, path) in enumerate(jobs, 1):
         if cancelled is not None and cancelled():
             log.info("Unity project export cancelled after %d file(s)", written)
             break
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            for out in write_asset(session, asset, path):
-                write_meta(out, asset_guid(asset.uid))
+            if asset.kind in MODEL_KINDS:
+                files = _write_model(session, asset, path, texture_paths, normal_keys)
+            else:
+                files = write_asset(session, asset, path)
+            for out in files:
+                guid = asset_guid(asset.uid if out == path or len(files) == 1 else f"{asset.uid}:{os.path.basename(out)}")
+                write_meta(out, guid, normal_map=asset.key in normal_keys)
                 write_folder_metas(assets_dir, os.path.dirname(out))
                 written += 1
         except Exception as e:
-            failed += 1
-            log.warning("Could not export %s '%s': %s", asset.kind, asset.name, e)
+            if _skippable(session, asset):
+                skipped += 1
+                log.debug("Skipped %s '%s': %s", asset.kind, asset.name, e)
+            else:
+                failed += 1
+                log.warning("Could not export %s '%s': %s", asset.kind, asset.name, e)
         if progress is not None and (n % 10 == 0 or n == len(jobs)):
             progress(n, len(jobs), asset.name)
-    log.info("Unity project: %d file(s) written, %d failed", written, failed)
-    return written, failed
+    log.info("Unity project: %d file(s) written, %d failed, %d skipped", written, failed, skipped)
+    return written, failed, skipped

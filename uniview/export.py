@@ -41,11 +41,13 @@ def display_texture(md, materials):
             return tex.asset
     return main_texture(materials)
 
-def write_glb(session, md, materials, path, rig=None, animation=None):
+def write_glb(session, md, materials, path, rig=None, animation=None, image_uri=None, normal_maps=False):
     """Binary glTF: positions, normals, UVs, vertex colors and embedded base-color textures.
 
     One primitive per submesh, each with its material. Opens directly in Blender.
     rig / animation (see GameSession.skeleton): adds the skeleton, the skin weights and an animation.
+    image_uri(texture Asset) -> relative path/URI: reference that image file instead of embedding a copy
+    (None -> embed as usual). normal_maps: also add each material's normal map.
     """
     count = len(md.points)
     buf, views, accessors = bytearray(), [], []
@@ -89,17 +91,16 @@ def write_glb(session, md, materials, path, rig=None, animation=None):
         attributes["WEIGHTS_0"] = add_accessor(np.asarray(rig["weights_0"], np.float32), "VEC4")
 
     gl_materials, images, textures, texture_index, mat_index = [], [], [], {}, {}
-    for mat in materials:
-        entry = {"name": mat.name or "material", "doubleSided": True,
-                 "pbrMetallicRoughness": {"metallicFactor": 0.0, "roughnessFactor": 1.0}}
-        if mat.color is not None:
-            entry["pbrMetallicRoughness"]["baseColorFactor"] = [min(1.0, max(0.0, float(c)))
-                                                                for c in (list(mat.color) + [1.0])[:4]]
-        tex = mat.main_texture()
-        if tex is not None:
-            key = tex.asset.key
-            if key not in texture_index:
-                texture_index[key] = None
+
+    def texture(tex):
+        """glTF texture index for a TextureRef (referenced or embedded once), or None if it can't be read."""
+        key = tex.asset.key
+        if key not in texture_index:
+            texture_index[key] = None
+            uri = image_uri(tex.asset) if image_uri is not None else None
+            if uri:  # an image file next to the model: reference it
+                images.append({"uri": uri, "name": tex.name or "texture"})
+            else:
                 try:
                     png = io.BytesIO()
                     with session.lock:
@@ -107,12 +108,25 @@ def write_glb(session, md, materials, path, rig=None, animation=None):
                     img.convert("RGBA").save(png, "PNG")
                     images.append({"bufferView": add_view(png.getvalue()), "mimeType": "image/png",
                                    "name": tex.name or "texture"})
-                    textures.append({"source": len(images) - 1, "sampler": 0})
-                    texture_index[key] = len(textures) - 1
                 except Exception as e:
                     log.warning("Could not embed a texture in %s: %s", os.path.basename(path), e)
-            if texture_index[key] is not None:
-                entry["pbrMetallicRoughness"]["baseColorTexture"] = {"index": texture_index[key]}
+            if len(images) > len(textures):
+                textures.append({"source": len(images) - 1, "sampler": 0})
+                texture_index[key] = len(textures) - 1
+        return texture_index[key]
+
+    for mat in materials:
+        entry = {"name": mat.name or "material", "doubleSided": True,
+                 "pbrMetallicRoughness": {"metallicFactor": 0.0, "roughnessFactor": 1.0}}
+        if mat.color is not None:
+            entry["pbrMetallicRoughness"]["baseColorFactor"] = [min(1.0, max(0.0, float(c)))
+                                                                for c in (list(mat.color) + [1.0])[:4]]
+        tex = mat.main_texture()
+        if tex is not None and texture(tex) is not None:
+            entry["pbrMetallicRoughness"]["baseColorTexture"] = {"index": texture(tex)}
+        normal = next((t for t in mat.textures if t.role == NORMAL), None) if normal_maps else None
+        if normal is not None and texture(normal) is not None:
+            entry["normalTexture"] = {"index": texture(normal)}
         mat_index[id(mat)] = len(gl_materials)
         gl_materials.append(entry)
 

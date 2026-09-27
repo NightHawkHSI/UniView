@@ -79,7 +79,7 @@ from uniview.ui.home import HomePage
 from uniview.ui.media import AnimationView, AudioView, ImageView, ImageWindow, VideoView
 from uniview.ui.mesh_view import MeshView
 from uniview.ui.unity_export import ask_project_folder, run_export
-from uniview.unity_project import unity_version
+from uniview.unity_project import installed_editors, target_version, unity_version
 from uniview.util import blank_icon, fmt_size, norm_path, open_path, pil_to_pixmap, safe_filename
 from uniview.workers import Loader, StatsWorker, ThumbnailWorker, meshdata_to_polydata
 
@@ -365,8 +365,10 @@ class MainWindow(QMainWindow):
             return
         session = entry["session"]
         project = self.store.get(path) or {}
-        version = unity_version(project.get("engine_version"), session.engine_version)
-        run_export(self, session, root, version)
+        game_version = unity_version(project.get("engine_version"), session.engine_version)
+        editors = installed_editors()
+        version = target_version(game_version, editors)
+        run_export(self, session, root, version, editors.get(version), game_version)
 
     def edit_current_notes(self):
         project = self.current_project()
