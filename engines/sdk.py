@@ -320,7 +320,11 @@ class Progress:
         self.options: dict[str, Any] = dict(options or {})
 
     def __call__(self, text: str, done: int = 0, total: int = 0) -> None:
-        """Status text, plus done/total for a progress bar (total 0 = busy animation)."""
+        """Status text, plus done/total for a progress bar.
+
+        progress("Listing files ...") alone shows a moving 'busy' bar (total 0 = length unknown);
+        progress("Reading data 3/10", 3, 10) fills it.
+        """
         self._text(text)
         self._value(done, total)
 

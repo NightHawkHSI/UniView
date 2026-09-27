@@ -444,6 +444,7 @@ class MainWindow(QMainWindow):
 
     # ---- progress
     def set_progress(self, done, total):
+        """Progress bars at done/total; total 0 means 'busy, no idea how long' (moving bar)."""
         for bar in (self.progress, self.load_bar):
             if total <= 0:
                 bar.setRange(0, 0)  # busy animation
@@ -451,6 +452,9 @@ class MainWindow(QMainWindow):
                 bar.setRange(0, total)
                 bar.setValue(done)
             bar.show()
+
+    def show_busy(self):
+        self.set_progress(0, 0)
 
     def hide_progress(self):
         self.progress.hide()
@@ -505,7 +509,7 @@ class MainWindow(QMainWindow):
                                 + ", ".join(p.name for p in engines.plugins())
                                 + "\n\nSee Help \u2192 Engine plugins to add one.")
             return
-        self.set_progress(0, 0)
+        self.show_busy()
         self.thread = QThread()
         options = project_options(project, plugin) if project else {}
         self.loader = Loader(path, plugin, options)

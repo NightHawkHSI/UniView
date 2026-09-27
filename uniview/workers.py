@@ -12,6 +12,7 @@ from PySide6.QtGui import QImage
 
 from engines.sdk import KIND_LABELS, Progress
 from uniview.constants import log
+from uniview.jobs import JobQueue
 from uniview.util import pil_to_qimage
 
 
@@ -33,7 +34,7 @@ class Loader(QObject):
         try:
             started = time.time()
             log.info("Opening %s with the %s plugin", self.path, self.plugin.name)
-            self.progress_value.emit(0, 0)
+            self.progress_value.emit(0, 0)  # busy until the plugin reports numbers
             session = self.plugin.open(self.path, Progress(self.progress.emit, self.progress_value.emit, self.options))
             self.progress.emit("Sorting ...")
             session.assets.sort(key=lambda a: a.name.lower())
@@ -115,32 +116,22 @@ class ThumbnailWorker(QObject):
     def __init__(self, size):
         super().__init__()
         self.size = size
-        self._priority = []
-        self._visible = []
-        self._cv = threading.Condition()
-        threading.Thread(target=self._run, daemon=True).start()
+        self._jobs = JobQueue()
+        threading.Thread(target=self._run, daemon=True, name="thumbnails").start()
 
     def request_visible(self, jobs):
-        """Replace the list jobs (only what's on screen matters)."""
-        with self._cv:
-            self._visible = list(jobs)
-            self._cv.notify()
+        """Replace the list jobs (only what's on screen matters). A job is (key, session, asset)."""
+        self._jobs.replace(jobs)
 
     def request_priority(self, jobs):
-        with self._cv:
-            self._priority = list(jobs) + self._priority
-            self._cv.notify()
+        self._jobs.put_urgent(jobs)
 
     def clear(self):
-        with self._cv:
-            self._priority, self._visible = [], []
+        self._jobs.clear()
 
     def _run(self):
         while True:
-            with self._cv:
-                while not self._priority and not self._visible:
-                    self._cv.wait()
-                key, session, asset = (self._priority or self._visible).pop(0)
+            _gen, [(key, session, asset)] = self._jobs.take()
             try:
                 qimg = pil_to_qimage(make_thumbnail(session, asset, self.size))
             except Exception as e:
@@ -151,6 +142,7 @@ class ThumbnailWorker(QObject):
             except RuntimeError:
                 return  # window closed
 
+
 class StatsWorker(QObject):
     """Background thread that measures every asset (tris, pixel size, bytes) for sort/filter."""
 
@@ -158,24 +150,16 @@ class StatsWorker(QObject):
 
     def __init__(self):
         super().__init__()
-        self._jobs = []
-        self._gen = 0
-        self._cv = threading.Condition()
+        self._jobs = JobQueue()
         threading.Thread(target=self._run, daemon=True, name="asset-stats").start()
 
     def start(self, jobs):
-        with self._cv:
-            self._gen += 1
-            self._jobs = list(jobs)
-            self._cv.notify()
+        """Measure these (key, session, asset) jobs instead of any still waiting; [] just cancels."""
+        self._jobs.replace(jobs, cancel=True)
 
     def _run(self):
         while True:
-            with self._cv:
-                while not self._jobs:
-                    self._cv.wait()
-                gen = self._gen
-                batch_jobs, self._jobs = self._jobs[:40], self._jobs[40:]
+            gen, batch_jobs = self._jobs.take(40)
             batch = []
             for key, session, asset in batch_jobs:
                 try:
@@ -188,10 +172,9 @@ class StatsWorker(QObject):
                     log.debug("No stats for %s '%s': %s", asset.kind, asset.name, e)
                     batch.append((key, {"size": asset.size, "info": "?", "sort": -1}))
                 time.sleep(0)  # hand the GIL to the window thread if it's waiting (keeps the UI smooth)
-            with self._cv:
-                if gen != self._gen:
-                    continue  # a different game was opened meanwhile
-                remaining = len(self._jobs)
+            remaining = self._jobs.pending_if_current(gen)
+            if remaining is None:
+                continue  # a different game was opened meanwhile
             try:
                 self.ready.emit(batch, remaining)
             except RuntimeError:
