@@ -876,9 +876,6 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
                     log.info(note)
                     if notes is not None:
                         notes.append(note)
-                elif code_files and notes is not None:
-                    notes.append(f"The game's code is in the project as {code_files:,} decompiled C# files, not "
-                                 "compiled yet: in Unity use UniView \u2192 Add the game's scripts.")
             except Exception as e:
                 failed += 1
                 log.warning("Could not export the game's scripts: %s", e)

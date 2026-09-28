@@ -854,8 +854,10 @@ class MainWindow(QMainWindow):
         self.show_asset(data)
 
     def show_asset(self, asset):
-        self.current = asset
         session = self.session
+        if session is None:  # a leftover selection while another game is opening
+            return
+        self.current = asset
         self.audio_view.stop()
         self.video_view.stop()
         self.flipbook_timer.stop()

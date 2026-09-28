@@ -235,9 +235,9 @@ namespace UniView
         static void BuildMissingIfAny()
         {
             if (EditorApplication.isPlayingOrWillChangePlaymode) return;
-            if (File.Exists(RebuildMarker) && Directory.Exists(ScriptsActive))
+            if (File.Exists(RebuildMarker) && (Directory.Exists(ScriptsActive) || Directory.Exists(CodeActive)))
             {
-                // The game's scripts were just added and compile: build again so the script components get attached.
+                // The game's code was just swapped and compiles: build again so the script components get attached.
                 File.Delete(RebuildMarker);
                 Debug.Log("UniView: the game's scripts compiled - rebuilding prefabs and scenes with their script components");
                 RebuildAll();
@@ -266,14 +266,51 @@ namespace UniView
                 return;
             }
             if (!Application.isBatchMode && !EditorUtility.DisplayDialog("UniView",
-                "Move the game's decompiled code into " + ScriptsActive + " so Unity compiles it?\n\n"
-                + "Decompiled code often needs fixes before it compiles. If there are errors, fix them, or use "
-                + "UniView > Remove the game's scripts to go back. Once it compiles, the prefabs and scenes are "
-                + "rebuilt with their script components.", "Add scripts", "Cancel")) return;
+                "Swap the game's compiled code for its decompiled source (moved into " + ScriptsActive + ")?\n\n"
+                + "Only needed to read or change the code in the editor: the compiled code already gives the prefabs "
+                + "their script components. Decompiled code often needs fixes before it compiles. If there are "
+                + "errors, fix them, or use UniView > Remove the game's scripts to go back. Once it compiles, the "
+                + "prefabs and scenes are rebuilt with the source's script components.", "Swap in source", "Cancel")) return;
+            // The source replaces the compiled assemblies it came from (same names would clash); it can use the others.
+            if (Directory.Exists(CodeActive))
+            {
+                Directory.CreateDirectory(CodeParked);
+                foreach (string dir in Directory.GetDirectories(ScriptsParked))
+                    MoveFileWithMeta(CodeActive + "/" + Path.GetFileName(dir) + ".dll", CodeParked);
+                SetExplicitlyReferenced(false);
+            }
             Directory.Move(ScriptsParked, ScriptsActive);
             if (File.Exists(ScriptsParked + ".meta")) File.Delete(ScriptsParked + ".meta");
             File.WriteAllText(RebuildMarker, "UniView: rebuild prefabs and scenes once the game's scripts compile.\n");
             AssetDatabase.Refresh();
+        }
+
+        const string CodeActive = "Assets/UniView/GameCode";   // the game's compiled assemblies
+        const string CodeParked = "Assets/UniView/GameCode~";  // the ones swapped out for source
+
+        static void MoveFileWithMeta(string file, string folder)
+        {
+            if (!File.Exists(file)) return;
+            string target = folder + "/" + Path.GetFileName(file);
+            if (File.Exists(target)) File.Delete(target);
+            File.Move(file, target);
+            if (File.Exists(file + ".meta"))
+            {
+                if (File.Exists(target + ".meta")) File.Delete(target + ".meta");
+                File.Move(file + ".meta", target + ".meta");
+            }
+        }
+
+        static void SetExplicitlyReferenced(bool on)
+        {
+            // Decompiled source compiles into Assembly-CSharp, which only sees auto-referenced plugins.
+            if (!Directory.Exists(CodeActive)) return;
+            foreach (string meta in Directory.GetFiles(CodeActive, "*.dll.meta"))
+            {
+                string text = File.ReadAllText(meta);
+                File.WriteAllText(meta, text.Replace("isExplicitlyReferenced: " + (on ? 0 : 1),
+                                                     "isExplicitlyReferenced: " + (on ? 1 : 0)));
+            }
         }
 
         [MenuItem("UniView/Add the game's scripts (decompiled)", true)]
@@ -285,9 +322,15 @@ namespace UniView
             if (!Directory.Exists(ScriptsActive)) return;
             Directory.Move(ScriptsActive, ScriptsParked);
             if (File.Exists(ScriptsActive + ".meta")) File.Delete(ScriptsActive + ".meta");
-            if (File.Exists(RebuildMarker)) File.Delete(RebuildMarker);
+            if (Directory.Exists(CodeParked))
+            {
+                foreach (string file in Directory.GetFiles(CodeParked, "*.dll")) MoveFileWithMeta(file, CodeActive);
+                SetExplicitlyReferenced(true);
+                File.WriteAllText(RebuildMarker, "UniView: rebuild prefabs and scenes with the compiled code.\n");
+            }
+            else if (File.Exists(RebuildMarker)) File.Delete(RebuildMarker);
             AssetDatabase.Refresh();
-            Debug.Log("UniView: the game's scripts were moved back to " + ScriptsParked + " (not compiled)");
+            Debug.Log("UniView: the game's scripts were moved back to " + ScriptsParked + " (the compiled code is used again)");
         }
 
         [MenuItem("UniView/Remove the game's scripts", true)]
@@ -788,6 +831,14 @@ namespace UniView
         static int scriptsAdded, scriptsMissing;
         static readonly HashSet<string> missingScripts = new HashSet<string>();
 
+        static Type[] LoadableTypes(System.Reflection.Assembly asm)
+        {
+            // A game assembly built for an old Unity has a few types that use removed APIs; keep the rest.
+            try { return asm.GetTypes(); }
+            catch (System.Reflection.ReflectionTypeLoadException e) { return Array.FindAll(e.Types, t => t != null); }
+            catch (Exception) { return new Type[0]; }
+        }
+
         static Type ScriptType(string fullName)
         {
             if (scriptTypes == null)
@@ -795,9 +846,7 @@ namespace UniView
                 scriptTypes = new Dictionary<string, Type>();
                 foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
                 {
-                    Type[] types;
-                    try { types = asm.GetTypes(); } catch (Exception) { continue; }
-                    foreach (Type t in types)
+                    foreach (Type t in LoadableTypes(asm))
                         if ((typeof(MonoBehaviour).IsAssignableFrom(t) || typeof(ScriptableObject).IsAssignableFrom(t))
                             && !t.IsAbstract && !t.IsGenericTypeDefinition && !scriptTypes.ContainsKey(t.FullName))
                             scriptTypes[t.FullName] = t;
@@ -814,9 +863,7 @@ namespace UniView
                 componentTypes = new Dictionary<string, Type>();
                 foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
                 {
-                    Type[] types;
-                    try { types = asm.GetTypes(); } catch (Exception) { continue; }
-                    foreach (Type t in types)
+                    foreach (Type t in LoadableTypes(asm))
                         if (typeof(Component).IsAssignableFrom(t) && t.Namespace != null && t.Namespace.StartsWith("UnityEngine")
                             && !componentTypes.ContainsKey(t.Name))
                             componentTypes[t.Name] = t;

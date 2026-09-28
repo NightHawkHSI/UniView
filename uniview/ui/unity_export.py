@@ -85,12 +85,13 @@ def run_export(parent, session, root, version, editor_exe=None, game_version="")
 
     threading.Thread(target=work, name="unity-export", daemon=True).start()
     loop.exec()
+    cancelled = stop.is_set()  # before close(): closing the dialog emits canceled
+    dlg.canceled.disconnect(stop.set)
     dlg.close()
     if outcome["error"] is not None:
         QMessageBox.warning(parent, "Export as Unity project", str(outcome["error"]))
         return
     written, failed, skipped = outcome["result"]
-    cancelled = stop.is_set()
     made_with = f" (the game was made with {game_version})" if game_version and game_version != version else ""
     text = (f"{'Stopped' if cancelled else 'Done'}: {written:,} file(s) written"
             + (f", {failed:,} couldn't be exported (see the log)" if failed else "")

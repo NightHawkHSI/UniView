@@ -74,3 +74,23 @@ def test_decompile_can_be_cancelled(tmp_path):
     with pytest.raises(RuntimeError, match="stopped"):
         decompile(slow, "x.dll", str(tmp_path / "out"), str(tmp_path), cancelled=lambda: True)
     assert time.monotonic() - start < 5
+
+
+def test_looks_obfuscated(tmp_path):
+    from uniview.unity_scripts import looks_obfuscated
+
+    plain, scrambled = tmp_path / "plain", tmp_path / "scrambled"
+    plain.mkdir()
+    scrambled.mkdir()
+    for i in range(30):
+        (plain / f"PlayerControllerInputHandler{i}.cs").write_text("")
+        (scrambled / (["rZkCodHxnHDKLfTEpwBxOzVzYX", "--q0c5djtfUkEKlWOvR1l6PUq-"][i % 2] + f"{i}.cs")).write_text("")
+    assert not looks_obfuscated(str(plain))
+    assert looks_obfuscated(str(scrambled))
+
+
+def test_plugin_meta_is_explicit_and_unvalidated():
+    from uniview.unity_scripts import plugin_meta
+
+    meta = plugin_meta("0" * 32)
+    assert "PluginImporter:" in meta and "isExplicitlyReferenced: 1" in meta and "validateReferences: 0" in meta
