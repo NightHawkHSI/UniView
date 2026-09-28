@@ -150,6 +150,8 @@ def write_manifest(root, editor_exe, gltfast, extra=None):
     deps = {m: "1.0.0" for m in modules}
     deps["com.unity.cloud.gltfast"] = gltfast
     deps.update(extra or {})  # the Unity packages the game was built with (UI, TextMeshPro, Timeline...)
+    if os.path.isdir(os.path.join(builtin, "com.unity.2d.sprite")):
+        deps.setdefault("com.unity.2d.sprite", "1.0.0")  # UniViewBuilder.cs cuts sprite sheets with it
     path = os.path.join(root, "Packages", "manifest.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if os.path.isfile(path):  # keep packages the user added to an earlier export
@@ -255,6 +257,10 @@ def component_props(props, asset_paths, root, materials=None, prefab_objects=Non
             out.append(e)
         elif "node" in e:
             out.append({"p": e["p"], "t": "n", "n": e["node"], "s": e["cls"]})
+        elif e.get("kind") == "sprite":
+            found = (prefab_objects or {}).get(e["asset"])  # sprite uid -> (texture file, sprite name)
+            if found:
+                out.append({"p": e["p"], "t": "a", "s": found[0], "c": "Sprite", "q": found[1]})
         elif e.get("kind") == "gameobject":
             found = (prefab_objects or {}).get(e["asset"])
             if found:
@@ -495,6 +501,171 @@ def plan_data(assets, assets_dir):
     return out
 
 
+def write_sprites_description(session, root, assets_dir, model_paths):
+    """Assets/UniView/Build/Sprites.json: which exported textures are sprites / sprite sheets, and where each sprite
+    is. Returns {sprite uid: (texture file, sprite name)} for links to sprites."""
+    if not hasattr(session, "sprite_sheets"):
+        return {}
+    links, sheets = {}, []
+    for sheet in session.sprite_sheets():
+        path = model_paths.get(sheet["texture"].uid)
+        if not path or not path.lower().endswith(".png"):
+            continue
+        used, sprites = set(), []
+        for sp in sheet["sprites"]:
+            name, i = sp["name"], 1
+            while name.lower() in used:
+                i += 1
+                name = f"{sp['name']}_{i}"
+            used.add(name.lower())
+            sprites.append({"name": name, "rect": sp["rect"], "pivot": sp["pivot"], "border": sp["border"]})
+            links[sp["uid"]] = (unity_path(root, path), name)
+        sheets.append({"texture": unity_path(root, path), "ppu": sheet["sprites"][0]["ppu"], "sprites": sprites})
+    if sheets:
+        desc = {"version": 1, "kind": "sprites", "target": "", "sheets": sheets, "nodes": []}
+        out = os.path.join(assets_dir, *BUILD_DIR, "Sprites.json")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(desc, f, separators=(",", ":"))
+        write_meta(out, asset_guid("uniview:sprites"))
+        write_folder_metas(assets_dir, os.path.dirname(out))
+        log.info("Sprites: %d in %d texture(s)", len(links), len(sheets))
+    return links
+
+
+def plan_clips(assets, assets_dir):
+    """[(animation clip asset, target .anim path)]."""
+    out, used = [], set()
+    for asset in assets:
+        if asset.kind != "animation" or asset.source in BUILTIN_SOURCES:
+            continue
+        if getattr(getattr(asset.ref, "type", None), "name", "") != "AnimationClip":
+            continue
+        folder = os.path.join(assets_dir, safe_filename(asset.source or "animations"), "Animations")
+        base = safe_filename(os.path.basename(asset.name.replace("\\", "/"))) or "Clip"
+        name, i = base, 1
+        while (folder.lower(), name.lower()) in used:
+            i += 1
+            name = f"{base}_{i}"
+        used.add((folder.lower(), name.lower()))
+        out.append((asset, os.path.join(folder, f"{name}.anim")))
+    return out
+
+
+def write_clip_descriptions(session, root, assets_dir, clip_plan, sprite_links, cancelled=None):
+    """One JSON per animation clip (UniViewBuilder.cs makes the .anim); returns (written, failed)."""
+    if not hasattr(session, "clip_export"):
+        return 0, 0
+    written = failed = 0
+    build_dir = os.path.join(assets_dir, *BUILD_DIR)
+    for asset, target in clip_plan:
+        if cancelled is not None and cancelled():
+            break
+        try:
+            clip = session.clip_export(asset)
+            curves = [{"path": c["path"], "type": c["type"], "prop": c["prop"], "script": bool(c.get("script")),
+                       "keys": [float(x) for t, v in c["keys"] for x in (t, v)]} for c in clip["curves"]]
+            objects = []
+            for c in clip["object_curves"]:
+                keys = [(t, sprite_links.get(uid)) for t, uid in c["keys"] if sprite_links.get(uid)]
+                if keys:
+                    objects.append({"path": c["path"], "type": c["type"], "prop": c["prop"],
+                                    "times": [float(t) for t, _l in keys], "textures": [link[0] for _t, link in keys],
+                                    "sprites": [link[1] for _t, link in keys]})
+            desc = {"version": 1, "kind": "clip", "target": unity_path(root, target), "nodes": [],
+                    "clip": {"length": clip["length"], "rate": float(clip["sample_rate"] or 30), "loop": clip["loop"],
+                             "legacy": clip["legacy"], "curves": curves, "objectCurves": objects,
+                             "events": [{"time": float(e.get("time") or 0), "function": e.get("function") or "",
+                                         "data": str(e.get("data") or ""), "floatValue": float(e.get("float") or 0),
+                                         "intValue": int(e.get("int") or 0)} for e in clip["events"]]}}
+            path = os.path.join(build_dir, os.path.relpath(target, assets_dir) + ".json")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(desc, f, separators=(",", ":"))
+            write_meta(path, asset_guid(f"{asset.uid}:description"))
+            write_folder_metas(assets_dir, os.path.dirname(path))
+            written += 1
+        except Exception as e:
+            failed += 1
+            log.warning("Could not describe animation '%s': %s", asset.name, e)
+    return written, failed
+
+
+def plan_controllers(session, assets_dir):
+    """[(uid, target .controller path)] for the game's AnimatorControllers."""
+    if not hasattr(session, "controllers"):
+        return []
+    out, used = [], set()
+    for uid, name, source in session.controllers():
+        if source in BUILTIN_SOURCES:
+            continue
+        folder = os.path.join(assets_dir, safe_filename(source or "animators"), "Animators")
+        base = safe_filename(name) or "Controller"
+        stem, i = base, 1
+        while (folder.lower(), stem.lower()) in used:
+            i += 1
+            stem = f"{base}_{i}"
+        used.add((folder.lower(), stem.lower()))
+        out.append((uid, os.path.join(folder, f"{stem}.controller")))
+    return out
+
+
+def controller_json(ctrl, clip_path):
+    """unity_controller.decode_controller() output in the shape UniViewBuilder.cs reads (camelCase, clip paths)."""
+    def transition(t):
+        return {"dest": t["dest"], "duration": t["duration"], "offset": t["offset"], "exitTime": t["exit_time"],
+                "hasExitTime": t["has_exit_time"], "fixedDuration": t["fixed_duration"],
+                "interruption": t["interruption"], "ordered": t["ordered"], "toSelf": t["to_self"],
+                "conditions": t["conditions"]}
+
+    def state(s):
+        motion = s["motion"] or {}
+        out = {"name": s["name"], "tag": s["tag"], "speed": s["speed"], "cycleOffset": s["cycle_offset"],
+               "mirror": s["mirror"], "ikOnFeet": s["ik_on_feet"], "writeDefaults": s["write_defaults"],
+               "speedParam": s["speed_param"], "clip": clip_path(motion.get("clip")), "treeNodes": [],
+               "transitions": [transition(t) for t in s["transitions"]]}
+        if "tree" in motion:
+            out["treeNodes"] = [{"type": n["type"], "param": n["param"], "paramY": n["param_y"],
+                                 "clip": clip_path(n["clip"]), "children": n["children"],
+                                 "thresholds": n["thresholds"], "positions": n["positions"]}
+                                for n in motion["tree"]["nodes"]]
+        return out
+
+    return {"parameters": [{"name": p["name"], "type": p["type"], "defaultValue": p["default"]} for p in ctrl["parameters"]],
+            "layers": [{"name": layer["name"], "weight": layer["weight"], "blending": layer["blending"], "ik": layer["ik"],
+                        "defaultState": layer["default_state"], "states": [state(s) for s in layer["states"]],
+                        "anyTransitions": [transition(t) for t in layer["any_transitions"]]}
+                       for layer in ctrl["layers"]]}
+
+
+def write_controller_descriptions(session, root, assets_dir, controller_plan, model_paths, cancelled=None):
+    """One JSON per AnimatorController (UniViewBuilder.cs makes the .controller); returns (written, failed)."""
+    written = failed = 0
+    build_dir = os.path.join(assets_dir, *BUILD_DIR)
+
+    def clip_path(uid):
+        path = model_paths.get(uid) if uid else None
+        return unity_path(root, path) if path else ""
+
+    for uid, target in controller_plan:
+        if cancelled is not None and cancelled():
+            break
+        try:
+            desc = {"version": 1, "kind": "controller", "target": unity_path(root, target), "nodes": [],
+                    "controller": controller_json(session.controller_export(uid), clip_path)}
+            path = os.path.join(build_dir, os.path.relpath(target, assets_dir) + ".json")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(desc, f, separators=(",", ":"))
+            write_meta(path, asset_guid(f"{uid}:description"))
+            write_folder_metas(assets_dir, os.path.dirname(path))
+            written += 1
+        except Exception as e:
+            failed += 1
+            log.warning("Could not describe animator controller %s: %s", uid, e)
+    return written, failed
+
+
 def write_data_descriptions(session, root, assets_dir, data_plan, model_paths, materials=None, prefab_objects=None,
                             cancelled=None):
     """One JSON per data asset (built by UniViewBuilder.cs once the game's scripts compile); returns (written, failed)."""
@@ -669,7 +840,13 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
         library = MaterialLibrary(session, root, assets_dir, texture_paths) if hasattr(session, "material_details") else None
         data_plan = plan_data(session.assets, assets_dir)
         model_paths.update({a.uid: p for a, p in data_plan})  # links to data assets
+        clip_plan = plan_clips(session.assets, assets_dir)
+        model_paths.update({a.uid: p for a, p in clip_plan})  # links to animation clips
+        controller_plan = plan_controllers(session, assets_dir)
+        model_paths.update(dict(controller_plan))  # links to animator controllers
         prefab_objects = prefab_object_map(session, root, assets_dir)
+        sprite_links = write_sprites_description(session, root, assets_dir, model_paths)
+        prefab_objects.update(sprite_links)  # links to sprites
         prefabs, prefab_failed = write_prefab_descriptions(session, root, assets_dir, model_paths, cancelled, library,
                                                            prefab_objects)
         if progress is not None:
@@ -678,8 +855,11 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
                                                         cancelled, library, prefab_objects)
         data, data_failed = write_data_descriptions(session, root, assets_dir, data_plan, model_paths, library,
                                                     prefab_objects, cancelled)
-        written += data
-        failed += data_failed
+        clips, clip_failed = write_clip_descriptions(session, root, assets_dir, clip_plan, sprite_links, cancelled)
+        ctrls, ctrl_failed = write_controller_descriptions(session, root, assets_dir, controller_plan, model_paths,
+                                                           cancelled)
+        written += data + clips + ctrls
+        failed += data_failed + clip_failed + ctrl_failed
         if (prefabs or scenes) and write_settings_description(session, root, assets_dir,
                                                                 plan_scenes(session.assets, assets_dir)):
             written += 1

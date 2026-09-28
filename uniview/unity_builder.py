@@ -12,8 +12,12 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using UnityEditor;
+using UnityEditor.Animations;
 using UnityEditor.SceneManagement;
 using UnityEngine;
+#if UNITY_2021_2_OR_NEWER
+using UnityEditor.U2D.Sprites;
+#endif
 
 namespace UniView
 {
@@ -78,6 +82,114 @@ namespace UniView
     }
 
     [Serializable]
+    public class SpriteInfo
+    {
+        public string name;
+        public float[] rect;    // x, y, width, height (pixels, from the bottom-left)
+        public float[] pivot;   // 0..1
+        public float[] border;  // left, bottom, right, top
+    }
+
+    [Serializable]
+    public class Sheet
+    {
+        public string texture;
+        public float ppu = 100f;
+        public SpriteInfo[] sprites;
+    }
+
+    [Serializable]
+    public class ClipCurve
+    {
+        public string path;
+        public string type;   // Transform, GameObject, Animator (humanoid), a component or script class
+        public string prop;   // m_LocalPosition.x, localEulerAnglesRaw.y, m_IsActive, material._Color.r ...
+        public bool script;
+        public float[] keys;  // t0, v0, t1, v1 ...
+    }
+
+    [Serializable]
+    public class ClipObjectCurve
+    {
+        public string path;
+        public string type;
+        public string prop;
+        public float[] times;
+        public string[] textures;  // sprite = texture file + sprite name
+        public string[] sprites;
+    }
+
+    [Serializable]
+    public class ClipEvent
+    {
+        public float time;
+        public string function;
+        public string data;
+        public float floatValue;
+        public int intValue;
+    }
+
+    [Serializable]
+    public class ClipInfo
+    {
+        public float length;
+        public float rate = 30f;
+        public bool loop;
+        public bool legacy;
+        public ClipCurve[] curves;
+        public ClipObjectCurve[] objectCurves;
+        public ClipEvent[] events;
+    }
+
+    [Serializable]
+    public class CtrlParam { public string name; public string type; public float defaultValue; }
+
+    [Serializable]
+    public class CtrlCondition { public int mode; public string param; public float threshold; }
+
+    [Serializable]
+    public class CtrlTransition
+    {
+        public int dest = -1;  // state index; -1 = exit
+        public float duration, offset, exitTime;
+        public bool hasExitTime, fixedDuration = true, ordered = true, toSelf = true;
+        public int interruption;
+        public CtrlCondition[] conditions;
+    }
+
+    [Serializable]
+    public class TreeNode
+    {
+        public string type, param, paramY, clip;
+        public int[] children;
+        public float[] thresholds, positions;
+    }
+
+    [Serializable]
+    public class CtrlState
+    {
+        public string name, tag, speedParam, clip;
+        public float speed = 1f, cycleOffset;
+        public bool mirror, ikOnFeet, writeDefaults = true;
+        public TreeNode[] treeNodes;
+        public CtrlTransition[] transitions;
+    }
+
+    [Serializable]
+    public class CtrlLayer
+    {
+        public string name;
+        public float weight = 1f;
+        public int blending, defaultState;
+        public bool ik;
+        public CtrlState[] states;
+        public CtrlTransition[] anyTransitions;
+    }
+
+    [Serializable]
+    public class CtrlInfo { public CtrlParam[] parameters; public CtrlLayer[] layers; }
+
+    [Serializable]
     public class Manager
     {
         public string type;
@@ -96,6 +208,9 @@ namespace UniView
         public string[] scenes;
         public string product;
         public string company;
+        public Sheet[] sheets;  // kind "sprites"
+        public ClipInfo clip;   // kind "clip"
+        public CtrlInfo controller;  // kind "controller"
         public string script;  // kind "data": the ScriptableObject class
         public Prop[] props;   // kind "data": its values
     }
@@ -112,6 +227,7 @@ namespace UniView
         }
 
         const string SettingsMarker = "ProjectSettings/UniViewSettingsApplied.txt";
+        const string SpritesMarker = "ProjectSettings/UniViewSpritesApplied.txt";
         const string ScriptsParked = "Assets/UniView/GameScripts~";   // ignored by Unity
         const string ScriptsActive = "Assets/GameScripts";
         const string RebuildMarker = "ProjectSettings/UniViewRebuildAfterScripts.txt";
@@ -128,6 +244,7 @@ namespace UniView
                 return;
             }
             if (!File.Exists(SettingsMarker) && File.Exists(BuildDir + "/ProjectSettings.json")) { BuildMissing(); return; }
+            if (!File.Exists(SpritesMarker) && File.Exists(BuildDir + "/Sprites.json")) { BuildMissing(); return; }
             foreach (string file in Descriptions())
             {
                 Description d = Load(file);
@@ -200,9 +317,27 @@ namespace UniView
         {
             var todo = new List<Description>();
             var data = new List<Description>();
+            var clips = new List<Description>();
+            var controllers = new List<Description>();
             foreach (string file in Descriptions())
             {
                 Description d = Load(file);
+                if (d != null && d.kind == "sprites")
+                {
+                    // Textures become sprites / sprite sheets before anything links to their sprites.
+                    if (!onlyMissing || !File.Exists(SpritesMarker)) ApplySprites(d);
+                    continue;
+                }
+                if (d != null && d.kind == "controller")
+                {
+                    if (!onlyMissing || !File.Exists(d.target)) controllers.Add(d);
+                    continue;
+                }
+                if (d != null && d.kind == "clip")
+                {
+                    if (!onlyMissing || !File.Exists(d.target)) clips.Add(d);
+                    continue;
+                }
                 if (d != null && d.kind == "data")
                 {
                     if (!onlyMissing || !File.Exists(d.target)) data.Add(d);
@@ -218,12 +353,15 @@ namespace UniView
                 if (onlyMissing && File.Exists(d.target)) continue;
                 todo.Add(d);
             }
+            int clipsMade = BuildClips(clips);  // before prefabs: Animation components point at clips
+            int controllersMade = BuildControllers(controllers);  // Animators point at controllers
             int dataMade = CreateDataAssets(data);
             if (todo.Count == 0)
             {
                 FillDataAssets(data);
                 AssetDatabase.SaveAssets();
-                if (data.Count > 0) Debug.Log("UniView: " + dataMade + " data asset(s) built");
+                if (data.Count > 0 || clips.Count > 0)
+                    Debug.Log("UniView: " + dataMade + " data asset(s), " + clipsMade + " animation clip(s) built");
                 return;
             }
             // Prefabs first, then scenes (building a scene replaces the open one).
@@ -268,6 +406,8 @@ namespace UniView
                       + "; components: " + componentsAdded + " added" + (componentsFailed > 0 ? ", " + componentsFailed + " not available" : "")
                       + ", " + valuesSet + " values set, " + valuesSkipped + " not applicable"
                       + "; data assets: " + dataMade + " of " + data.Count
+                      + "; animation clips: " + clipsMade + " of " + clips.Count
+                      + "; animator controllers: " + controllersMade + " of " + controllers.Count
                       + "; scripts: " + scriptsAdded + " attached"
                       + (scriptsMissing > 0 ? ", " + scriptsMissing + " script classes not in the project (UniView > Add the game's scripts)" : ""));
         }
@@ -355,6 +495,204 @@ namespace UniView
             }
             Directory.CreateDirectory(Path.GetDirectoryName(d.target));
             EditorSceneManager.SaveScene(scene, d.target);
+        }
+
+        // ---- animation clips
+        static Type CurveType(ClipCurve c)
+        {
+            if (c.type == "Transform") return typeof(Transform);
+            if (c.type == "GameObject") return typeof(GameObject);
+            if (c.type == "Animator") return typeof(Animator);
+            return c.script ? ScriptType(c.type) : ComponentType(c.type);
+        }
+
+        static int BuildClips(List<Description> clips)
+        {
+            int made = 0, curvesSet = 0, curvesSkipped = 0;
+            foreach (Description d in clips)
+            {
+                ClipInfo info = d.clip;
+                if (info == null) continue;
+                try
+                {
+                    var clip = new AnimationClip { frameRate = info.rate > 0 ? info.rate : 30f, legacy = info.legacy };
+                    if (info.curves != null)
+                    {
+                        foreach (ClipCurve c in info.curves)
+                        {
+                            Type type = CurveType(c);
+                            if (type == null || c.keys == null || c.keys.Length < 2) { curvesSkipped++; continue; }
+                            var keys = new Keyframe[c.keys.Length / 2];
+                            for (int k = 0; k < keys.Length; k++) keys[k] = new Keyframe(c.keys[2 * k], c.keys[2 * k + 1]);
+                            var curve = new AnimationCurve(keys);  // keys at the same time are merged
+                            for (int k = 0; k < curve.length; k++)
+                            {
+                                AnimationUtility.SetKeyLeftTangentMode(curve, k, AnimationUtility.TangentMode.ClampedAuto);
+                                AnimationUtility.SetKeyRightTangentMode(curve, k, AnimationUtility.TangentMode.ClampedAuto);
+                            }
+                            AnimationUtility.SetEditorCurve(clip, EditorCurveBinding.FloatCurve(c.path ?? "", type, c.prop), curve);
+                            curvesSet++;
+                        }
+                    }
+                    if (info.objectCurves != null)
+                    {
+                        foreach (ClipObjectCurve c in info.objectCurves)
+                        {
+                            Type type = ComponentType(c.type);
+                            if (type == null || c.times == null) continue;
+                            var frames = new List<ObjectReferenceKeyframe>();
+                            for (int k = 0; k < c.times.Length; k++)
+                                frames.Add(new ObjectReferenceKeyframe { time = c.times[k], value = SpriteAt(c.textures[k], c.sprites[k]) });
+                            AnimationUtility.SetObjectReferenceCurve(clip, EditorCurveBinding.PPtrCurve(c.path ?? "", type, c.prop), frames.ToArray());
+                        }
+                    }
+                    if (info.events != null && info.events.Length > 0)
+                    {
+                        var events = new List<AnimationEvent>();
+                        foreach (ClipEvent e in info.events)
+                            events.Add(new AnimationEvent { time = e.time, functionName = e.function, stringParameter = e.data,
+                                                            floatParameter = e.floatValue, intParameter = e.intValue });
+                        AnimationUtility.SetAnimationEvents(clip, events.ToArray());
+                    }
+                    if (!info.legacy)
+                    {
+                        AnimationClipSettings settings = AnimationUtility.GetAnimationClipSettings(clip);
+                        settings.loopTime = info.loop;
+                        AnimationUtility.SetAnimationClipSettings(clip, settings);
+                    }
+                    else if (info.loop) clip.wrapMode = WrapMode.Loop;
+                    Directory.CreateDirectory(Path.GetDirectoryName(d.target));
+                    if (File.Exists(d.target)) AssetDatabase.DeleteAsset(d.target);
+                    AssetDatabase.CreateAsset(clip, d.target);
+                    made++;
+                }
+                catch (Exception e) { Debug.LogWarning("UniView: couldn't build " + d.target + ": " + e.Message); }
+            }
+            if (clips.Count > 0) Debug.Log("UniView: animation curves: " + curvesSet + " set, " + curvesSkipped + " skipped (their component or script isn't in the project)");
+            return made;
+        }
+
+        // ---- animator controllers
+        static int BuildControllers(List<Description> list)
+        {
+            int made = 0;
+            foreach (Description d in list)
+            {
+                CtrlInfo info = d.controller;
+                if (info == null) continue;
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(d.target));
+                    if (File.Exists(d.target)) AssetDatabase.DeleteAsset(d.target);
+                    AnimatorController ctrl = AnimatorController.CreateAnimatorControllerAtPath(d.target);
+                    if (info.parameters != null)
+                    {
+                        foreach (CtrlParam p in info.parameters)
+                        {
+                            var type = p.type == "Int" ? AnimatorControllerParameterType.Int
+                                     : p.type == "Bool" ? AnimatorControllerParameterType.Bool
+                                     : p.type == "Trigger" ? AnimatorControllerParameterType.Trigger
+                                     : AnimatorControllerParameterType.Float;
+                            ctrl.AddParameter(p.name, type);
+                        }
+                        AnimatorControllerParameter[] ps = ctrl.parameters;
+                        for (int i = 0; i < ps.Length && i < info.parameters.Length; i++)
+                        {
+                            ps[i].defaultFloat = info.parameters[i].defaultValue;
+                            ps[i].defaultInt = (int)info.parameters[i].defaultValue;
+                            ps[i].defaultBool = info.parameters[i].defaultValue != 0;
+                        }
+                        ctrl.parameters = ps;
+                    }
+                    if (info.layers != null)
+                    {
+                        for (int li = 0; li < info.layers.Length; li++)
+                        {
+                            CtrlLayer L = info.layers[li];
+                            if (li > 0) ctrl.AddLayer(L.name);
+                            AnimatorControllerLayer[] layers = ctrl.layers;
+                            AnimatorStateMachine sm = layers[li].stateMachine;
+                            var states = new AnimatorState[L.states != null ? L.states.Length : 0];
+                            for (int i = 0; i < states.Length; i++)
+                            {
+                                CtrlState s = L.states[i];
+                                AnimatorState st = sm.AddState(string.IsNullOrEmpty(s.name) ? "State" : s.name,
+                                                               new Vector3(300 + (i % 4) * 240, 80 + (i / 4) * 80, 0));
+                                st.tag = s.tag ?? "";
+                                st.speed = s.speed;
+                                st.cycleOffset = s.cycleOffset;
+                                st.mirror = s.mirror;
+                                st.iKOnFeet = s.ikOnFeet;
+                                st.writeDefaultValues = s.writeDefaults;
+                                if (!string.IsNullOrEmpty(s.speedParam)) { st.speedParameterActive = true; st.speedParameter = s.speedParam; }
+                                if (s.treeNodes != null && s.treeNodes.Length > 0) st.motion = BuildTree(ctrl, s.treeNodes, 0, s.name);
+                                else if (!string.IsNullOrEmpty(s.clip)) st.motion = AssetDatabase.LoadAssetAtPath<AnimationClip>(s.clip);
+                                states[i] = st;
+                            }
+                            if (states.Length > 0 && L.defaultState >= 0 && L.defaultState < states.Length) sm.defaultState = states[L.defaultState];
+                            for (int i = 0; i < states.Length; i++)
+                                if (L.states[i].transitions != null)
+                                    foreach (CtrlTransition t in L.states[i].transitions)
+                                        SetTransition(t.dest >= 0 && t.dest < states.Length ? states[i].AddTransition(states[t.dest])
+                                                                                            : states[i].AddExitTransition(), t);
+                            if (L.anyTransitions != null)
+                                foreach (CtrlTransition t in L.anyTransitions)
+                                    if (t.dest >= 0 && t.dest < states.Length) SetTransition(sm.AddAnyStateTransition(states[t.dest]), t);
+                            layers = ctrl.layers;
+                            layers[li].name = L.name;
+                            layers[li].defaultWeight = li == 0 ? 1f : L.weight;  // the base layer always counts fully
+                            layers[li].blendingMode = (AnimatorLayerBlendingMode)L.blending;
+                            layers[li].iKPass = L.ik;
+                            ctrl.layers = layers;
+                        }
+                    }
+                    EditorUtility.SetDirty(ctrl);
+                    made++;
+                }
+                catch (Exception e) { Debug.LogWarning("UniView: couldn't build " + d.target + ": " + e.Message); }
+            }
+            if (list.Count > 0) AssetDatabase.SaveAssets();
+            return made;
+        }
+
+        static void SetTransition(AnimatorStateTransition tr, CtrlTransition t)
+        {
+            tr.duration = t.duration;
+            tr.offset = t.offset;
+            tr.exitTime = t.exitTime;
+            tr.hasExitTime = t.hasExitTime;
+            tr.hasFixedDuration = t.fixedDuration;
+            tr.interruptionSource = (TransitionInterruptionSource)t.interruption;
+            tr.orderedInterruption = t.ordered;
+            tr.canTransitionToSelf = t.toSelf;
+            if (t.conditions != null)
+                foreach (CtrlCondition c in t.conditions) tr.AddCondition((AnimatorConditionMode)c.mode, c.threshold, c.param);
+        }
+
+        static Motion BuildTree(AnimatorController ctrl, TreeNode[] nodes, int index, string name)
+        {
+            TreeNode n = nodes[index];
+            if (n.children == null || n.children.Length == 0)
+                return string.IsNullOrEmpty(n.clip) ? null : AssetDatabase.LoadAssetAtPath<AnimationClip>(n.clip);
+            var tree = new BlendTree { name = name, hideFlags = HideFlags.HideInHierarchy, useAutomaticThresholds = false };
+            try { tree.blendType = (BlendTreeType)Enum.Parse(typeof(BlendTreeType), n.type); } catch (Exception) { }
+            if (!string.IsNullOrEmpty(n.param)) tree.blendParameter = n.param;
+            if (!string.IsNullOrEmpty(n.paramY)) tree.blendParameterY = n.paramY;
+            AssetDatabase.AddObjectToAsset(tree, ctrl);
+            for (int k = 0; k < n.children.Length; k++)
+            {
+                int c = n.children[k];
+                if (c < 0 || c >= nodes.Length) continue;
+                Motion m = BuildTree(ctrl, nodes, c, name + "." + k);
+                if (tree.blendType == BlendTreeType.Simple1D)
+                    tree.AddChild(m, n.thresholds != null && k < n.thresholds.Length ? n.thresholds[k] : k);
+                else if (tree.blendType == BlendTreeType.Direct)
+                    tree.AddChild(m);
+                else
+                    tree.AddChild(m, n.positions != null && 2 * k + 1 < n.positions.Length
+                                     ? new Vector2(n.positions[2 * k], n.positions[2 * k + 1]) : Vector2.zero);
+            }
+            return tree;
         }
 
         // ---- data assets (ScriptableObjects: item stats, loot tables...)
@@ -564,6 +902,7 @@ namespace UniView
                         if (skinned != null) target = skinned.sharedMesh;
                         else if (r != null && r.GetComponent<MeshFilter>() != null) target = r.GetComponent<MeshFilter>().sharedMesh;
                     }
+                    else if (pr.c == "Sprite") target = SpriteAt(pr.s, pr.q);
                     else if (!string.IsNullOrEmpty(pr.c)) target = PrefabObject(pr.s, pr.q, pr.c);
                     else target = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(pr.s);
                     if (target == null) { valuesSkipped++; return; }
@@ -587,6 +926,78 @@ namespace UniView
             }
             catch (Exception) { valuesSkipped++; }
         }
+
+        static UnityEngine.Object SpriteAt(string texturePath, string name)
+        {
+            Sprite first = null;
+            foreach (UnityEngine.Object o in AssetDatabase.LoadAllAssetsAtPath(texturePath))
+            {
+                var sprite = o as Sprite;
+                if (sprite == null) continue;
+                if (sprite.name == name) return sprite;
+                if (first == null) first = sprite;
+            }
+            return first;
+        }
+
+        static void ApplySprites(Description d)
+        {
+            int textures = 0, sprites = 0;
+            if (d.sheets != null)
+            {
+                foreach (Sheet sh in d.sheets)
+                {
+                    var ti = AssetImporter.GetAtPath(sh.texture) as TextureImporter;
+                    if (ti == null || sh.sprites == null || sh.sprites.Length == 0) continue;
+                    try
+                    {
+                        ti.textureType = TextureImporterType.Sprite;
+                        ti.spriteImportMode = SpriteImportMode.Multiple;
+                        ti.spritePixelsPerUnit = sh.ppu > 0 ? sh.ppu : 100f;
+                        ti.alphaIsTransparency = true;
+#if UNITY_2021_2_OR_NEWER
+                        var factory = new SpriteDataProviderFactories();
+                        factory.Init();
+                        ISpriteEditorDataProvider dp = factory.GetSpriteEditorDataProviderFromObject(ti);
+                        dp.InitSpriteEditorDataProvider();
+                        var rects = new List<SpriteRect>();
+                        foreach (SpriteInfo s in sh.sprites)
+                            rects.Add(new SpriteRect
+                            {
+                                name = s.name, rect = R(s.rect), pivot = P(s.pivot), alignment = SpriteAlignment.Custom,
+                                border = B(s.border), spriteID = GUID.Generate()
+                            });
+                        dp.SetSpriteRects(rects.ToArray());
+#if UNITY_2022_2_OR_NEWER
+                        var ids = dp.GetDataProvider<ISpriteNameFileIdDataProvider>();
+                        if (ids != null)
+                        {
+                            var pairs = new List<SpriteNameFileIdPair>();
+                            foreach (SpriteRect r in rects) pairs.Add(new SpriteNameFileIdPair(r.name, r.spriteID));
+                            ids.SetNameFileIdPairs(pairs);
+                        }
+#endif
+                        dp.Apply();
+#else
+                        var metas = new List<SpriteMetaData>();
+                        foreach (SpriteInfo s in sh.sprites)
+                            metas.Add(new SpriteMetaData { name = s.name, rect = R(s.rect), pivot = P(s.pivot), alignment = 9, border = B(s.border) });
+                        ti.spritesheet = metas.ToArray();
+#endif
+                        ti.SaveAndReimport();
+                        textures++;
+                        sprites += sh.sprites.Length;
+                    }
+                    catch (Exception e) { Debug.LogWarning("UniView: couldn't set up sprites of " + sh.texture + ": " + e.Message); }
+                }
+            }
+            File.WriteAllText(SpritesMarker, "UniView set up the game's sprites (delete this file to do it again).\n");
+            Debug.Log("UniView: " + sprites + " sprite(s) in " + textures + " texture(s)");
+        }
+
+        static Rect R(float[] a) { return a != null && a.Length >= 4 ? new Rect(a[0], a[1], a[2], a[3]) : new Rect(); }
+        static Vector2 P(float[] a) { return a != null && a.Length >= 2 ? new Vector2(a[0], a[1]) : new Vector2(0.5f, 0.5f); }
+        static Vector4 B(float[] a) { return a != null && a.Length >= 4 ? new Vector4(a[0], a[1], a[2], a[3]) : Vector4.zero; }
 
         static UnityEngine.Object PrefabObject(string path, string childPath, string cls)
         {

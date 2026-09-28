@@ -45,7 +45,7 @@ def _bindings(tree):
             name, count = attribute_name(attribute), 1  # humanoid muscle / body curve (on the Animator)
         else:
             name, count = f"property {attribute} (class {type_id})", 1
-        out.append((b.get("path", 0), attribute, count, name, pptr, type_id))
+        out.append((b.get("path", 0), attribute, count, name, pptr, type_id, b.get("script") or {}))
     return out
 
 
@@ -81,13 +81,15 @@ def decode_clip(tree, path_names=None):
     curves = []
     index = 0
     component_names = {3: "xyz", 4: "xyzw"}
-    for path_hash, attr, count, prop, pptr, class_id in _bindings(tree):
+    for path_hash, attr, count, prop, pptr, class_id, script in _bindings(tree):
         path = path_names.get(path_hash, f"#{path_hash:08x}") if path_hash else ""
         for k in range(count):
             comp = component_names.get(count, "")[k] if count > 1 else ""
             if index in keys:
                 curve = {"path": path, "property": prop, "component": comp, "keys": keys[index],
                          "class_id": class_id, "attribute": attr}
+                if script.get("m_PathID"):
+                    curve["script"] = (script.get("m_FileID", 0), script["m_PathID"])
                 if pptr:
                     curve.update(object_curve=True)  # values index pptrCurveMapping
                 curves.append(curve)
@@ -121,8 +123,11 @@ def decode_clip(tree, path_names=None):
         "length": round(length, 4),
         "sample_rate": tree.get("m_SampleRate", 0),
         "legacy": bool(tree.get("m_Legacy")),
+        "loop": bool(muscle.get("m_LoopTime")) or tree.get("m_WrapMode", 0) == 2,
         "wrap_mode": tree.get("m_WrapMode", 0),
-        "events": [{"time": e.get("time"), "function": e.get("functionName")} for e in tree.get("m_Events") or []],
+        "events": [{"time": e.get("time"), "function": e.get("functionName"), "data": e.get("data", ""),
+                    "float": e.get("floatParameter", 0.0), "int": e.get("intParameter", 0)}
+                   for e in tree.get("m_Events") or []],
         "curves": curves,
     }
 

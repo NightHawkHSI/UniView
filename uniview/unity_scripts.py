@@ -128,6 +128,9 @@ def export_scripts(session, assets_dir, progress=None, cancelled=None, unity_ver
     ilspycmd = find_ilspycmd()
     if ilspycmd is None:
         return 0, 0, "No game scripts: install the ILSpy decompiler first (Help → Optional tools...), then export again."
+    if os.path.isdir(os.path.join(assets_dir, "GameScripts")):
+        # Exporting again into a project whose scripts were already added (and maybe fixed by hand): keep them.
+        return 0, 0, "Kept the game's scripts already in Assets/GameScripts (delete that folder to get fresh ones)."
     script_assemblies = session.script_assemblies() if hasattr(session, "script_assemblies") else []
     to_decompile, libraries = plan_assemblies(managed, script_assemblies)
     out_root = os.path.join(assets_dir, *SCRIPTS_DIR)

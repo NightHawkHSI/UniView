@@ -438,3 +438,77 @@ def test_data_assets_and_prefab_links(tmp_path):
                                         re.search(rf"public class {cls}\s*\{{(.*?)\}}", BUILDER_CS, re.S).group(1)))
     assert set(desc) <= fields("Description")
     assert {"p", "t", "v", "s", "n", "c", "q"} <= fields("Prop")
+
+
+def test_clip_description_matches_builder_classes(tmp_path):
+    from types import SimpleNamespace
+    import re
+    from uniview.unity_builder import BUILDER_CS
+
+    class ClipSession(PrefabSession):
+        def clip_export(self, asset):
+            return {"name": "Walk", "length": 1.0, "sample_rate": 30, "loop": True, "legacy": False,
+                    "events": [{"time": 0.5, "function": "Step", "data": "", "float": 0.0, "int": 1}],
+                    "curves": [{"path": "Body", "type": "Transform", "prop": "m_LocalPosition.x",
+                                "keys": [(0.0, 1.0), (1.0, 2.0)]}],
+                    "object_curves": [], "skipped": 0}
+
+    clip = Asset("animation", "Walk", "w", uid="a:1", source="sharedassets0.assets",
+                 ref=SimpleNamespace(type=SimpleNamespace(name="AnimationClip")))
+    prefab = Asset("scene", "Prefab: Crate", ("root", 1, 1), uid="prefab:crate", source="sharedassets1.assets")
+    root = tmp_path / "proj"
+    up.export_unity_project(ClipSession([clip, prefab]), str(root), "6000.5.4f1", editor_exe=fake_editor(tmp_path))
+    desc = json.load(open(root / "Assets" / "UniView" / "Build" / "sharedassets0.assets" / "Animations" / "Walk.anim.json"))
+    assert desc["kind"] == "clip" and desc["target"] == "Assets/sharedassets0.assets/Animations/Walk.anim"
+    c = desc["clip"]
+    assert c["loop"] is True and c["curves"][0]["keys"] == [0.0, 1.0, 1.0, 2.0]
+    fields = lambda cls: set(re.findall(r"public \w+(?:\[\])? (\w+)",  # noqa: E731
+                                        re.search(rf"public class {cls}\s*\{{(.*?)\}}", BUILDER_CS, re.S).group(1)))
+    assert set(c) <= fields("ClipInfo")
+    assert set(c["curves"][0]) <= fields("ClipCurve") and set(c["events"][0]) <= fields("ClipEvent")
+    assert set(desc) <= fields("Description")
+
+
+def test_controller_json_matches_builder_classes():
+    import re
+    from engines.unity_controller import decode_controller
+    from uniview.unity_builder import BUILDER_CS
+    tree = {"m_Name": "Cow", "m_TOS": [(1, "Speed"), (2, "Base Layer"), (3, "Idle"), (4, "Walk"), (5, "Grounded")],
+            "m_Controller": {
+                "m_Values": {"data": {"m_ValueArray": [{"m_ID": 1, "m_Type": 1, "m_Index": 0},
+                                                       {"m_ID": 5, "m_Type": 4, "m_Index": 0}]}},
+                "m_DefaultValues": {"data": {"m_FloatValues": [0.5], "m_BoolValues": [True]}},
+                "m_LayerArray": [{"data": {"m_StateMachineIndex": 0, "m_Binding": 2, "m_DefaultWeight": 0.0}}],
+                "m_StateMachineArray": [{"data": {"m_DefaultState": 0, "m_AnyStateTransitionConstantArray": [], "m_StateConstantArray": [
+                    {"data": {"m_NameID": 3, "m_BlendTreeConstantArray": [{"data": {"m_NodeArray": [{"data": {"m_ClipID": 0}}]}}],
+                              "m_TransitionConstantArray": [{"data": {"m_DestinationState": 1, "m_ConditionConstantArray": [
+                                  {"data": {"m_ConditionMode": 3, "m_EventID": 1, "m_EventThreshold": 0.1}}]}}]}},
+                    {"data": {"m_NameID": 4, "m_BlendTreeConstantArray": [{"data": {"m_NodeArray": [
+                        {"data": {"m_BlendType": 0, "m_BlendEventID": 1, "m_ChildIndices": [1, 2],
+                                  "m_Blend1dData": {"data": {"m_ChildThresholdArray": [0.0, 1.0]}}, "m_ClipID": 0xFFFFFFFF}},
+                        {"data": {"m_ClipID": 1}}, {"data": {"m_ClipID": 0}}]}}],
+                              "m_TransitionConstantArray": [{"data": {"m_DestinationState": 99}}]}}]}}]}}
+    ctrl = decode_controller(tree, lambda i: f"clip{i}")
+    assert ctrl["parameters"] == [{"name": "Speed", "type": "Float", "default": 0.5},
+                                  {"name": "Grounded", "type": "Bool", "default": 1.0}]
+    layer = ctrl["layers"][0]
+    assert layer["name"] == "Base Layer" and [s["name"] for s in layer["states"]] == ["Idle", "Walk"]
+    idle, walk = layer["states"]
+    assert idle["motion"] == {"clip": "clip0"}
+    assert idle["transitions"][0]["dest"] == 1 and idle["transitions"][0]["conditions"] == [
+        {"mode": 3, "param": "Speed", "threshold": 0.1}]
+    assert walk["transitions"][0]["dest"] == -1  # out of range -> exit
+    nodes = walk["motion"]["tree"]["nodes"]
+    assert nodes[0]["param"] == "Speed" and nodes[0]["children"] == [1, 2] and nodes[0]["thresholds"] == [0.0, 1.0]
+    js = up.controller_json(ctrl, lambda uid: f"Assets/{uid}.anim" if uid else "")
+    def names(cls):
+        """Field names of a C# class, including several per line ("public float a = 1f, b;")."""
+        body = re.search(rf"public class {cls}\s*\{{(.*?)\}}", BUILDER_CS, re.S).group(1)
+        out = set()
+        for decl in re.findall(r"public \w+(?:\[\])? ([^;]+);", body):
+            out.update(part.split("=")[0].strip() for part in decl.split(","))
+        return out
+    assert set(js) <= names("CtrlInfo") and set(js["parameters"][0]) <= names("CtrlParam")
+    assert set(js["layers"][0]) <= names("CtrlLayer") and set(js["layers"][0]["states"][0]) <= names("CtrlState")
+    assert set(js["layers"][0]["states"][0]["transitions"][0]) <= names("CtrlTransition")
+    assert set(js["layers"][0]["states"][1]["treeNodes"][0]) <= names("TreeNode")

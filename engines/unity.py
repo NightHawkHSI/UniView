@@ -834,6 +834,7 @@ class UnitySession(GameSession):
         self._humanoid = {}      # (clip key, rig) -> clip converted to bone curves
         self._material_readers = {}  # "material:<file>:<id>" -> ObjectReader (filled by hierarchy())
         self._tags = None            # custom tag names (TagManager)
+        self._controller_readers = {}  # "controller:<file>:<id>" -> ObjectReader (filled by controllers())
 
     def _asset_for(self, obj, type_name="Texture2D", name=None):
         """Asset for an ObjectReader (the listed one if we have it)."""
@@ -1095,6 +1096,8 @@ class UnitySession(GameSession):
                     log.debug("Component %s of '%s': %s", name, nodes[index]["name"], e)
                     continue
                 entry = {"type": "MonoBehaviour", "script": name, "props": props} if script else {"type": name, "props": props}
+                seen = self.__dict__.setdefault("_seen_props", set())
+                seen.update(e["p"] for e in props if "Array" not in e["p"] and len(seen) < 200_000)
                 nodes[index].setdefault("components", []).append(entry)
         return nodes
 
@@ -1129,6 +1132,12 @@ class UnitySession(GameSession):
                 return {"asset": self._asset_for(obj, name).uid, "kind": kind}
             if name == "GameObject":
                 return {"asset": f"go:{obj.assets_file.name}:{obj.path_id}", "kind": "gameobject", "cls": "GameObject"}
+            if name == "Sprite":
+                return {"asset": self._asset_for(obj, "Sprite").uid, "kind": "sprite"}
+            if name == "AnimationClip":
+                return {"asset": self._asset_for(obj, "AnimationClip").uid, "kind": "file"}
+            if name == "AnimatorController":
+                return {"asset": f"controller:{obj.assets_file.name}:{obj.path_id}", "kind": "file"}
             listed = self.by_key.get(key)
             if name == "MonoBehaviour" and listed is not None and listed.kind == "data":
                 return {"asset": listed.uid, "kind": "data"}
@@ -1614,6 +1623,160 @@ class UnitySession(GameSession):
             log.info("Indexed which textures %d sprites come from in %.1fs",
                      sum(len(v) for v in sheets.values()), time.time() - started)
         return self._sheets
+
+    # Property names animation curves can target, besides Transform ones; clips store a CRC32 of the name.
+    COMMON_PROPERTIES = ["m_IsActive", "m_Enabled", "m_Color.r", "m_Color.g", "m_Color.b", "m_Color.a",
+                         "m_Intensity", "m_Range", "m_SpotAngle", "m_Volume", "m_Pitch", "m_FieldOfView",
+                         "m_SortingOrder", "m_FlipX", "m_FlipY", "m_Size.x", "m_Size.y", "m_Center.x", "m_Center.y",
+                         "m_Center.z", "m_Radius", "m_Height", "m_AnchoredPosition.x", "m_AnchoredPosition.y",
+                         "m_SizeDelta.x", "m_SizeDelta.y", "m_LocalPosition.x", "m_LocalPosition.y", "m_LocalPosition.z",
+                         "m_Alpha", "m_fontSize", "m_fontColor.r", "m_fontColor.g", "m_fontColor.b", "m_fontColor.a",
+                         "m_BlendShapeWeights.Array.data[0]"]
+
+    def _property_names(self):
+        """CRC32 -> property path, for the curves that name their property by hash."""
+        import zlib
+        if not hasattr(self, "_prop_hash") or self._prop_hash is None:
+            self._prop_hash = {}
+        names = set(self.COMMON_PROPERTIES) | getattr(self, "_seen_props", set())
+        for uid, reader in list(self._material_readers.items()):
+            try:
+                d = read_material_details(reader.read())
+            except Exception:
+                continue
+            for prop in d["floats"]:
+                names.add(f"material.{prop}")
+            for prop in d["colors"]:
+                names.update(f"material.{prop}.{c}" for c in "rgba")
+        for name in names:
+            self._prop_hash.setdefault(zlib.crc32(name.encode("utf-8")) & 0xFFFFFFFF, name)
+        return self._prop_hash
+
+    def clip_export(self, asset):
+        """For exporting an AnimationClip: {"name", "length", "sample_rate", "loop", "legacy", "events",
+        "curves": [{"path", "type", "prop", "keys": [(t, v)]}], "object_curves": [{"path", "type", "prop",
+        "keys": [(t, sprite uid)]}], "skipped"}, with Unity editor binding names."""
+        from UnityPy.enums import ClassIDType
+        info = self._clip(asset)
+        hashes = self._property_names()
+        transform = {"position": "m_LocalPosition", "rotation": "m_LocalRotation", "scale": "m_LocalScale",
+                     "euler": "localEulerAnglesRaw"}
+        curves, objects, skipped = [], [], 0
+        mapping = None
+        for c in info["curves"]:
+            path, prop, class_id = c["path"], c["property"], c.get("class_id")
+            if path.startswith("#"):
+                skipped += 1
+                continue
+            if c.get("object_curve"):
+                if mapping is None:
+                    with self.lock:
+                        mapping = list(asset.ref.read().m_ClipBindingConstant.pptrCurveMapping or [])
+                keys = []
+                for t, v in c["keys"]:
+                    try:
+                        sprite = mapping[int(v)].deref()
+                        keys.append((t, self._asset_for(sprite, "Sprite").uid))
+                    except Exception:
+                        continue
+                if keys:
+                    objects.append({"path": path, "type": "SpriteRenderer", "prop": "m_Sprite", "keys": keys})
+                continue
+            if prop in transform and class_id in (4, None):
+                curves.append({"path": path, "type": "Transform", "keys": c["keys"],
+                               "prop": f"{transform[prop]}.{c['component']}" if c["component"] else transform[prop]})
+                continue
+            if class_id == 95:  # humanoid muscle / body curve on the Animator
+                curves.append({"path": path, "type": "Animator", "prop": prop, "keys": c["keys"]})
+                continue
+            name = prop if class_id is None else hashes.get(c.get("attribute"))
+            if not name:
+                skipped += 1
+                continue
+            if class_id == 114:
+                type_name = ""
+                if c.get("script"):
+                    try:
+                        target = self.finder._file(asset.ref.assets_file, c["script"][0])
+                        script = target.objects[c["script"][1]].read_typetree()
+                        ns, cls = script.get("m_Namespace", ""), script.get("m_ClassName", "")
+                        type_name = f"{ns}.{cls}" if ns else cls
+                    except Exception:
+                        type_name = ""
+                if not type_name:
+                    skipped += 1
+                    continue
+            else:
+                try:
+                    type_name = ClassIDType(class_id).name if class_id is not None else "GameObject"
+                except ValueError:
+                    skipped += 1
+                    continue
+            curves.append({"path": path, "type": type_name, "prop": name, "keys": c["keys"],
+                           "script": class_id == 114})
+        return {"name": info["name"], "length": info["length"], "sample_rate": info["sample_rate"] or 30,
+                "loop": info.get("loop", False), "legacy": info["legacy"], "events": info["events"],
+                "curves": curves, "object_curves": objects, "skipped": skipped}
+
+    def controllers(self):
+        """[(uid "controller:<file>:<id>", name, source file)] of the game's AnimatorControllers."""
+        out = []
+        with self.lock:
+            for obj in self.env.objects:
+                if obj.type.name == "AnimatorController":
+                    uid = f"controller:{obj.assets_file.name}:{obj.path_id}"
+                    self._controller_readers[uid] = obj
+                    out.append((uid, obj.peek_name() or "Controller", obj.assets_file.name))
+        return out
+
+    def controller_export(self, uid):
+        """unity_controller.decode_controller() of a controller from controllers(), clips as their asset uids."""
+        from .unity_controller import decode_controller
+        reader = self._controller_readers[uid]
+        with self.lock:
+            tree = reader.read_typetree()
+            clips = []
+            for ptr in tree.get("m_AnimationClips") or []:
+                try:
+                    target = self.finder._file(reader.assets_file, ptr.get("m_FileID", 0))
+                    obj = target.objects.get(ptr.get("m_PathID")) if target is not None and ptr.get("m_PathID") else None
+                    clips.append(self._asset_for(obj, "AnimationClip").uid if obj is not None else None)
+                except Exception:
+                    clips.append(None)
+        return decode_controller(tree, lambda i: clips[i] if 0 <= i < len(clips) else None)
+
+    def sprite_sheets(self):
+        """For exporting: [{"texture": texture Asset, "sprites": [{"uid", "name", "rect" (x, y, w, h from the
+        bottom), "pivot" (0..1), "border" (left, bottom, right, top), "ppu"}]}] - where each sprite sits in the
+        texture it's drawn from (its own texture, or the atlas it was packed into)."""
+        sheets = {}
+        with self.lock:
+            for a in self.assets:
+                if a.kind != "sprite":
+                    continue
+                try:
+                    tree = a.ref.read_typetree()
+                    rd = tree["m_RD"]
+                    tex = rd["texture"]
+                    if not tex.get("m_PathID"):
+                        continue
+                    target = self.finder._file(a.ref.assets_file, tex.get("m_FileID", 0))
+                    texture = self.by_key.get(obj_key(target, tex["m_PathID"])) if target is not None else None
+                    if texture is None:
+                        continue
+                    packed = int(rd.get("settingsRaw", 0)) & 1
+                    r = rd.get("textureRect") if packed and rd.get("textureRect") else tree["m_Rect"]
+                    pivot = tree.get("m_Pivot") or {"x": 0.5, "y": 0.5}
+                    border = tree.get("m_Border") or {}
+                    sheets.setdefault(texture.key, {"texture": texture, "sprites": []})["sprites"].append({
+                        "uid": a.uid, "name": a.name or "sprite",
+                        "rect": [float(r["x"]), float(r["y"]), float(r["width"]), float(r["height"])],
+                        "pivot": [float(pivot["x"]), float(pivot["y"])],
+                        "border": [float(border.get(k, 0)) for k in ("x", "y", "z", "w")],
+                        "ppu": float(tree.get("m_PixelsToUnits", 100.0))})
+                except Exception as e:
+                    log.debug("Sprite '%s': %s", a.name, e)
+        return list(sheets.values())
 
     def sprite_rects(self, asset):
         if asset.kind != "texture":
