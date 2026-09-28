@@ -586,6 +586,39 @@ class TextureFinder:
 UNDER_READ = re.compile(r"Expected to read (\d+) bytes, but only read (\d+) bytes")
 
 
+def resource_paths(env):
+    """{(file name lowercase, path id): "Resources/<path>"} from the build's Resources index
+    (globalgamemanagers' ResourceManager). UnityPy attaches AssetBundle paths to objects but not these.
+    Which Resources folder an entry came from isn't stored, so they're all under one "Resources/"."""
+    out = {}
+    for f in getattr(env, "assets", []):
+        if (getattr(f, "name", "") or "").lower() != "globalgamemanagers":
+            continue
+        for obj in f.objects.values():
+            if obj.type.name != "ResourceManager":
+                continue
+            try:
+                tree = obj.read_typetree()
+            except Exception as e:
+                log.debug("Resources index unreadable: %s", e)
+                return out
+            externals = f.externals
+            for entry in tree.get("m_Container") or []:
+                try:
+                    path, ptr = entry
+                    fid, pid = ptr.get("m_FileID", 0), ptr.get("m_PathID", 0)
+                    if not pid or not path:
+                        continue
+                    fname = f.name if fid == 0 else os.path.basename(externals[fid - 1].path.replace("\\", "/"))
+                    out.setdefault((fname.lower(), pid), "Resources/" + path)
+                except (IndexError, TypeError, ValueError, AttributeError):
+                    continue
+            if out:
+                log.info("%d path(s) from the Resources index", len(out))
+            return out
+    return out
+
+
 def _aligned_nodes(gen):
     """get_nodes_up for a TypeTreeGenerator, with MonoBehaviour's m_Enabled marked as 4-byte aligned.
 
@@ -599,7 +632,14 @@ def _aligned_nodes(gen):
     def get_nodes_up(assembly, fullname):
         key = (assembly, fullname)
         if key not in cache:
-            root = original(assembly, fullname)
+            try:
+                with _quiet_native_output():  # the native generator prints every failure to the console
+                    root = original(assembly, fullname)
+            except Exception as e:
+                # Remember the failure: a class that can't be laid out fails the same way for each of its
+                # objects, and a game can have thousands (UnityScript assemblies the generator can't load).
+                cache[key] = e
+                raise
             flat = []
 
             def walk(node):
@@ -612,8 +652,38 @@ def _aligned_nodes(gen):
 
             walk(root)
             cache[key] = TypeTreeNode.from_list(flat)
+        if isinstance(cache[key], Exception):
+            raise cache[key]
         return cache[key]
     return get_nodes_up
+
+
+_quiet_lock = threading.Lock()
+
+
+@contextmanager
+def _quiet_native_output():
+    """Send what native code writes to stdout/stderr to nowhere (Python's own streams are left alone)."""
+    with _quiet_lock:
+        saved = []
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+        except OSError:
+            yield
+            return
+        try:
+            for fd in (1, 2):
+                try:
+                    saved.append((fd, os.dup(fd)))
+                    os.dup2(devnull, fd)
+                except OSError:
+                    pass
+            yield
+        finally:
+            for fd, copy in saved:
+                os.dup2(copy, fd)
+                os.close(copy)
+            os.close(devnull)
 
 
 class ScriptReader:
@@ -1860,7 +1930,11 @@ class UnitySession(GameSession):
 
     def audio(self, asset):
         clip = asset.ref.read()
-        samples = clip.samples  # UnityPy converts through FMOD to WAV
+        try:
+            samples = clip.samples  # UnityPy converts through FMOD to WAV
+        except OSError as e:
+            # the clip names no resource file (e.g. a video's audio track): UnityPy opens the game folder itself
+            raise ValueError("This AudioClip's sound data isn't in the game files.") from e
         if not samples:
             raise ValueError("This AudioClip has no sound data in the game files.")
         _name, data = next(iter(samples.items()))
@@ -2062,7 +2136,7 @@ class UnityPlugin(EnginePlugin):
 
     def _scenes_and_prefabs(self, env, session, transforms_by_file, prefab_containers, renderer_readers):
         """Add 'scene' assets: one per level file, one per prefab (bundle container or root object)."""
-        from .unity_scene import is_scene_file, scene_name
+        from .unity_scene import is_scene_file, scene_name, scene_path
         scene_paths = []
         for obj in env.objects:
             if obj.type.name == "BuildSettings":
@@ -2079,7 +2153,8 @@ class UnityPlugin(EnginePlugin):
             name = scene_name(assets_file, scene_paths)
             key = ("scene", file_id)
             session.assets.append(Asset("scene", f"Scene: {name}", key, uid=f"scene:{assets_file.name}",
-                                        size=sum(t.byte_size for t in transforms), path="", source=assets_file.name,
+                                        size=sum(t.byte_size for t in transforms),
+                                        path=scene_path(assets_file, scene_paths), source=assets_file.name,
                                         ref={"type": "scene", "transforms": transforms}))
             added += 1
         # Only prefabs with something to see (skip audio/logic/UI prefabs): a MeshFilter or
@@ -2135,14 +2210,18 @@ class UnityPlugin(EnginePlugin):
                     break
                 k = father[k]
         added = 0
+        res_paths = getattr(session, "resource_paths", None) or {}
         for k in roots:
             t = node[k]
+            path = ""
             try:
-                name = t.read().m_GameObject.deref().peek_name() or "prefab"
+                go = t.read().m_GameObject.deref()
+                name = go.peek_name() or "prefab"
+                path = res_paths.get((go.assets_file.name.lower(), go.path_id), "")  # loaded with Resources.Load
             except Exception:
                 name = "prefab"
             session.assets.append(Asset("scene", f"Prefab: {name}", ("root", k[1], id(t.assets_file)),
-                                        uid=f"prefab:{t.assets_file.name}:{t.path_id}", size=None, path="",
+                                        uid=f"prefab:{t.assets_file.name}:{t.path_id}", size=None, path=path,
                                         source=t.assets_file.name, ref={"type": "root", "transform": t}))
             added += 1
         return added
@@ -2170,6 +2249,8 @@ class UnityPlugin(EnginePlugin):
                 log.warning("Could not load %s: %s: %s", rel, type(e).__name__, e)
         progress("Indexing objects ...")
         session = UnitySession(self, path, env, len(files))
+        res_paths = resource_paths(env)
+        session.resource_paths = res_paths
         transforms_by_file = {}   # id(assets file) -> (assets file, [Transform readers])
         prefab_containers = {}    # container path -> [GameObject readers]
         renderer_readers = []     # MeshFilter / SkinnedMeshRenderer (to find prefab roots in classic builds)
@@ -2204,7 +2285,7 @@ class UnityPlugin(EnginePlugin):
                         continue  # a reference to a built-in/OS font: nothing to show or export
                 except Exception:
                     continue
-            container = getattr(obj, "container", None)
+            container = getattr(obj, "container", None) or res_paths.get((obj.assets_file.name.lower(), obj.path_id))
             if not name:
                 # Unnamed (common for combined/prefab meshes): name it after where it lives.
                 stem = os.path.splitext(os.path.basename(container))[0] if container else type_name

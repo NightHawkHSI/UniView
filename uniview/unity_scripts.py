@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 
 from uniview.constants import log
 
@@ -100,17 +101,29 @@ def plan_assemblies(managed, script_assemblies):
     return decompile, libraries
 
 
-def decompile(ilspycmd, dll, out_dir, reference_dir, language="CSharp9_0", timeout=600):
+def decompile(ilspycmd, dll, out_dir, reference_dir, language="CSharp9_0", timeout=600, cancelled=None):
     """Decompile one assembly to a folder of .cs files (one per type). Returns the number of files.
-    ilspycmd: the command (list, or one path) that runs ilspycmd."""
+    ilspycmd: the command (list, or one path) that runs ilspycmd. cancelled() -> True stops it early."""
     from uniview.tools import ilspy_env
     os.makedirs(out_dir, exist_ok=True)
     command = list(ilspycmd) if isinstance(ilspycmd, (list, tuple)) else [ilspycmd]
-    result = subprocess.run(command + ["-p", "-lv", language, "-o", out_dir, "-r", reference_dir, dll],
-                            capture_output=True, text=True, timeout=timeout, env=ilspy_env(),
+    # --nested-directories: a folder per namespace part (Game/UI/Menu/), close to how projects are laid out
+    proc = subprocess.Popen(command + ["-p", "--nested-directories", "-lv", language, "-o", out_dir,
+                                       "-r", reference_dir, dll],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ilspy_env(),
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout or "ilspycmd failed").strip().splitlines()[-1])
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            out, err = proc.communicate(timeout=0.25)
+            break
+        except subprocess.TimeoutExpired:
+            if (cancelled is not None and cancelled()) or time.monotonic() > deadline:
+                proc.kill()
+                proc.communicate()
+                raise RuntimeError("stopped" if cancelled is not None and cancelled() else "took too long")
+    if proc.returncode != 0:
+        raise RuntimeError((err or out or "ilspycmd failed").strip().splitlines()[-1])
     # Project files and assembly attributes would clash when everything compiles into Unity's assemblies.
     shutil.rmtree(os.path.join(out_dir, "Properties"), ignore_errors=True)
     for name in os.listdir(out_dir):
@@ -143,7 +156,7 @@ def export_scripts(session, assets_dir, progress=None, cancelled=None, unity_ver
             progress(n, len(to_decompile), f"Decompiling {name}.dll")
         try:
             files += decompile(ilspycmd, os.path.join(managed, name + ".dll"), os.path.join(out_root, name), managed,
-                               csharp_version(unity_version))
+                               csharp_version(unity_version), cancelled=cancelled)
         except Exception as e:
             log.warning("Could not decompile %s.dll: %s", name, e)
     renamed = fix_api_renames(out_root, unity_version)

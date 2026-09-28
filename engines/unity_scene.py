@@ -267,6 +267,14 @@ def build(session, roots, name):
     return md, materials, info
 
 
+def scene_path(assets_file, scene_paths):
+    """The scene's path in the original project ('Assets/Scenes/Main.unity') from the build's scene list, or ''."""
+    m = re.match(r"level(\d+)$", assets_file.name or "", re.I)
+    if m and int(m.group(1)) < len(scene_paths):
+        return str(scene_paths[int(m.group(1))] or "")
+    return ""
+
+
 def scene_name(assets_file, scene_paths):
     m = re.match(r"level(\d+)$", assets_file.name or "", re.I)
     if m and int(m.group(1)) < len(scene_paths):

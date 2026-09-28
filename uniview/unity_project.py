@@ -14,13 +14,12 @@ import hashlib
 import json
 import os
 import re
+from types import SimpleNamespace
 
 from engines.sdk import NORMAL, Material
 from uniview.constants import log
 from uniview.export import (
     export_ext,
-    export_stem,
-    export_subfolder,
     rig_for_export,
     session_materials,
     write_asset,
@@ -29,6 +28,8 @@ from uniview.export import (
 )
 from uniview.search import is_unreadable
 from uniview.unity_builder import BUILDER_CS
+from uniview.unity_layout import KIND_FOLDERS, Layout, collect_usage
+from uniview.unity_layout import target as layout_target
 from uniview.unity_materials import convert, mat_yaml
 from uniview.unity_packages import game_assemblies, packages_for, recommended_versions
 from uniview.util import safe_filename
@@ -177,21 +178,15 @@ def is_prefab(asset):
     return asset.kind == "scene" and isinstance(asset.key, tuple) and asset.key[:1] in (("prefab",), ("root",))
 
 
-def plan_prefabs(assets, assets_dir):
+def plan_prefabs(assets, assets_dir, layout=None):
     """[(prefab asset, target .prefab path)], unique per folder."""
+    layout = layout or Layout(assets)
     out, used = [], set()
     for asset in assets:
         if not is_prefab(asset) or asset.source in BUILTIN_SOURCES:
             continue
-        sub = export_subfolder(asset) if asset.path else os.path.join(safe_filename(asset.source or "prefabs"), "Prefabs")
-        folder = os.path.normpath(os.path.join(assets_dir, sub))
-        base = safe_filename(os.path.basename(asset.name.split(": ", 1)[-1].replace("\\", "/"))) or "prefab"
-        name, i = base, 1
-        while (folder.lower(), name.lower()) in used:
-            i += 1
-            name = f"{base}_{i}"
-        used.add((folder.lower(), name.lower()))
-        out.append((asset, os.path.join(folder, f"{name}.prefab")))
+        folder, stem, _how = layout.place(asset, KIND_FOLDERS["prefab"])
+        out.append((asset, layout_target(assets_dir, folder, stem or "prefab", "prefab", used)))
     return out
 
 
@@ -201,10 +196,12 @@ def unity_path(root, path):
 
 
 class MaterialLibrary:
-    """Writes each game material as a .mat the first time a renderer uses it (Assets/<file>/Materials/)."""
+    """Writes each game material as a .mat the first time a renderer uses it (next to the one prefab
+    that uses it, else Assets/Materials/)."""
 
-    def __init__(self, session, root, assets_dir, texture_paths):
+    def __init__(self, session, root, assets_dir, texture_paths, layout=None):
         self.session, self.root, self.assets_dir = session, root, assets_dir
+        self.layout = layout or Layout()
         self.texture_paths = texture_paths  # texture asset key -> exported path
         self.paths = {}                     # material uid -> "Assets/..." ('' if it couldn't be written)
         self.used = set()
@@ -229,8 +226,8 @@ class MaterialLibrary:
         return self.paths[uid]
 
     def _write(self, uid, details):
-        source = uid.split(":", 2)[1] if uid.count(":") >= 2 else "materials"
-        folder = os.path.join(self.assets_dir, safe_filename(source), "Materials")
+        folder = os.path.join(self.assets_dir, *[safe_filename(p)[:80] for p in
+                                                 self.layout.material_folder(uid).split("/") if p])
         base = safe_filename(details.get("name") or "Material") or "Material"
         name, i = base, 1
         while os.path.join(folder, name).lower() in self.used:
@@ -312,20 +309,15 @@ def is_scene(asset):
     return asset.kind == "scene" and isinstance(asset.key, tuple) and asset.key[:1] == ("scene",)
 
 
-def plan_scenes(assets, assets_dir):
-    """[(scene asset, target .unity path)] in Assets/Scenes/, unique names."""
+def plan_scenes(assets, assets_dir, layout=None):
+    """[(scene asset, target .unity path)]: where the build's scene list says, else Assets/Scenes/."""
+    layout = layout or Layout(assets)
     out, used = [], set()
-    folder = os.path.join(assets_dir, "Scenes")
     for asset in assets:
         if not is_scene(asset):
             continue
-        base = safe_filename(asset.name.split(": ", 1)[-1]) or "Scene"
-        name, i = base, 1
-        while name.lower() in used:
-            i += 1
-            name = f"{base}_{i}"
-        used.add(name.lower())
-        out.append((asset, os.path.join(folder, f"{name}.unity")))
+        folder, stem, _how = layout.place(asset, KIND_FOLDERS["scene"])
+        out.append((asset, layout_target(assets_dir, folder, stem or "Scene", "unity", used)))
     return out
 
 
@@ -420,7 +412,7 @@ def write_settings_description(session, root, assets_dir, scene_targets):
 
 
 def write_scene_descriptions(session, root, assets_dir, model_paths, texture_paths, cancelled=None, materials=None,
-                             prefab_objects=None):
+                             prefab_objects=None, layout=None):
     """One JSON per scene (+ its static-batch GLBs); returns (files written, failed)."""
     if not hasattr(session, "hierarchy"):
         return 0, 0
@@ -428,7 +420,7 @@ def write_scene_descriptions(session, root, assets_dir, model_paths, texture_pat
     build_dir = os.path.join(assets_dir, *BUILD_DIR)
     builtin_meshes = {a.uid: a.name for a in session.assets
                       if a.kind in MODEL_KINDS and a.source in BUILTIN_SOURCES and a.name in BUILTIN_MESHES}
-    for asset, target in plan_scenes(session.assets, assets_dir):
+    for asset, target in plan_scenes(session.assets, assets_dir, layout):
         if cancelled is not None and cancelled():
             break
         try:
@@ -468,12 +460,12 @@ def write_builder(root, assets_dir):
     write_folder_metas(assets_dir, os.path.dirname(path))
 
 
-def prefab_object_map(session, root, assets_dir):
+def prefab_object_map(session, root, assets_dir, layout=None):
     """{"go:<file>:<id>": ("Assets/...prefab", child path)} for every exported prefab's GameObjects."""
     out = {}
     if not hasattr(session, "object_paths"):
         return out
-    for asset, target in plan_prefabs(session.assets, assets_dir):
+    for asset, target in plan_prefabs(session.assets, assets_dir, layout):
         try:
             for go, path in session.object_paths(asset).items():
                 out.setdefault(go, (unity_path(root, target), path))
@@ -482,22 +474,17 @@ def prefab_object_map(session, root, assets_dir):
     return out
 
 
-def plan_data(assets, assets_dir):
+def plan_data(assets, assets_dir, layout=None):
     """[(data asset, target .asset path)]: the game's ScriptableObjects (item stats, loot tables...)."""
+    layout = layout or Layout(assets)
     out, used = [], set()
     for asset in assets:
         if asset.kind != "data" or asset.source in BUILTIN_SOURCES:
             continue
         if getattr(getattr(asset.ref, "type", None), "name", "") != "MonoBehaviour":
             continue
-        folder = os.path.join(assets_dir, safe_filename(asset.source or "data"), "Data")
-        base = safe_filename(os.path.basename(asset.name.replace("\\", "/"))) or "Data"
-        name, i = base, 1
-        while (folder.lower(), name.lower()) in used:
-            i += 1
-            name = f"{base}_{i}"
-        used.add((folder.lower(), name.lower()))
-        out.append((asset, os.path.join(folder, f"{name}.asset")))
+        folder, stem, _how = layout.place(asset, KIND_FOLDERS["data"])
+        out.append((asset, layout_target(assets_dir, folder, stem or "Data", "asset", used)))
     return out
 
 
@@ -533,22 +520,17 @@ def write_sprites_description(session, root, assets_dir, model_paths):
     return links
 
 
-def plan_clips(assets, assets_dir):
+def plan_clips(assets, assets_dir, layout=None):
     """[(animation clip asset, target .anim path)]."""
+    layout = layout or Layout(assets)
     out, used = [], set()
     for asset in assets:
         if asset.kind != "animation" or asset.source in BUILTIN_SOURCES:
             continue
         if getattr(getattr(asset.ref, "type", None), "name", "") != "AnimationClip":
             continue
-        folder = os.path.join(assets_dir, safe_filename(asset.source or "animations"), "Animations")
-        base = safe_filename(os.path.basename(asset.name.replace("\\", "/"))) or "Clip"
-        name, i = base, 1
-        while (folder.lower(), name.lower()) in used:
-            i += 1
-            name = f"{base}_{i}"
-        used.add((folder.lower(), name.lower()))
-        out.append((asset, os.path.join(folder, f"{name}.anim")))
+        folder, stem, _how = layout.place(asset, KIND_FOLDERS["animation"])
+        out.append((asset, layout_target(assets_dir, folder, stem or "Clip", "anim", used)))
     return out
 
 
@@ -591,22 +573,18 @@ def write_clip_descriptions(session, root, assets_dir, clip_plan, sprite_links, 
     return written, failed
 
 
-def plan_controllers(session, assets_dir):
+def plan_controllers(session, assets_dir, layout=None):
     """[(uid, target .controller path)] for the game's AnimatorControllers."""
     if not hasattr(session, "controllers"):
         return []
+    layout = layout or Layout(session.assets)
     out, used = [], set()
     for uid, name, source in session.controllers():
         if source in BUILTIN_SOURCES:
             continue
-        folder = os.path.join(assets_dir, safe_filename(source or "animators"), "Animators")
-        base = safe_filename(name) or "Controller"
-        stem, i = base, 1
-        while (folder.lower(), stem.lower()) in used:
-            i += 1
-            stem = f"{base}_{i}"
-        used.add((folder.lower(), stem.lower()))
-        out.append((uid, os.path.join(folder, f"{stem}.controller")))
+        item = SimpleNamespace(uid=uid, name=name or "Controller", kind="controller", path="", source=source)
+        folder, stem, _how = layout.place(item, KIND_FOLDERS["controller"])
+        out.append((uid, layout_target(assets_dir, folder, stem or "Controller", "controller", used)))
     return out
 
 
@@ -697,7 +675,7 @@ def write_data_descriptions(session, root, assets_dir, data_plan, model_paths, m
 
 
 def write_prefab_descriptions(session, root, assets_dir, model_paths, cancelled=None, materials=None,
-                              prefab_objects=None):
+                              prefab_objects=None, layout=None):
     """One JSON per prefab under Assets/UniView/Build/; returns (written, failed)."""
     if not hasattr(session, "hierarchy"):
         return 0, 0
@@ -705,7 +683,7 @@ def write_prefab_descriptions(session, root, assets_dir, model_paths, cancelled=
     build_dir = os.path.join(assets_dir, *BUILD_DIR)
     builtin_meshes = {a.uid: a.name for a in session.assets
                       if a.kind in MODEL_KINDS and a.source in BUILTIN_SOURCES and a.name in BUILTIN_MESHES}
-    for asset, target in plan_prefabs(session.assets, assets_dir):
+    for asset, target in plan_prefabs(session.assets, assets_dir, layout):
         if cancelled is not None and cancelled():
             break
         try:
@@ -735,21 +713,18 @@ def exportable(asset):
     return asset.kind in FILE_KINDS + MODEL_KINDS and asset.source not in BUILTIN_SOURCES
 
 
-def plan(assets, assets_dir, model_format="glb"):
+def plan(assets, assets_dir, model_format="glb", layout=None):
     """[(asset, target path)] for the files to write, with unique names per folder."""
+    layout = layout or Layout(assets)
     out, used = [], set()
     for asset in assets:
         if not exportable(asset):
             continue
         ext = export_ext(asset, model_format)
-        folder = os.path.normpath(os.path.join(assets_dir, export_subfolder(asset)))
-        base = export_stem(asset, ext)
-        name, i = base, 1
-        while (folder.lower(), name.lower()) in used:
-            i += 1
-            name = f"{base}_{i}"
-        used.add((folder.lower(), name.lower()))
-        out.append((asset, os.path.join(folder, f"{name}.{ext}")))
+        folder, stem, _how = layout.place(asset)
+        if asset.kind in ("text", "file", "audio") and stem.lower().endswith("." + ext.lower()):
+            stem = stem[: -len(ext) - 1]
+        out.append((asset, layout_target(assets_dir, folder, stem, ext, used)))
     return out
 
 
@@ -782,6 +757,30 @@ def _skippable(session, asset):
     return is_unreadable(stats) or (asset.kind in MODEL_KINDS and not stats.get("tris"))
 
 
+def find_owners(session, layout, cancelled=None, progress=None):
+    """Tell the layout which assets belong next to a model or prefab whose original folder is known:
+    the textures of models, and what those prefabs use."""
+    for asset in session.assets:
+        if cancelled is not None and cancelled():
+            return
+        if asset.kind not in MODEL_KINDS or not exportable(asset):
+            continue
+        real = layout.real_place(asset)
+        if real is None:
+            continue
+        try:
+            with session.lock:
+                materials = session_materials(session, asset)
+            for mat in materials:
+                for tex in mat.textures:
+                    layout.use(tex.asset.uid, real[0], model=True)
+        except Exception as e:
+            log.debug("Textures of '%s': %s", asset.name, e)
+    prefabs = [(a, layout.real_place(a)) for a in session.assets
+               if is_prefab(a) and a.source not in BUILTIN_SOURCES]
+    collect_usage(session, layout, [(a, real[0]) for a, real in prefabs if real is not None], cancelled, progress)
+
+
 def export_unity_project(session, root, version="", progress=None, cancelled=None, editor_exe=None,
                          scripts=True, notes=None):
     """Write the project; returns (files written, failed, skipped). progress(done, total, text) is called
@@ -801,7 +800,9 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
     if gltf and not write_manifest(root, editor_exe, gltfast_version(version), packages):
         log.warning("No Unity editor to read the package list from: models are saved as OBJ")
         gltf = False
-    jobs = plan(session.assets, assets_dir, "glb" if gltf else "obj")
+    layout = Layout(session.assets)
+    find_owners(session, layout, cancelled, progress)
+    jobs = plan(session.assets, assets_dir, "glb" if gltf else "obj", layout)
     texture_paths = {a.key: p for a, p in jobs if a.kind == "texture"}
     # Models first: they tell which textures are normal maps (their .meta says so).
     jobs.sort(key=lambda job: job[0].kind not in MODEL_KINDS)
@@ -837,22 +838,23 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
         if progress is not None:
             progress(len(jobs), len(jobs), "prefabs")
         model_paths = {asset.uid: path for asset, path in jobs if os.path.isfile(path)}  # models, sounds, textures...
-        library = MaterialLibrary(session, root, assets_dir, texture_paths) if hasattr(session, "material_details") else None
-        data_plan = plan_data(session.assets, assets_dir)
+        library = (MaterialLibrary(session, root, assets_dir, texture_paths, layout)
+                   if hasattr(session, "material_details") else None)
+        data_plan = plan_data(session.assets, assets_dir, layout)
         model_paths.update({a.uid: p for a, p in data_plan})  # links to data assets
-        clip_plan = plan_clips(session.assets, assets_dir)
+        clip_plan = plan_clips(session.assets, assets_dir, layout)
         model_paths.update({a.uid: p for a, p in clip_plan})  # links to animation clips
-        controller_plan = plan_controllers(session, assets_dir)
+        controller_plan = plan_controllers(session, assets_dir, layout)
         model_paths.update(dict(controller_plan))  # links to animator controllers
-        prefab_objects = prefab_object_map(session, root, assets_dir)
+        prefab_objects = prefab_object_map(session, root, assets_dir, layout)
         sprite_links = write_sprites_description(session, root, assets_dir, model_paths)
         prefab_objects.update(sprite_links)  # links to sprites
         prefabs, prefab_failed = write_prefab_descriptions(session, root, assets_dir, model_paths, cancelled, library,
-                                                           prefab_objects)
+                                                           prefab_objects, layout)
         if progress is not None:
             progress(len(jobs), len(jobs), "scenes")
         scenes, scene_failed = write_scene_descriptions(session, root, assets_dir, model_paths, texture_paths,
-                                                        cancelled, library, prefab_objects)
+                                                        cancelled, library, prefab_objects, layout)
         data, data_failed = write_data_descriptions(session, root, assets_dir, data_plan, model_paths, library,
                                                     prefab_objects, cancelled)
         clips, clip_failed = write_clip_descriptions(session, root, assets_dir, clip_plan, sprite_links, cancelled)
@@ -861,7 +863,7 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
         written += data + clips + ctrls
         failed += data_failed + clip_failed + ctrl_failed
         if (prefabs or scenes) and write_settings_description(session, root, assets_dir,
-                                                                plan_scenes(session.assets, assets_dir)):
+                                                                plan_scenes(session.assets, assets_dir, layout)):
             written += 1
         written += prefabs + scenes + (library.written if library else 0)
         if (scripts and hasattr(session, "script_assemblies") and (prefabs or scenes)
@@ -882,5 +884,10 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
                 log.warning("Could not export the game's scripts: %s", e)
         failed += prefab_failed + scene_failed + (library.failed if library else 0)
         log.info("Unity project: %d prefab and %d scene file(s) for UniViewBuilder.cs", prefabs, scenes)
+    report = layout.report()
+    if report:
+        log.info(report)
+        if notes is not None:
+            notes.insert(0, report)
     log.info("Unity project: %d file(s) written, %d failed, %d skipped", written, failed, skipped)
     return written, failed, skipped

@@ -119,8 +119,7 @@ def test_plan_skips_builtins_and_unhandled_kinds(tmp_path):
               Asset("scene", "Scene: Main", 6, source="level0"),
               Asset("audio", "boom", 5, source="resources.assets", ext="wav")]
     rel = [os.path.relpath(p, tmp_path).replace("\\", "/") for _a, p in up.plan(assets, str(tmp_path))]
-    assert rel == ["sharedassets0.assets/Textures/wall.png", "sharedassets0.assets/Textures/wall_2.png",
-                   "sharedassets0.assets/Models/crate.glb", "resources.assets/Audio/boom.wav"]
+    assert rel == ["Textures/wall.png", "Textures/wall_2.png", "Models/crate.glb", "Audio/boom.wav"]
     assert up.plan(assets, str(tmp_path), "obj")[2][1].endswith("crate.obj")
 
 
@@ -144,17 +143,17 @@ def test_export_writes_project_with_models(tmp_path):
     assert calls[-1] == (7, 7)
     assert open(root / "ProjectSettings" / "ProjectVersion.txt").read() == "m_EditorVersion: 6000.5.4f1\n"
     assert "com.unity.cloud.gltfast" in open(root / "Packages" / "manifest.json").read()
-    tex = root / "Assets" / "sharedassets0.assets" / "Textures"
+    tex = root / "Assets" / "Textures"
     assert open(str(tex / "wall.png") + ".meta").read() == up.meta_text(up.asset_guid("s:1"), 0)
     assert open(str(tex / "wall_n.png") + ".meta").read() == up.meta_text(up.asset_guid("s:5"), 1)  # normal map
-    glb = root / "Assets" / "sharedassets1.assets" / "Models" / "crate.glb"
+    glb = root / "Assets" / "Models" / "crate.glb"
     assert open(str(glb) + ".meta").read() == up.meta_text(up.asset_guid("s:6"))
     gltf = glb_json(glb)
     uris = [img["uri"] for img in gltf["images"]]
-    assert uris == ["../../sharedassets0.assets/Textures/wall.png", "../../sharedassets0.assets/Textures/wall_n.png"]
+    assert uris == ["../Textures/wall.png", "../Textures/wall_n.png"]
     assert "normalTexture" in gltf["materials"][0]
     assert "bufferView" not in gltf["images"][0]  # referenced, not embedded
-    assert "folderAsset: yes" in open(root / "Assets" / "sharedassets0.assets" / "Textures.meta").read()
+    assert "folderAsset: yes" in open(root / "Assets" / "Textures.meta").read()
     assert not (root / "Assets.meta").exists()
 
 
@@ -162,7 +161,7 @@ def test_export_old_unity_uses_obj_without_manifest(tmp_path):
     assets = [Asset("model", "crate", "c", uid="s:6", source="sharedassets1.assets")]
     written, failed, _ = up.export_unity_project(Session(assets), str(tmp_path), "2019.4.19f1",
                                                  editor_exe=fake_editor(tmp_path))
-    models = tmp_path / "Assets" / "sharedassets1.assets" / "Models"
+    models = tmp_path / "Assets" / "Models"
     assert failed == 0 and (models / "crate.obj").exists()
     assert (models / "crate.obj.meta").exists()
     assert not (tmp_path / "Packages").exists()
@@ -198,8 +197,7 @@ def test_plan_prefabs(tmp_path):
               Asset("scene", "Prefab: Boat", ("root", 3, 2), uid="prefab:b2", source="sharedassets1.assets"),
               Asset("scene", "Scene: Main", ("scene", 5), uid="scene:level0", source="level0")]
     rel = [os.path.relpath(p, tmp_path).replace("\\", "/") for _a, p in up.plan_prefabs(assets, str(tmp_path))]
-    assert rel == ["assets/prefabs/cubes/corner.prefab", "sharedassets1.assets/Prefabs/Boat.prefab",
-                   "sharedassets1.assets/Prefabs/Boat_2.prefab"]
+    assert rel == ["prefabs/cubes/corner.prefab", "Prefabs/Boat.prefab", "Prefabs/Boat_2.prefab"]
 
 
 def test_export_writes_prefab_descriptions_and_builder(tmp_path):
@@ -210,12 +208,12 @@ def test_export_writes_prefab_descriptions_and_builder(tmp_path):
     written, failed, _ = up.export_unity_project(PrefabSession([crate, sphere, prefab]), str(root), "6000.5.4f1",
                                                  editor_exe=fake_editor(tmp_path))
     assert (written, failed) == (2, 0)  # the GLB + one prefab description
-    desc_path = root / "Assets" / "UniView" / "Build" / "sharedassets1.assets" / "Prefabs" / "Crate.prefab.json"
+    desc_path = root / "Assets" / "UniView" / "Build" / "Prefabs" / "Crate.prefab.json"
     desc = json.load(open(desc_path))
-    assert desc["kind"] == "prefab" and desc["target"] == "Assets/sharedassets1.assets/Prefabs/Crate.prefab"
+    assert desc["kind"] == "prefab" and desc["target"] == "Assets/Prefabs/Crate.prefab"
     nodes = desc["nodes"]
     assert [n["name"] for n in nodes] == ["Crate", "Body", "Ball", "Ghost"]
-    assert nodes[1]["model"] == "Assets/sharedassets1.assets/Models/crate.glb" and not nodes[1]["active"]
+    assert nodes[1]["model"] == "Assets/Models/crate.glb" and not nodes[1]["active"]
     assert nodes[1]["rendererEnabled"] is False and nodes[1]["scale"] == [2.0, 2.0, 2.0]
     assert nodes[2]["model"] == "" and nodes[2]["builtin"] == "Sphere"
     assert nodes[3]["model"] == "" and nodes[3]["builtin"] == "" and nodes[3]["skinned"] is True
@@ -310,7 +308,7 @@ def test_export_scene_with_static_batches_lights_and_terrain(tmp_path):
     assert desc["kind"] == "scene" and desc["target"] == "Assets/Scenes/Main.unity"
     nodes = {n["name"]: n for n in desc["nodes"]}
     assert nodes["Wall"]["model"] == "" and nodes["Floor"]["model"] == ""  # drawn by the batch instead
-    assert nodes["Ground"]["model"] == "Assets/level0/Models/Terrain_ Ground.glb"
+    assert nodes["Ground"]["model"] == "Assets/Models/Terrain_ Ground.glb"
     assert nodes["Sun"]["light"] == {"present": True, "type": 1, "color": [1.0, 0.9, 0.8, 1.0], "intensity": 1.2,
                                      "range": 10, "spotAngle": 30, "enabled": True}
     assert "light" not in nodes["Wall"]
@@ -346,13 +344,13 @@ def test_export_writes_mat_files_for_renderers(tmp_path):
     written, failed, _ = up.export_unity_project(MaterialSession([wall, crate, prefab]), str(root), "6000.5.4f1",
                                                  editor_exe=fake_editor(tmp_path))
     assert failed == 0
-    mat = root / "Assets" / "sharedassets1.assets" / "Materials" / "Shield.mat"
+    mat = root / "Assets" / "Materials" / "Shield.mat"
     text = mat.read_text()
     assert "m_CustomRenderQueue: 3000" in text and up.asset_guid("s:1") in text  # transparent, texture by GUID
     assert open(str(mat) + ".meta").read() == up.meta_text(up.asset_guid("material:sharedassets1.assets:77"))
-    desc = json.load(open(root / "Assets" / "UniView" / "Build" / "sharedassets1.assets" / "Prefabs" / "Crate.prefab.json"))
+    desc = json.load(open(root / "Assets" / "UniView" / "Build" / "Prefabs" / "Crate.prefab.json"))
     body = desc["nodes"][1]
-    assert body["materials"] == ["Assets/sharedassets1.assets/Materials/Shield.mat", ""]
+    assert body["materials"] == ["Assets/Materials/Shield.mat", ""]
     assert desc["nodes"][0]["materials"] == []  # no renderer, no materials
     assert body["noMaterials"] is False and desc["nodes"][0]["noMaterials"] is False
 
@@ -392,7 +390,7 @@ def test_settings_and_layers_tags(tmp_path):
     assert settings["kind"] == "settings" and settings["product"] == "Muck" and settings["company"] == "Dani"
     assert settings["scenes"] == ["Assets/Scenes/Menu.unity", "Assets/Scenes/Game.unity"]  # build order, by level
     assert settings["managers"][0]["type"] == "TagManager"
-    desc = json.load(open(root / "Assets" / "UniView" / "Build" / "sharedassets1.assets" / "Prefabs" / "Crate.prefab.json"))
+    desc = json.load(open(root / "Assets" / "UniView" / "Build" / "Prefabs" / "Crate.prefab.json"))
     assert desc["nodes"][1]["layer"] == 9 and desc["nodes"][1]["tag"] == "Enemy"
     from uniview.unity_builder import BUILDER_CS
     import re
@@ -423,15 +421,15 @@ def test_data_assets_and_prefab_links(tmp_path):
     written, failed, _ = up.export_unity_project(DataSession([item, other, prefab]), str(root), "6000.5.4f1",
                                                  editor_exe=fake_editor(tmp_path))
     assert failed == 0
-    desc = json.load(open(root / "Assets" / "UniView" / "Build" / "sharedassets0.assets" / "Data" / "Wood_DarkOak.asset.json"))
+    desc = json.load(open(root / "Assets" / "UniView" / "Build" / "Data" / "Wood_DarkOak.asset.json"))
     assert desc["kind"] == "data" and desc["script"] == "InventoryItem"
-    assert desc["target"] == "Assets/sharedassets0.assets/Data/Wood_DarkOak.asset"
+    assert desc["target"] == "Assets/Data/Wood_DarkOak.asset"
     props = {e["p"]: e for e in desc["props"]}
     assert props["name"] == {"p": "name", "t": "s", "s": "Dark Oak Wood"}
-    crate = "Assets/sharedassets1.assets/Prefabs/Crate.prefab"
+    crate = "Assets/Prefabs/Crate.prefab"
     assert props["dropPrefab"] == {"p": "dropPrefab", "t": "a", "s": crate, "c": "GameObject", "q": ""}
     assert props["arm"] == {"p": "arm", "t": "a", "s": crate, "c": "Rigidbody", "q": "Body/Arm"}
-    assert props["next"] == {"p": "next", "t": "a", "s": "Assets/sharedassets0.assets/Data/Wood_Oak.asset"}
+    assert props["next"] == {"p": "next", "t": "a", "s": "Assets/Data/Wood_Oak.asset"}
     from uniview.unity_builder import BUILDER_CS
     import re
     fields = lambda cls: set(re.findall(r"public \w+(?:\[\])? (\w+)",  # noqa: E731
@@ -458,8 +456,8 @@ def test_clip_description_matches_builder_classes(tmp_path):
     prefab = Asset("scene", "Prefab: Crate", ("root", 1, 1), uid="prefab:crate", source="sharedassets1.assets")
     root = tmp_path / "proj"
     up.export_unity_project(ClipSession([clip, prefab]), str(root), "6000.5.4f1", editor_exe=fake_editor(tmp_path))
-    desc = json.load(open(root / "Assets" / "UniView" / "Build" / "sharedassets0.assets" / "Animations" / "Walk.anim.json"))
-    assert desc["kind"] == "clip" and desc["target"] == "Assets/sharedassets0.assets/Animations/Walk.anim"
+    desc = json.load(open(root / "Assets" / "UniView" / "Build" / "Animations" / "Walk.anim.json"))
+    assert desc["kind"] == "clip" and desc["target"] == "Assets/Animations/Walk.anim"
     c = desc["clip"]
     assert c["loop"] is True and c["curves"][0]["keys"] == [0.0, 1.0, 1.0, 2.0]
     fields = lambda cls: set(re.findall(r"public \w+(?:\[\])? (\w+)",  # noqa: E731

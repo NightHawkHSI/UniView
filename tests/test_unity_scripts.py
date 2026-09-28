@@ -42,3 +42,35 @@ def test_csharp_version_and_renames(tmp_path):
     assert fix_api_renames(str(tmp_path), "2022.3.1f1") == 0
     assert fix_api_renames(str(tmp_path), "6000.5.4f1") == 1
     assert src.read_text(encoding="utf-8") == "PhysicsMaterial m; PhysicsMaterialCombine c; MyPhysicMaterials x;"
+
+
+def test_failed_layouts_are_not_retried():
+    from engines.unity import _aligned_nodes
+
+    class Gen:
+        calls = 0
+
+        def get_nodes_up(self, assembly, fullname):
+            Gen.calls += 1
+            raise KeyError(assembly)
+
+    get = _aligned_nodes(Gen())
+    for _ in range(3):
+        try:
+            get("Assembly-UnityScript", "Foo")
+        except KeyError:
+            pass
+    assert Gen.calls == 1
+
+
+def test_decompile_can_be_cancelled(tmp_path):
+    import sys
+    import time
+    import pytest
+    from uniview.unity_scripts import decompile
+
+    slow = [sys.executable, "-c", "import time; time.sleep(30)"]
+    start = time.monotonic()
+    with pytest.raises(RuntimeError, match="stopped"):
+        decompile(slow, "x.dll", str(tmp_path / "out"), str(tmp_path), cancelled=lambda: True)
+    assert time.monotonic() - start < 5
