@@ -37,6 +37,8 @@ namespace UniView
         public double v;
         public string s;
         public int n;
+        public string c;   // "a" into another prefab: the object's class (GameObject, Transform, a component)
+        public string q;   // ...and its child path in that prefab ("" = root)
     }
 
     [Serializable]
@@ -94,6 +96,8 @@ namespace UniView
         public string[] scenes;
         public string product;
         public string company;
+        public string script;  // kind "data": the ScriptableObject class
+        public Prop[] props;   // kind "data": its values
     }
 
     [InitializeOnLoad]
@@ -108,10 +112,21 @@ namespace UniView
         }
 
         const string SettingsMarker = "ProjectSettings/UniViewSettingsApplied.txt";
+        const string ScriptsParked = "Assets/UniView/GameScripts~";   // ignored by Unity
+        const string ScriptsActive = "Assets/GameScripts";
+        const string RebuildMarker = "ProjectSettings/UniViewRebuildAfterScripts.txt";
 
         static void BuildMissingIfAny()
         {
             if (EditorApplication.isPlayingOrWillChangePlaymode) return;
+            if (File.Exists(RebuildMarker) && Directory.Exists(ScriptsActive))
+            {
+                // The game's scripts were just added and compile: build again so the script components get attached.
+                File.Delete(RebuildMarker);
+                Debug.Log("UniView: the game's scripts compiled - rebuilding prefabs and scenes with their script components");
+                RebuildAll();
+                return;
+            }
             if (!File.Exists(SettingsMarker) && File.Exists(BuildDir + "/ProjectSettings.json")) { BuildMissing(); return; }
             foreach (string file in Descriptions())
             {
@@ -119,6 +134,47 @@ namespace UniView
                 if (d != null && !File.Exists(d.target)) { BuildMissing(); return; }
             }
         }
+
+        [MenuItem("UniView/Add the game's scripts (decompiled)")]
+        public static void AddGameScripts()
+        {
+            if (!Directory.Exists(ScriptsParked))
+            {
+                Debug.LogWarning("UniView: no decompiled scripts in this project (" + ScriptsParked + ")");
+                return;
+            }
+            if (Directory.Exists(ScriptsActive))
+            {
+                Debug.LogWarning("UniView: " + ScriptsActive + " already exists");
+                return;
+            }
+            if (!Application.isBatchMode && !EditorUtility.DisplayDialog("UniView",
+                "Move the game's decompiled code into " + ScriptsActive + " so Unity compiles it?\n\n"
+                + "Decompiled code often needs fixes before it compiles. If there are errors, fix them, or use "
+                + "UniView > Remove the game's scripts to go back. Once it compiles, the prefabs and scenes are "
+                + "rebuilt with their script components.", "Add scripts", "Cancel")) return;
+            Directory.Move(ScriptsParked, ScriptsActive);
+            if (File.Exists(ScriptsParked + ".meta")) File.Delete(ScriptsParked + ".meta");
+            File.WriteAllText(RebuildMarker, "UniView: rebuild prefabs and scenes once the game's scripts compile.\n");
+            AssetDatabase.Refresh();
+        }
+
+        [MenuItem("UniView/Add the game's scripts (decompiled)", true)]
+        static bool CanAddGameScripts() { return Directory.Exists(ScriptsParked) && !Directory.Exists(ScriptsActive); }
+
+        [MenuItem("UniView/Remove the game's scripts")]
+        public static void RemoveGameScripts()
+        {
+            if (!Directory.Exists(ScriptsActive)) return;
+            Directory.Move(ScriptsActive, ScriptsParked);
+            if (File.Exists(ScriptsActive + ".meta")) File.Delete(ScriptsActive + ".meta");
+            if (File.Exists(RebuildMarker)) File.Delete(RebuildMarker);
+            AssetDatabase.Refresh();
+            Debug.Log("UniView: the game's scripts were moved back to " + ScriptsParked + " (not compiled)");
+        }
+
+        [MenuItem("UniView/Remove the game's scripts", true)]
+        static bool CanRemoveGameScripts() { return Directory.Exists(ScriptsActive); }
 
         [MenuItem("UniView/Rebuild prefabs and scenes")]
         public static void RebuildAll() { Build(false); }
@@ -143,9 +199,15 @@ namespace UniView
         static void Build(bool onlyMissing)
         {
             var todo = new List<Description>();
+            var data = new List<Description>();
             foreach (string file in Descriptions())
             {
                 Description d = Load(file);
+                if (d != null && d.kind == "data")
+                {
+                    if (!onlyMissing || !File.Exists(d.target)) data.Add(d);
+                    continue;
+                }
                 if (d != null && d.kind == "settings")
                 {
                     // First: tags and layers must exist before objects can use them.
@@ -156,7 +218,14 @@ namespace UniView
                 if (onlyMissing && File.Exists(d.target)) continue;
                 todo.Add(d);
             }
-            if (todo.Count == 0) { AssetDatabase.SaveAssets(); return; }
+            int dataMade = CreateDataAssets(data);
+            if (todo.Count == 0)
+            {
+                FillDataAssets(data);
+                AssetDatabase.SaveAssets();
+                if (data.Count > 0) Debug.Log("UniView: " + dataMade + " data asset(s) built");
+                return;
+            }
             // Prefabs first, then scenes (building a scene replaces the open one).
             todo.Sort(delegate(Description a, Description b) { return (a.kind == "scene").CompareTo(b.kind == "scene"); });
             bool anyScene = todo.Exists(delegate(Description d) { return d.kind == "scene"; });
@@ -186,6 +255,8 @@ namespace UniView
             {
                 EditorUtility.ClearProgressBar();
             }
+            FillDataAssets(data);  // after the prefabs exist, so data can point at them
+            AssetDatabase.SaveAssets();
             AssetDatabase.Refresh();
             if (anyScene)
             {
@@ -196,6 +267,7 @@ namespace UniView
                       + (failed > 0 ? ", " + failed + " failed (see warnings)" : "")
                       + "; components: " + componentsAdded + " added" + (componentsFailed > 0 ? ", " + componentsFailed + " not available" : "")
                       + ", " + valuesSet + " values set, " + valuesSkipped + " not applicable"
+                      + "; data assets: " + dataMade + " of " + data.Count
                       + "; scripts: " + scriptsAdded + " attached"
                       + (scriptsMissing > 0 ? ", " + scriptsMissing + " script classes not in the project (UniView > Add the game's scripts)" : ""));
         }
@@ -285,6 +357,45 @@ namespace UniView
             EditorSceneManager.SaveScene(scene, d.target);
         }
 
+        // ---- data assets (ScriptableObjects: item stats, loot tables...)
+        static int CreateDataAssets(List<Description> data)
+        {
+            int made = 0;
+            foreach (Description d in data)
+            {
+                Type type = string.IsNullOrEmpty(d.script) ? null : ScriptType(d.script);
+                if (type == null || !typeof(ScriptableObject).IsAssignableFrom(type))
+                {
+                    if (!string.IsNullOrEmpty(d.script) && missingScripts.Add(d.script)) scriptsMissing++;
+                    continue;
+                }
+                if (AssetDatabase.LoadAssetAtPath<ScriptableObject>(d.target) != null) { made++; continue; }
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(d.target));
+                    ScriptableObject obj = ScriptableObject.CreateInstance(type);
+                    obj.name = Path.GetFileNameWithoutExtension(d.target);
+                    AssetDatabase.CreateAsset(obj, d.target);
+                    made++;
+                }
+                catch (Exception e) { Debug.LogWarning("UniView: couldn't create " + d.target + ": " + e.Message); }
+            }
+            return made;
+        }
+
+        static void FillDataAssets(List<Description> data)
+        {
+            foreach (Description d in data)
+            {
+                var obj = AssetDatabase.LoadAssetAtPath<ScriptableObject>(d.target);
+                if (obj == null || d.props == null) continue;
+                var so = new SerializedObject(obj);
+                foreach (Prop pr in d.props) SetProp(so, pr, null, null, new Dictionary<string, Renderer>());
+                so.ApplyModifiedPropertiesWithoutUndo();
+                EditorUtility.SetDirty(obj);
+            }
+        }
+
         // ---- the game's project settings
         static readonly Dictionary<string, string> SettingsFiles = new Dictionary<string, string>
         {
@@ -349,8 +460,8 @@ namespace UniView
                     Type[] types;
                     try { types = asm.GetTypes(); } catch (Exception) { continue; }
                     foreach (Type t in types)
-                        if (typeof(MonoBehaviour).IsAssignableFrom(t) && !t.IsAbstract && !t.IsGenericTypeDefinition
-                            && !scriptTypes.ContainsKey(t.FullName))
+                        if ((typeof(MonoBehaviour).IsAssignableFrom(t) || typeof(ScriptableObject).IsAssignableFrom(t))
+                            && !t.IsAbstract && !t.IsGenericTypeDefinition && !scriptTypes.ContainsKey(t.FullName))
                             scriptTypes[t.FullName] = t;
                 }
             }
@@ -440,11 +551,11 @@ namespace UniView
                 {
                     if (sp.propertyType != SerializedPropertyType.ObjectReference) { valuesSkipped++; return; }
                     UnityEngine.Object target = null;
-                    if (pr.t == "n" && pr.n >= 0 && pr.n < objects.Length)
+                    if (pr.t == "n" && objects != null && pr.n >= 0 && pr.n < objects.Length)
                     {
                         if (pr.s == "GameObject") target = objects[pr.n];
                         else if (pr.s == "Transform") target = objects[pr.n].transform;
-                        else { Component c; if (byNode.TryGetValue(pr.n + "|" + pr.s, out c)) target = c; }
+                        else { Component c; if (byNode != null && byNode.TryGetValue(pr.n + "|" + pr.s, out c)) target = c; }
                     }
                     else if (pr.t == "m")
                     {
@@ -453,6 +564,7 @@ namespace UniView
                         if (skinned != null) target = skinned.sharedMesh;
                         else if (r != null && r.GetComponent<MeshFilter>() != null) target = r.GetComponent<MeshFilter>().sharedMesh;
                     }
+                    else if (!string.IsNullOrEmpty(pr.c)) target = PrefabObject(pr.s, pr.q, pr.c);
                     else target = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(pr.s);
                     if (target == null) { valuesSkipped++; return; }
                     sp.objectReferenceValue = target;
@@ -474,6 +586,18 @@ namespace UniView
                 valuesSet++;
             }
             catch (Exception) { valuesSkipped++; }
+        }
+
+        static UnityEngine.Object PrefabObject(string path, string childPath, string cls)
+        {
+            var root = AssetDatabase.LoadAssetAtPath<GameObject>(path);
+            if (root == null) return null;
+            Transform t = string.IsNullOrEmpty(childPath) ? root.transform : root.transform.Find(childPath);
+            if (t == null) return null;
+            if (cls == "GameObject") return t.gameObject;
+            if (cls == "Transform") return t;
+            Type type = ScriptType(cls) ?? ComponentType(cls);
+            return type != null ? t.GetComponent(type) : null;
         }
 
         static Renderer ModelRenderer(string path, Dictionary<string, Renderer> parts)

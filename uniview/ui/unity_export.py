@@ -43,8 +43,9 @@ def run_export(parent, session, root, version, editor_exe=None, game_version="")
 
     QApplication.processEvents()
     try:
+        notes = []
         written, failed, skipped = export_unity_project(session, root, version, progress, dlg.wasCanceled,
-                                                        editor_exe)
+                                                        editor_exe, notes=notes)
     except Exception as e:
         log.exception("Exporting the Unity project failed")
         dlg.close()
@@ -59,6 +60,7 @@ def run_export(parent, session, root, version, editor_exe=None, game_version="")
             + (f"Open it with Unity {version}{made_with}: Unity Hub → Add → this folder." if version else
                "Open this folder with Unity Hub (Add → this folder).")
             + "\nThe first time, Unity takes a while to import everything, then builds the game's prefabs and scenes "
-              "(menu: UniView → Rebuild prefabs and scenes).\n\nOpen the folder now?")
+              "(menu: UniView → Rebuild prefabs and scenes)."
+            + "".join("\n\n" + n for n in notes) + "\n\nOpen the folder now?")
     if QMessageBox.question(parent, "Export as Unity project", text) == QMessageBox.Yes:
         open_path(root)

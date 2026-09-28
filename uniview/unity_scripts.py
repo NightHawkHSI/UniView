@@ -27,6 +27,46 @@ ENGINE_ASSEMBLIES = re.compile(
     r"Unity\..+|nunit\..+|Boo\..+|UnityScript(\..+)?|ExCSS\..+)$", re.I)
 TEST_ASSEMBLIES = re.compile(r"\.Tests?$|TestRunner", re.I)
 
+# Unity API renames that turned into compile errors: (min editor version, pattern, replacement).
+API_RENAMES = [
+    ((6000, 1), r"\bPhysicMaterialCombine\b", "PhysicsMaterialCombine"),
+    ((6000, 1), r"\bPhysicMaterial\b", "PhysicsMaterial"),
+]
+
+
+def csharp_version(unity_version):
+    """The newest C# the target editor compiles (decompiled code must not use anything newer)."""
+    v = tuple(int(n) for n in re.findall(r"\d+", unity_version or "")[:2])
+    if v >= (2021, 2):
+        return "CSharp9_0"
+    if v >= (2020, 2):
+        return "CSharp8_0"
+    return "CSharp7_3"
+
+
+def fix_api_renames(folder, unity_version):
+    """Apply API_RENAMES for the target editor to the .cs files under folder; returns files changed."""
+    v = tuple(int(n) for n in re.findall(r"\d+", unity_version or "")[:2])
+    renames = [(re.compile(pattern), repl) for since, pattern, repl in API_RENAMES if v >= since]
+    changed = 0
+    if not renames:
+        return 0
+    for base, _dirs, files in os.walk(folder):
+        for name in files:
+            if not name.endswith(".cs"):
+                continue
+            path = os.path.join(base, name)
+            with open(path, encoding="utf-8-sig") as f:
+                text = f.read()
+            new = text
+            for pattern, repl in renames:
+                new = pattern.sub(repl, new)
+            if new != text:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(new)
+                changed += 1
+    return changed
+
 
 def find_ilspycmd():
     """Path of ilspycmd, or None."""
@@ -63,10 +103,10 @@ def plan_assemblies(managed, script_assemblies):
     return decompile, libraries
 
 
-def decompile(ilspycmd, dll, out_dir, reference_dir, timeout=600):
+def decompile(ilspycmd, dll, out_dir, reference_dir, language="CSharp9_0", timeout=600):
     """Decompile one assembly to a folder of .cs files (one per type). Returns the number of files."""
     os.makedirs(out_dir, exist_ok=True)
-    result = subprocess.run([ilspycmd, "-p", "-o", out_dir, "-r", reference_dir, dll], capture_output=True,
+    result = subprocess.run([ilspycmd, "-p", "-lv", language, "-o", out_dir, "-r", reference_dir, dll], capture_output=True,
                             text=True, timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "ilspycmd failed").strip().splitlines()[-1])
@@ -78,7 +118,7 @@ def decompile(ilspycmd, dll, out_dir, reference_dir, timeout=600):
     return sum(len([f for f in files if f.endswith(".cs")]) for _r, _d, files in os.walk(out_dir))
 
 
-def export_scripts(session, assets_dir, progress=None, cancelled=None):
+def export_scripts(session, assets_dir, progress=None, cancelled=None, unity_version=""):
     """Decompile the game's code into Assets/UniView/GameScripts~. Returns (C# files, libraries, note)."""
     game_dir = session.path if os.path.isdir(session.path) else os.path.dirname(session.path)
     managed = managed_dir(game_dir) or managed_dir(os.path.dirname(game_dir))
@@ -98,9 +138,13 @@ def export_scripts(session, assets_dir, progress=None, cancelled=None):
         if progress is not None:
             progress(n, len(to_decompile), f"Decompiling {name}.dll")
         try:
-            files += decompile(ilspycmd, os.path.join(managed, name + ".dll"), os.path.join(out_root, name), managed)
+            files += decompile(ilspycmd, os.path.join(managed, name + ".dll"), os.path.join(out_root, name), managed,
+                               csharp_version(unity_version))
         except Exception as e:
             log.warning("Could not decompile %s.dll: %s", name, e)
+    renamed = fix_api_renames(out_root, unity_version)
+    if renamed:
+        log.info("Game scripts: updated renamed Unity APIs in %d file(s)", renamed)
     plugins = os.path.join(out_root, "Plugins")
     for name in libraries:
         os.makedirs(plugins, exist_ok=True)

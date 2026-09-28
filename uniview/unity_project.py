@@ -22,6 +22,7 @@ from uniview.export import (export_ext, export_stem, export_subfolder, rig_for_e
 from uniview.search import is_unreadable
 from uniview.unity_builder import BUILDER_CS
 from uniview.unity_materials import convert, mat_yaml
+from uniview.unity_packages import game_assemblies, packages_for, recommended_versions
 from uniview.util import safe_filename
 
 FILE_KINDS = ("texture", "audio", "text", "font", "video")
@@ -130,7 +131,7 @@ def write_project_settings(root, version):
             f.write(f"m_EditorVersion: {version}\n")
 
 
-def write_manifest(root, editor_exe, gltfast):
+def write_manifest(root, editor_exe, gltfast, extra=None):
     """Packages/manifest.json: every built-in module the editor ships (as Unity's own default) plus glTFast.
     Without an editor to read the module list from, Unity's default manifest is left alone."""
     builtin = os.path.join(os.path.dirname(editor_exe or ""), "Data", "Resources", "PackageManager", "BuiltInPackages")
@@ -140,6 +141,7 @@ def write_manifest(root, editor_exe, gltfast):
                      if n.startswith("com.unity.modules.") and "." not in n[len("com.unity.modules."):])
     deps = {m: "1.0.0" for m in modules}
     deps["com.unity.cloud.gltfast"] = gltfast
+    deps.update(extra or {})  # the Unity packages the game was built with (UI, TextMeshPro, Timeline...)
     path = os.path.join(root, "Packages", "manifest.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if os.path.isfile(path):  # keep packages the user added to an earlier export
@@ -234,16 +236,21 @@ class MaterialLibrary:
         return unity_path(self.root, path)
 
 
-def component_props(props, asset_paths, root, materials=None):
+def component_props(props, asset_paths, root, materials=None, prefab_objects=None):
     """unity_components.flatten() entries with references turned into what UniViewBuilder.cs loads:
     "n" (object n of this prefab/scene, s = "GameObject"/"Transform"/component class), "m" (the mesh of
-    the model file s) or "a" (the asset file s). References to things not in the project are dropped."""
+    the model file s) or "a" (the asset file s; for an object of another prefab also c = its class and
+    q = its child path in that prefab). References to things not in the project are dropped."""
     out = []
     for e in props:
         if e["t"] != "ref":
             out.append(e)
         elif "node" in e:
             out.append({"p": e["p"], "t": "n", "n": e["node"], "s": e["cls"]})
+        elif e.get("kind") == "gameobject":
+            found = (prefab_objects or {}).get(e["asset"])
+            if found:
+                out.append({"p": e["p"], "t": "a", "s": found[0], "c": e.get("cls") or "GameObject", "q": found[1]})
         elif e.get("kind") == "material":
             path = materials.path_for(e["asset"]) if materials is not None else ""
             if path:
@@ -255,7 +262,8 @@ def component_props(props, asset_paths, root, materials=None):
     return out
 
 
-def prefab_description(nodes, target, model_paths, root, builtin_meshes=None, kind="prefab", materials=None):
+def prefab_description(nodes, target, model_paths, root, builtin_meshes=None, kind="prefab", materials=None,
+                       prefab_objects=None):
     """The JSON UniViewBuilder.cs reads: nodes with their model GLB/OBJ (or built-in mesh) instead of mesh uids."""
     out = []
     for n in nodes:
@@ -274,7 +282,8 @@ def prefab_description(nodes, target, model_paths, root, builtin_meshes=None, ki
                     # The game's renderer has no materials, so the game never draws it (collision/helper meshes).
                     "noMaterials": "materials" in n and not n["materials"] and bool(model or builtin),
                     "components": [{"type": c["type"], "script": c.get("script", ""),
-                                    "props": component_props(c["props"], model_paths, root, materials)}
+                                    "props": component_props(c["props"], model_paths, root, materials,
+                                                             prefab_objects)}
                                    for c in n.get("components") or ()],
                     "layer": int(n.get("layer", 0)), "tag": n.get("tag", "")})
         light = n.get("light")
@@ -396,7 +405,8 @@ def write_settings_description(session, root, assets_dir, scene_targets):
     return True
 
 
-def write_scene_descriptions(session, root, assets_dir, model_paths, texture_paths, cancelled=None, materials=None):
+def write_scene_descriptions(session, root, assets_dir, model_paths, texture_paths, cancelled=None, materials=None,
+                             prefab_objects=None):
     """One JSON per scene (+ its static-batch GLBs); returns (files written, failed)."""
     if not hasattr(session, "hierarchy"):
         return 0, 0
@@ -412,7 +422,7 @@ def write_scene_descriptions(session, root, assets_dir, model_paths, texture_pat
             if not nodes:
                 continue
             desc = prefab_description(nodes, target, model_paths, root, builtin_meshes, kind="scene",
-                                      materials=materials)
+                                      materials=materials, prefab_objects=prefab_objects)
             batches = write_static_batches(session, nodes, target[:-len(".unity")] + "_StaticBatches", texture_paths)
             for glb, _uids in batches:
                 write_meta(glb, asset_guid(f"{asset.uid}:batch:{os.path.basename(glb)}"))
@@ -444,7 +454,71 @@ def write_builder(root, assets_dir):
     write_folder_metas(assets_dir, os.path.dirname(path))
 
 
-def write_prefab_descriptions(session, root, assets_dir, model_paths, cancelled=None, materials=None):
+def prefab_object_map(session, root, assets_dir):
+    """{"go:<file>:<id>": ("Assets/...prefab", child path)} for every exported prefab's GameObjects."""
+    out = {}
+    if not hasattr(session, "object_paths"):
+        return out
+    for asset, target in plan_prefabs(session.assets, assets_dir):
+        try:
+            for go, path in session.object_paths(asset).items():
+                out.setdefault(go, (unity_path(root, target), path))
+        except Exception as e:
+            log.debug("Objects of '%s': %s", asset.name, e)
+    return out
+
+
+def plan_data(assets, assets_dir):
+    """[(data asset, target .asset path)]: the game's ScriptableObjects (item stats, loot tables...)."""
+    out, used = [], set()
+    for asset in assets:
+        if asset.kind != "data" or asset.source in BUILTIN_SOURCES:
+            continue
+        if getattr(getattr(asset.ref, "type", None), "name", "") != "MonoBehaviour":
+            continue
+        folder = os.path.join(assets_dir, safe_filename(asset.source or "data"), "Data")
+        base = safe_filename(os.path.basename(asset.name.replace("\\", "/"))) or "Data"
+        name, i = base, 1
+        while (folder.lower(), name.lower()) in used:
+            i += 1
+            name = f"{base}_{i}"
+        used.add((folder.lower(), name.lower()))
+        out.append((asset, os.path.join(folder, f"{name}.asset")))
+    return out
+
+
+def write_data_descriptions(session, root, assets_dir, data_plan, model_paths, materials=None, prefab_objects=None,
+                            cancelled=None):
+    """One JSON per data asset (built by UniViewBuilder.cs once the game's scripts compile); returns (written, failed)."""
+    if not hasattr(session, "data_asset"):
+        return 0, 0
+    written = failed = 0
+    build_dir = os.path.join(assets_dir, *BUILD_DIR)
+    for asset, target in data_plan:
+        if cancelled is not None and cancelled():
+            break
+        try:
+            found = session.data_asset(asset)
+            if found is None:
+                continue
+            script, props = found
+            desc = {"version": 1, "kind": "data", "target": unity_path(root, target), "script": script,
+                    "props": component_props(props, model_paths, root, materials, prefab_objects), "nodes": []}
+            path = os.path.join(build_dir, os.path.relpath(target, assets_dir) + ".json")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(desc, f, separators=(",", ":"))
+            write_meta(path, asset_guid(f"{asset.uid}:description"))
+            write_folder_metas(assets_dir, os.path.dirname(path))
+            written += 1
+        except Exception as e:
+            failed += 1
+            log.warning("Could not describe data asset '%s': %s", asset.name, e)
+    return written, failed
+
+
+def write_prefab_descriptions(session, root, assets_dir, model_paths, cancelled=None, materials=None,
+                              prefab_objects=None):
     """One JSON per prefab under Assets/UniView/Build/; returns (written, failed)."""
     if not hasattr(session, "hierarchy"):
         return 0, 0
@@ -459,7 +533,8 @@ def write_prefab_descriptions(session, root, assets_dir, model_paths, cancelled=
             nodes = session.hierarchy(asset)
             if not nodes:
                 continue
-            desc = prefab_description(nodes, target, model_paths, root, builtin_meshes, materials=materials)
+            desc = prefab_description(nodes, target, model_paths, root, builtin_meshes, materials=materials,
+                                      prefab_objects=prefab_objects)
             path = os.path.join(build_dir, os.path.relpath(target, assets_dir) + ".json")
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8", newline="\n") as f:
@@ -528,15 +603,23 @@ def _skippable(session, asset):
     return is_unreadable(stats) or (asset.kind in MODEL_KINDS and not stats.get("tris"))
 
 
-def export_unity_project(session, root, version="", progress=None, cancelled=None, editor_exe=None):
+def export_unity_project(session, root, version="", progress=None, cancelled=None, editor_exe=None,
+                         scripts=True, notes=None):
     """Write the project; returns (files written, failed, skipped). progress(done, total, text) is called
     now and then; cancelled() -> True stops early. editor_exe: the Unity.exe the project is for (its
-    module list goes into the package manifest)."""
+    module list goes into the package manifest). scripts: also decompile the game's code (Mono games, needs
+    ilspycmd). notes: a list that gets messages for the user (e.g. why there are no scripts)."""
     assets_dir = os.path.join(root, "Assets")
     os.makedirs(assets_dir, exist_ok=True)
     write_project_settings(root, version)
     gltf = uses_gltf(version)
-    if gltf and not write_manifest(root, editor_exe, gltfast_version(version)):
+    game_dir = getattr(session, "path", "") or ""
+    game_dir = game_dir if os.path.isdir(game_dir) else os.path.dirname(game_dir)
+    packages = packages_for(game_assemblies(game_dir) + list(getattr(session, "script_assemblies", lambda: [])()),
+                            recommended_versions(editor_exe)) if game_dir else {}
+    if packages:
+        log.info("Unity packages the game uses: %s", ", ".join(f"{k} {v}" for k, v in sorted(packages.items())))
+    if gltf and not write_manifest(root, editor_exe, gltfast_version(version), packages):
         log.warning("No Unity editor to read the package list from: models are saved as OBJ")
         gltf = False
     jobs = plan(session.assets, assets_dir, "glb" if gltf else "obj")
@@ -576,15 +659,39 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
             progress(len(jobs), len(jobs), "prefabs")
         model_paths = {asset.uid: path for asset, path in jobs if os.path.isfile(path)}  # models, sounds, textures...
         library = MaterialLibrary(session, root, assets_dir, texture_paths) if hasattr(session, "material_details") else None
-        prefabs, prefab_failed = write_prefab_descriptions(session, root, assets_dir, model_paths, cancelled, library)
+        data_plan = plan_data(session.assets, assets_dir)
+        model_paths.update({a.uid: p for a, p in data_plan})  # links to data assets
+        prefab_objects = prefab_object_map(session, root, assets_dir)
+        prefabs, prefab_failed = write_prefab_descriptions(session, root, assets_dir, model_paths, cancelled, library,
+                                                           prefab_objects)
         if progress is not None:
             progress(len(jobs), len(jobs), "scenes")
         scenes, scene_failed = write_scene_descriptions(session, root, assets_dir, model_paths, texture_paths,
-                                                        cancelled, library)
+                                                        cancelled, library, prefab_objects)
+        data, data_failed = write_data_descriptions(session, root, assets_dir, data_plan, model_paths, library,
+                                                    prefab_objects, cancelled)
+        written += data
+        failed += data_failed
         if (prefabs or scenes) and write_settings_description(session, root, assets_dir,
                                                                 plan_scenes(session.assets, assets_dir)):
             written += 1
         written += prefabs + scenes + (library.written if library else 0)
+        if (scripts and hasattr(session, "script_assemblies") and (prefabs or scenes)
+                and not (cancelled is not None and cancelled())):
+            from uniview.unity_scripts import export_scripts
+            try:
+                code_files, libraries, note = export_scripts(session, assets_dir, progress, cancelled, version)
+                written += code_files + libraries
+                if note:
+                    log.info(note)
+                    if notes is not None:
+                        notes.append(note)
+                elif code_files and notes is not None:
+                    notes.append(f"The game's code is in the project as {code_files:,} decompiled C# files, not "
+                                 "compiled yet: in Unity use UniView \u2192 Add the game's scripts.")
+            except Exception as e:
+                failed += 1
+                log.warning("Could not export the game's scripts: %s", e)
         failed += prefab_failed + scene_failed + (library.failed if library else 0)
         log.info("Unity project: %d prefab and %d scene file(s) for UniViewBuilder.cs", prefabs, scenes)
     log.info("Unity project: %d file(s) written, %d failed, %d skipped", written, failed, skipped)

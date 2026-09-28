@@ -20,3 +20,25 @@ def test_plan_assemblies(tmp_path):
 def test_comp_class_has_script_field():
     comp = re.search(r"public class Comp\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
     assert {"type", "script", "props"} <= set(re.findall(r"public \w+(?:\[\])? (\w+)", comp))
+
+
+def test_packages_for():
+    from uniview.unity_packages import packages_for
+    recommended = {"com.unity.ugui": "2.5.0", "com.unity.timeline": "1.8.12", "com.unity.postprocessing": "3.5.4"}
+    got = packages_for(["UnityEngine.UI.dll", "Unity.TextMeshPro.dll", "Unity.Timeline.dll", "Unity.Postprocessing.Runtime",
+                        "Unity.InputSystem.dll", "Assembly-CSharp.dll"], recommended)
+    assert got == {"com.unity.ugui": "2.5.0", "com.unity.timeline": "1.8.12", "com.unity.postprocessing": "3.5.4"}
+    assert packages_for(["Unity.TextMeshPro.dll"], {"com.unity.textmeshpro": "3.0.6", "com.unity.ugui": "1.0.0"}) == \
+        {"com.unity.textmeshpro": "3.0.6"}  # older editors still have the separate package
+
+
+def test_csharp_version_and_renames(tmp_path):
+    from uniview.unity_scripts import csharp_version, fix_api_renames
+    assert [csharp_version(v) for v in ("6000.5.4f1", "2021.3.1f1", "2020.3.5f1", "2019.4.19f1", "")] == \
+        ["CSharp9_0", "CSharp9_0", "CSharp8_0", "CSharp7_3", "CSharp7_3"]
+    src = tmp_path / "A" / "Ball.cs"
+    src.parent.mkdir()
+    src.write_text("PhysicMaterial m; PhysicMaterialCombine c; MyPhysicMaterials x;", encoding="utf-8")
+    assert fix_api_renames(str(tmp_path), "2022.3.1f1") == 0
+    assert fix_api_renames(str(tmp_path), "6000.5.4f1") == 1
+    assert src.read_text(encoding="utf-8") == "PhysicsMaterial m; PhysicsMaterialCombine c; MyPhysicMaterials x;"

@@ -398,3 +398,43 @@ def test_settings_and_layers_tags(tmp_path):
     import re
     cs_desc = re.search(r"public class Description\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
     assert set(settings) <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_desc))
+
+
+# ---------------------------------------------------------------------------- data assets, links between prefabs
+
+class DataSession(PrefabSession):
+    def data_asset(self, asset):
+        return "InventoryItem", [{"p": "name", "t": "s", "s": "Dark Oak Wood"},
+                                 {"p": "dropPrefab", "t": "ref", "asset": "go:shared:7", "kind": "gameobject", "cls": "GameObject"},
+                                 {"p": "arm", "t": "ref", "asset": "go:shared:9", "kind": "gameobject", "cls": "Rigidbody"},
+                                 {"p": "next", "t": "ref", "asset": "d:2", "kind": "data"}]
+
+    def object_paths(self, asset):
+        return {"go:shared:7": "", "go:shared:9": "Body/Arm"}
+
+
+def test_data_assets_and_prefab_links(tmp_path):
+    from types import SimpleNamespace
+    mb = SimpleNamespace(type=SimpleNamespace(name="MonoBehaviour"))
+    item = Asset("data", "Wood_DarkOak", "d1", uid="d:1", source="sharedassets0.assets", ref=mb)
+    other = Asset("data", "Wood_Oak", "d2", uid="d:2", source="sharedassets0.assets", ref=mb)
+    prefab = Asset("scene", "Prefab: Crate", ("root", 1, 1), uid="prefab:crate", source="sharedassets1.assets")
+    root = tmp_path / "proj"
+    written, failed, _ = up.export_unity_project(DataSession([item, other, prefab]), str(root), "6000.5.4f1",
+                                                 editor_exe=fake_editor(tmp_path))
+    assert failed == 0
+    desc = json.load(open(root / "Assets" / "UniView" / "Build" / "sharedassets0.assets" / "Data" / "Wood_DarkOak.asset.json"))
+    assert desc["kind"] == "data" and desc["script"] == "InventoryItem"
+    assert desc["target"] == "Assets/sharedassets0.assets/Data/Wood_DarkOak.asset"
+    props = {e["p"]: e for e in desc["props"]}
+    assert props["name"] == {"p": "name", "t": "s", "s": "Dark Oak Wood"}
+    crate = "Assets/sharedassets1.assets/Prefabs/Crate.prefab"
+    assert props["dropPrefab"] == {"p": "dropPrefab", "t": "a", "s": crate, "c": "GameObject", "q": ""}
+    assert props["arm"] == {"p": "arm", "t": "a", "s": crate, "c": "Rigidbody", "q": "Body/Arm"}
+    assert props["next"] == {"p": "next", "t": "a", "s": "Assets/sharedassets0.assets/Data/Wood_Oak.asset"}
+    from uniview.unity_builder import BUILDER_CS
+    import re
+    fields = lambda cls: set(re.findall(r"public \w+(?:\[\])? (\w+)",  # noqa: E731
+                                        re.search(rf"public class {cls}\s*\{{(.*?)\}}", BUILDER_CS, re.S).group(1)))
+    assert set(desc) <= fields("Description")
+    assert {"p", "t", "v", "s", "n", "c", "q"} <= fields("Prop")

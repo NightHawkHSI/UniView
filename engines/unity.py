@@ -958,7 +958,7 @@ class UnitySession(GameSession):
           built-in components: colliders, rigidbodies, audio sources, cameras, LOD groups..., and
           {"type": "MonoBehaviour", "script": "Namespace.Class", "props"} for script components)}],
         in Unity's own space. Optional keys are missing when they don't apply."""
-        from .unity_components import ASSET_KINDS, SKIP_COMPONENTS, flatten
+        from .unity_components import SKIP_COMPONENTS, flatten
         from .unity_scene import _components
         nodes = []
         material_cache = {}
@@ -1015,6 +1015,7 @@ class UnitySession(GameSession):
             node_keys[obj_key(transform_reader.assets_file, transform_reader.path_id)] = (index, "Transform")
             p, r, s = t.m_LocalPosition, t.m_LocalRotation, t.m_LocalScale
             node = {"name": getattr(go, "m_Name", "") or "GameObject", "parent": parent,
+                    "go": f"go:{go_reader.assets_file.name}:{go_reader.path_id}",
                     "active": bool(getattr(go, "m_IsActive", True)),
                     "layer": int(getattr(go, "m_Layer", 0) or 0),
                     "tag": self.tag_name(int(getattr(go, "m_Tag", 0) or 0)),
@@ -1080,23 +1081,7 @@ class UnitySession(GameSession):
                     continue
 
         def resolver(reader):
-            def resolve(file_id, path_id):
-                target_file = self.finder._file(reader.assets_file, file_id)
-                if target_file is None:
-                    return None
-                found = node_keys.get(obj_key(target_file, path_id))
-                if found is not None:
-                    return {"node": found[0], "cls": found[1]}
-                obj = target_file.objects.get(path_id)
-                kind = ASSET_KINDS.get(obj.type.name) if obj is not None else None
-                if kind == "material":
-                    uid = f"material:{obj.assets_file.name}:{obj.path_id}"
-                    self._material_readers[uid] = obj
-                    return {"asset": uid, "kind": kind}
-                if kind:
-                    return {"asset": self._asset_for(obj, obj.type.name).uid, "kind": kind}
-                return None
-            return resolve
+            return self._ref_resolver(reader, node_keys)
 
         with self.lock:
             for root in self._scene_roots(asset):
@@ -1115,6 +1100,89 @@ class UnitySession(GameSession):
 
     def _settings_objects(self):
         return [o for o in self.env.objects if o.type.name in SETTINGS_TYPES + ("BuildSettings", "PlayerSettings")]
+
+    def _ref_resolver(self, reader, node_keys=None):
+        """resolve(file id, path id) for unity_components.flatten(): an object of the same prefab/scene
+        ({"node", "cls"}), an exported asset ({"asset": uid, "kind"}), a GameObject or component of another
+        prefab ({"asset": "go:<file>:<id>" of its GameObject, "kind": "gameobject", "cls"}), or None."""
+        from .unity_components import ASSET_KINDS
+        node_keys = node_keys or {}
+
+        def resolve(file_id, path_id):
+            target_file = self.finder._file(reader.assets_file, file_id)
+            if target_file is None:
+                return None
+            key = obj_key(target_file, path_id)
+            found = node_keys.get(key)
+            if found is not None:
+                return {"node": found[0], "cls": found[1]}
+            obj = target_file.objects.get(path_id)
+            if obj is None:
+                return None
+            name = obj.type.name
+            kind = ASSET_KINDS.get(name)
+            if kind == "material":
+                uid = f"material:{obj.assets_file.name}:{obj.path_id}"
+                self._material_readers[uid] = obj
+                return {"asset": uid, "kind": kind}
+            if kind:
+                return {"asset": self._asset_for(obj, name).uid, "kind": kind}
+            if name == "GameObject":
+                return {"asset": f"go:{obj.assets_file.name}:{obj.path_id}", "kind": "gameobject", "cls": "GameObject"}
+            listed = self.by_key.get(key)
+            if name == "MonoBehaviour" and listed is not None and listed.kind == "data":
+                return {"asset": listed.uid, "kind": "data"}
+            try:  # a component (Transform, Rigidbody, a script...) of another prefab: its GameObject + type
+                go = obj.read_typetree().get("m_GameObject") or {}
+                if go.get("m_PathID"):
+                    go_file = self.finder._file(obj.assets_file, go.get("m_FileID", 0))
+                    if go_file is not None:
+                        cls = script_class(obj) if name == "MonoBehaviour" else name
+                        return {"asset": f"go:{go_file.name}:{go['m_PathID']}", "kind": "gameobject", "cls": cls}
+            except Exception:
+                pass
+            return None
+        return resolve
+
+    def object_paths(self, asset):
+        """{"go:<file>:<id>": child path ('' for the root, 'Body/Arm' below it)} of a prefab's GameObjects,
+        without reading any components (cheap)."""
+        out = {}
+
+        def visit(transform_reader, path, depth):
+            if depth > 200:
+                return
+            try:
+                t = transform_reader.read()
+                go_reader = t.m_GameObject.deref()
+                name = go_reader.peek_name() or "GameObject"
+            except Exception:
+                return
+            here = name if path is None else (f"{path}/{name}" if path else name)
+            out[f"go:{go_reader.assets_file.name}:{go_reader.path_id}"] = "" if path is None else here
+            for child in t.m_Children or []:
+                try:
+                    visit(child.deref(), "" if path is None else here, depth + 1)
+                except Exception:
+                    continue
+
+        with self.lock:
+            for root in self._scene_roots(asset):
+                visit(root, None, 0)
+        return out
+
+    def data_asset(self, asset):
+        """(script class, unity_components.flatten() props) of a ScriptableObject data asset, or None."""
+        from .unity_components import flatten
+        reader = asset.ref
+        if getattr(getattr(reader, "type", None), "name", "") != "MonoBehaviour":
+            return None
+        cls = script_class(reader)
+        if not cls:
+            return None
+        with self.lock:
+            tree = self._scripts().read(reader)[0]
+            return cls, flatten(tree, self._ref_resolver(reader))
 
     def script_assemblies(self):
         """Names of the assemblies (e.g. 'Assembly-CSharp.dll') the game's MonoScripts come from."""
