@@ -17,8 +17,16 @@ import re
 
 from engines.sdk import NORMAL, Material
 from uniview.constants import log
-from uniview.export import (export_ext, export_stem, export_subfolder, rig_for_export, session_materials,
-                            write_asset, write_glb, write_obj)
+from uniview.export import (
+    export_ext,
+    export_stem,
+    export_subfolder,
+    rig_for_export,
+    session_materials,
+    write_asset,
+    write_glb,
+    write_obj,
+)
 from uniview.search import is_unreadable
 from uniview.unity_builder import BUILDER_CS
 from uniview.unity_materials import convert, mat_yaml

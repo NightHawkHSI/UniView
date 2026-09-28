@@ -1,7 +1,7 @@
 """External sound decoder: vgmstream (https://github.com/vgmstream/vgmstream, ISC license).
 
 vgmstream plays hundreds of game audio formats - Wwise (.wem/.bnk), FMOD (.bank/.fsb), ADX,
-HCA, XMA and more. UniView doesn't ship it; Help -> Install sound decoder downloads the
+HCA, XMA and more. UniView doesn't ship it; Help -> Optional tools downloads the
 official Windows build into tools/vgmstream next to UniView, or put vgmstream-cli.exe there
 (or on PATH) yourself.
 """
@@ -60,7 +60,7 @@ def to_wav(data, ext, subsong=None):
     exe = vgmstream_path()
     if exe is None:
         raise NotImplementedError(f"Playing .{ext} sounds needs the vgmstream decoder: "
-                                  "Help → Install sound decoder (vgmstream).")
+                                  "Help → Optional tools... (vgmstream).")
     with tempfile.TemporaryDirectory(prefix="uniview_") as tmp:
         src = os.path.join(tmp, f"sound.{ext}")
         out = os.path.join(tmp, "sound.wav")

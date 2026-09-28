@@ -71,7 +71,7 @@ Each game is read by an **engine plugin**. UniView picks the plugin automaticall
 | **Fallout 1/2** | Fallout, Fallout 2 | – | ✔ FRM sprites (whole animation strip), RIX images | ✔ ACM* | ✔ MSG text |
 | **Loose files & archives** | any other game (Project Zomboid, Serious Sam 2...) | ✔ `.obj`, DirectX `.x` | ✔ png/jpg/tga/dds/bmp... | ✔ wav/mp3/ogg, plus anything vgmstream* plays | ✔ text; files inside `.zip`/`.gro`/`.pk3` archives |
 
-\* Needs the free **vgmstream** decoder: **Help → Install sound decoder (vgmstream)** downloads it once (from its official GitHub releases) into `tools/` next to UniView.
+\* Needs the free **vgmstream** decoder: **Help → Optional tools...** downloads it once (from its official GitHub releases) into `tools/` next to UniView. UniView offers this at startup when it's missing.
 
 - **Textures per part**: models with several materials show each part with its own texture. Materials without a texture show their color (and export it in GLB/OBJ); the info panel shows each material's color swatch, and hovering a material lists its shader values.
 - **Fonts, videos, scripts & data** (Unity): fonts preview as a sample sheet and save as `.ttf`/`.otf`; VideoClips play in a built-in video player; named MonoBehaviours / ScriptableObjects (item stats, loot tables, dialogue, configs) show every field as readable text and save as JSON. Script fields are read from the game's own code (Mono, or IL2CPP's `GameAssembly.dll` + `global-metadata.dat`), each asset is labeled with its class, and references to other objects say what they point to (e.g. `icon → Texture2D 'ItemBattery'`). Games that use Addressables (`StreamingAssets/aa`) load too, and models find textures stored in other bundles.

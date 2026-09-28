@@ -69,12 +69,9 @@ def fix_api_renames(folder, unity_version):
 
 
 def find_ilspycmd():
-    """Path of ilspycmd, or None."""
-    found = shutil.which("ilspycmd")
-    if found:
-        return found
-    tool = os.path.join(os.path.expanduser("~"), ".dotnet", "tools", "ilspycmd.exe")
-    return tool if os.path.isfile(tool) else None
+    """Command (list) that runs ilspycmd, or None (see uniview.tools)."""
+    from uniview.tools import ilspy_command
+    return ilspy_command()
 
 
 def managed_dir(game_dir):
@@ -104,10 +101,14 @@ def plan_assemblies(managed, script_assemblies):
 
 
 def decompile(ilspycmd, dll, out_dir, reference_dir, language="CSharp9_0", timeout=600):
-    """Decompile one assembly to a folder of .cs files (one per type). Returns the number of files."""
+    """Decompile one assembly to a folder of .cs files (one per type). Returns the number of files.
+    ilspycmd: the command (list, or one path) that runs ilspycmd."""
+    from uniview.tools import ilspy_env
     os.makedirs(out_dir, exist_ok=True)
-    result = subprocess.run([ilspycmd, "-p", "-lv", language, "-o", out_dir, "-r", reference_dir, dll], capture_output=True,
-                            text=True, timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    command = list(ilspycmd) if isinstance(ilspycmd, (list, tuple)) else [ilspycmd]
+    result = subprocess.run(command + ["-p", "-lv", language, "-o", out_dir, "-r", reference_dir, dll],
+                            capture_output=True, text=True, timeout=timeout, env=ilspy_env(),
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "ilspycmd failed").strip().splitlines()[-1])
     # Project files and assembly attributes would clash when everything compiles into Unity's assemblies.
@@ -126,7 +127,7 @@ def export_scripts(session, assets_dir, progress=None, cancelled=None, unity_ver
         return 0, 0, "No game scripts: this build has no .NET code to decompile (IL2CPP)."
     ilspycmd = find_ilspycmd()
     if ilspycmd is None:
-        return 0, 0, f"No game scripts: install the decompiler first ({INSTALL_HINT}), then export again."
+        return 0, 0, "No game scripts: install the ILSpy decompiler first (Help → Optional tools...), then export again."
     script_assemblies = session.script_assemblies() if hasattr(session, "script_assemblies") else []
     to_decompile, libraries = plan_assemblies(managed, script_assemblies)
     out_root = os.path.join(assets_dir, *SCRIPTS_DIR)

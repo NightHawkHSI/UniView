@@ -10,11 +10,11 @@ show as images.
 
 import sys
 
-from uniview import __version__  # first: sets QT_API before Qt / pyvista load
-
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 import engines
+from uniview import __version__  # first: sets QT_API before Qt / pyvista load
 from uniview.constants import APP_SHORT, APP_TITLE, PLUGINS_DIR
 from uniview.logs import install_crash_handlers, setup_logging
 from uniview.selftest import self_test
@@ -42,6 +42,7 @@ def main():
     app.setWindowIcon(load_app_icon())
     win = MainWindow(handler)
     win.show()
+    QTimer.singleShot(800, win.check_tools_at_startup)
     if len(sys.argv) > 1:
         win.load(sys.argv[1])
     sys.exit(app.exec())

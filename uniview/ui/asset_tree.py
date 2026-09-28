@@ -4,8 +4,16 @@ layout for a narrow panel (Info and Size shown under the name instead of in thei
 
 from PySide6.QtCore import QPoint, QRect, Qt
 from PySide6.QtGui import QPalette
-from PySide6.QtWidgets import (QAbstractItemView, QMenu, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
-                               QToolButton, QToolTip, QTreeWidget)
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QMenu,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
+    QToolButton,
+    QToolTip,
+    QTreeWidget,
+)
 
 BREAK_AFTER = "_/\\.- "  # preferred places to wrap a name
 

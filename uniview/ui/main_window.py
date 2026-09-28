@@ -72,12 +72,14 @@ from uniview.model_display import is_place, model_info_rows, texture_groups, tex
 from uniview.projects import ProjectStore, detect_project_engine, engine_info_text, project_options
 from uniview.search import FILTER_HELP, AssetFilter, is_unreadable
 from uniview.settings import BLENDER_IMPORT, Settings, find_blender
+from uniview.tools import missing_recommended
 from uniview.ui.asset_tree import AssetTree
 from uniview.ui.console import ConsoleDock
 from uniview.ui.dialogs import ExportDialog, PluginsDialog, edit_project_notes, open_plugins_folder
 from uniview.ui.home import HomePage
 from uniview.ui.media import AnimationView, AudioView, ImageView, ImageWindow, VideoView
 from uniview.ui.mesh_view import MeshView
+from uniview.ui.tools_dialog import ToolsDialog
 from uniview.ui.unity_export import ask_project_folder, run_export
 from uniview.unity_project import installed_editors, target_version, unity_version
 from uniview.util import blank_icon, fmt_size, norm_path, open_path, pil_to_pixmap, safe_filename
@@ -445,7 +447,7 @@ class MainWindow(QMainWindow):
         help_menu.addAction("Project page on GitHub", lambda: webbrowser.open(REPO_URL))
         help_menu.addSeparator()
         help_menu.addAction("Engine plugins...", lambda: PluginsDialog(self).exec())
-        help_menu.addAction("Install sound decoder (vgmstream)...", self.install_sound_decoder)
+        help_menu.addAction("Optional tools (audio decoder, script decompiler...)...", self.show_tools)
         help_menu.addAction("Open plugins folder", open_plugins_folder)
         help_menu.addSeparator()
         help_menu.addAction("Open log file", lambda: open_path(LOG_FILE))
@@ -926,25 +928,21 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
-    def install_sound_decoder(self):
-        from engines import extdecode
-        existing = extdecode.vgmstream_path()
-        text = ("vgmstream is a free, open-source decoder for game audio formats (Wwise .wem/.bnk, FMOD "
-                ".bank/.fsb and many more). UniView will download the official Windows build from GitHub "
-                f"into:\n{os.path.join(extdecode.tools_dir(), 'vgmstream')}")
-        if existing:
-            text = f"vgmstream is already installed:\n{existing}\n\nDownload the latest version again?"
-        if QMessageBox.question(self, "Install sound decoder", text) != QMessageBox.Yes:
+    def show_tools(self, at_startup=False):
+        ToolsDialog(self.settings, self, at_startup=at_startup).exec()
+
+    def check_tools_at_startup(self):
+        """Offer to install recommended helpers that are missing (unless turned off in the dialog)."""
+        if not self.settings.check_tools:
             return
-        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            exe = extdecode.install_vgmstream()
-            QMessageBox.information(self, "Install sound decoder", f"Installed:\n{exe}")
-        except Exception as e:
-            log.exception("Installing vgmstream failed")
-            QMessageBox.warning(self, "Install sound decoder", f"Download failed: {e}")
-        finally:
-            QApplication.restoreOverrideCursor()
+            missing = missing_recommended(self.settings.blender_path)
+        except Exception:
+            log.exception("Checking the optional tools failed")
+            return
+        if missing:
+            log.info("Optional tools not installed: %s", ", ".join(t.name for t in missing))
+            self.show_tools(at_startup=True)
 
     def play_flipbook(self):
         """Play the current clip's sprite frames in the image view."""

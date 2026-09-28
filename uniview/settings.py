@@ -39,6 +39,7 @@ class Settings:
     home_sort: str = "recent"
     online_compat: bool = True
     blender_path: str = ""
+    check_tools: bool = True  # startup check for missing optional tools
     options: dict = field(default_factory=dict)  # Options menu (VIEW_OPTION_ITEMS): {key: bool}, missing = on
     path: str = SETTINGS_FILE
     extra: dict = field(default_factory=dict)  # keys this version doesn't know, written back unchanged
