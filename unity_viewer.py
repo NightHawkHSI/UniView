@@ -10,6 +10,11 @@ show as images.
 
 import sys
 
+try:
+    import pyi_splash  # the packaged exe's launcher splash (build.py --splash); not there when run from source
+except ImportError:
+    pyi_splash = None
+
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
@@ -21,12 +26,21 @@ from uniview.selftest import self_test
 from uniview.ui.main_window import MainWindow, load_app_icon
 
 
+def close_splash():
+    if pyi_splash is not None:
+        try:
+            pyi_splash.close()
+        except Exception:
+            pass
+
+
 def main():
     handler = setup_logging()
     install_crash_handlers()
     engines.load_plugins(PLUGINS_DIR)
     if "--self-test" in sys.argv:
         args = [a for a in sys.argv[1:] if a != "--self-test"]
+        close_splash()
         QApplication(sys.argv)
         sys.exit(self_test(args[0] if args else None))
     if sys.platform == "win32":
@@ -42,6 +56,7 @@ def main():
     app.setWindowIcon(load_app_icon())
     win = MainWindow(handler)
     win.show()
+    close_splash()
     QTimer.singleShot(800, win.check_tools_at_startup)
     if len(sys.argv) > 1:
         win.load(sys.argv[1])

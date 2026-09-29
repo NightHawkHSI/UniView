@@ -109,6 +109,36 @@ def make_ico(png_path, ico_path):
     square.save(ico_path, sizes=[(s, s) for s in (16, 24, 32, 48, 64, 128, 256)])
 
 
+def make_splash(png_path, out_path, version):
+    """Splash image the exe's launcher shows right away, before Python and the big libraries load
+    (a first launch can take ~20 s while Windows scans every bundled DLL). UniView closes it when its
+    window appears."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    def font(size, bold=False):
+        for name in (("segoeuib.ttf" if bold else "segoeui.ttf"), "arial.ttf"):
+            try:
+                return ImageFont.truetype(name, size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    width, height = 460, 200
+    img = Image.new("RGB", (width, height), (32, 33, 36))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([0, 0, width - 1, height - 1], outline=(67, 160, 71), width=2)
+    if os.path.isfile(png_path):
+        icon = Image.open(png_path).convert("RGBA")
+        icon.thumbnail((112, 112), Image.LANCZOS)
+        img.paste(icon, (28, (height - icon.height) // 2), icon)
+    x = 164
+    draw.text((x, 46), APP_NAME, font=font(34, bold=True), fill=(240, 240, 240))
+    draw.text((x, 92), f"Game Asset Viewer  v{version}", font=font(15), fill=(170, 170, 170))
+    draw.text((x, 132), "Loading...", font=font(16, bold=True), fill=(67, 160, 71))
+    draw.text((x, 156), "The first launch can take a moment.", font=font(13), fill=(140, 140, 140))
+    img.save(out_path)
+
+
 def ensure_pyinstaller():
     import importlib.util
     if importlib.util.find_spec("PyInstaller") is None:
@@ -134,6 +164,9 @@ def build_release(version, test_game=None):
         icon_args += ["--add-data", f"{compat}{os.pathsep}."]
     else:
         print("  Icon.png not found - building without an icon")
+    splash = os.path.join(WORK, "splash.png")
+    make_splash(icon_png, splash, version)
+    icon_args += ["--splash", splash]
 
     step(f"PyInstaller (v{version}) - this takes a few minutes")
     dist = os.path.join(WORK, "dist")
