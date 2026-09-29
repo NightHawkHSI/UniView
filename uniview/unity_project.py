@@ -870,7 +870,8 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
                 and not (cancelled is not None and cancelled())):
             from uniview.unity_scripts import export_scripts
             try:
-                code_files, libraries, note = export_scripts(session, assets_dir, progress, cancelled, version)
+                code_files, libraries, note = export_scripts(session, assets_dir, progress, cancelled, version,
+                                                              set(packages) if gltf else None)
                 written += code_files + libraries
                 if note:
                     log.info(note)

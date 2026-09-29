@@ -2,7 +2,7 @@
 
 import os
 
-__version__ = "2.5.0"
+__version__ = "2.5.1"
 
 # pyvista/pyvistaqt pick their Qt binding from this; it has to be set before they're imported.
 os.environ.setdefault("QT_API", "pyside6")

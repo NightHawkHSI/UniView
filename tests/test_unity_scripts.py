@@ -17,6 +17,18 @@ def test_plan_assemblies(tmp_path):
     assert libraries == ["Facepunch.Steamworks.Win64", "Newtonsoft.Json"]
 
 
+def test_plan_assemblies_with_known_packages(tmp_path):
+    for name in ("Assembly-CSharp", "Unity.TextMeshPro", "Unity.Localization", "Unity.Services.Analytics",
+                 "Cinemachine", "UnityEngine.CoreModule", "Newtonsoft.Json", "Unity.Burst", "Unity.Burst.Unsafe"):
+        (tmp_path / f"{name}.dll").write_bytes(b"")
+    decompile, libraries = plan_assemblies(str(tmp_path), ["Assembly-CSharp.dll", "Unity.Localization.dll"],
+                                           {"com.unity.ugui", "com.unity.cinemachine", "com.unity.burst"})
+    assert decompile == ["Assembly-CSharp"]
+    # No package provides Localization/Analytics: copied so Assembly-CSharp's references resolve.
+    # TextMeshPro (in ugui), Cinemachine and Burst (incl. Unity.Burst.Unsafe) come from their packages instead.
+    assert libraries == ["Newtonsoft.Json", "Unity.Localization", "Unity.Services.Analytics"]
+
+
 def test_comp_class_has_script_field():
     comp = re.search(r"public class Comp\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
     assert {"type", "script", "props"} <= set(re.findall(r"public \w+(?:\[\])? (\w+)", comp))

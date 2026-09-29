@@ -28,6 +28,13 @@ ASSEMBLY_PACKAGES = [
 ]
 
 
+def provided_by(assembly, installed):
+    """Is this assembly (name without .dll) part of one of the installed packages?"""
+    # A package's other assemblies share its name: Unity.Burst.Unsafe, Unity.Collections.LowLevel.ILSupport...
+    return any(re.fullmatch(rf"(?:{pattern})(?:\..+)?", assembly) and any(c in installed for c in candidates)
+               for pattern, candidates in ASSEMBLY_PACKAGES)
+
+
 def recommended_versions(editor_exe):
     """{package: version} the editor recommends (its PackageManager/Editor/manifest.json), or {}."""
     path = os.path.join(os.path.dirname(editor_exe or ""), "Data", "Resources", "PackageManager", "Editor",
@@ -58,8 +65,15 @@ def packages_for(assembly_names, recommended):
 
 
 def game_assemblies(game_dir):
-    """Names of the managed assemblies a Mono build ships ([] for IL2CPP)."""
+    """Names of the managed assemblies a build ships: Managed/*.dll (Mono), else the list Unity 2019.3+ writes
+    to ScriptingAssemblies.json (IL2CPP builds have no Managed folder)."""
     out = []
     for data in glob.glob(os.path.join(game_dir, "*_Data")):
         out += [os.path.basename(p) for p in glob.glob(os.path.join(data, "Managed", "*.dll"))]
+        if not out:
+            try:
+                with open(os.path.join(data, "ScriptingAssemblies.json"), encoding="utf-8") as f:
+                    out += [n for n in json.load(f).get("names", []) if isinstance(n, str)]
+            except (OSError, ValueError, AttributeError):
+                pass
     return out

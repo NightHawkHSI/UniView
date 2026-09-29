@@ -55,10 +55,13 @@ def self_test(game_path=None):
             raise RuntimeError("loading failed (see log above)")
         session = result["session"]
         counts = {}
-        for kind, decode in (("model", lambda a: meshdata_to_polydata(session.mesh(a))),
-                             ("texture", lambda a: session.image(a).load())):
+        # Script data reads fields through the type tree generator (native code) - a sample big enough to
+        # catch problems that only show after many classes.
+        for kind, decode, sample in (("model", lambda a: meshdata_to_polydata(session.mesh(a)), 25),
+                                     ("texture", lambda a: session.image(a).load(), 25),
+                                     ("data", lambda a: session.text(a), 200)):
             ok = 0
-            items = [a for a in session.assets if a.kind == kind][:25]
+            items = [a for a in session.assets if a.kind == kind][:sample]
             for asset in items:
                 try:
                     with session.lock:
@@ -71,7 +74,7 @@ def self_test(game_path=None):
             counts[kind] = f"{ok}/{len(items)}"
         session.close()
         return (f"{plugin.name}: {session.file_count} files, decoded models {counts.get('model')}, "
-                f"textures {counts.get('texture')}")
+                f"textures {counts.get('texture')}, data {counts.get('data')}")
 
     check("imports", imports)
     check("engine plugins", plugins)

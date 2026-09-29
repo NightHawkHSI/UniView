@@ -192,10 +192,18 @@ def build_release(version, test_game=None):
                 if "self-test" in line:
                     print("  " + line.rstrip())
         os.remove(log_path)  # don't ship the test log
-    for leftover in ("crash.log", "projects.json"):
+    # Per-user files the test run wrote (settings.json holds this PC's folders, e.g. C:\Users\<name>):
+    # never ship them - the app creates its own on first run.
+    for leftover in ("crash.log", "projects.json", "settings.json", "compat_cache.json"):
         path = os.path.join(out_dir, leftover)
-        if os.path.isfile(path) and os.path.getsize(path) == 0:
+        if os.path.isfile(path):
             os.remove(path)
+    for leftover in ("cache", "tools"):
+        shutil.rmtree(os.path.join(out_dir, leftover), ignore_errors=True)
+    # pip's record of where a package was installed from (a local wheel's path names this PC's user).
+    for dirpath, _dirs, files in os.walk(out_dir):
+        if dirpath.endswith(".dist-info") and "direct_url.json" in files:
+            os.remove(os.path.join(dirpath, "direct_url.json"))
     if code != 0:
         sys.exit(f"Self-test of the packaged exe FAILED (exit code {code}) - not zipping.")
 

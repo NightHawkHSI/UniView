@@ -7,7 +7,10 @@ command-line tool (ilspycmd) into Assets/UniView/GameScripts~ - a folder Unity i
 UniView > Add the game's scripts (UniViewBuilder.cs) swaps that source in for the compiled code.
 Obfuscated assemblies get no source (it can't compile).
 
-IL2CPP games have no managed code to decompile (only GameAssembly.dll), so they get no scripts.
+IL2CPP games have no .NET code (only GameAssembly.dll + global-metadata.dat). Cpp2IL rebuilds their assemblies
+from the metadata as stubs - every class, field and attribute ([SerializeField]...), method bodies that just
+return defaults - which go into GameCode the same way: script components attach and keep their saved values,
+but the game's logic isn't there.
 """
 
 import glob
@@ -17,6 +20,7 @@ import shutil
 import subprocess
 import time
 
+from engines import cpp2il
 from uniview.constants import log
 
 SCRIPTS_DIR = ("UniView", "GameScripts~")   # under Assets/
@@ -86,15 +90,24 @@ def managed_dir(game_dir):
     return None
 
 
-def plan_assemblies(managed, script_assemblies):
+def plan_assemblies(managed, script_assemblies, packages=None):
     """(assemblies to decompile, plain library DLLs to copy) - names without .dll.
 
-    script_assemblies: names of the assemblies the game's MonoScripts come from."""
+    script_assemblies: names of the assemblies the game's MonoScripts come from. packages: the Unity
+    packages the project gets (None = unknown). When known, a Unity package assembly none of them
+    provides (Unity.Localization, Unity.Services.*...) is copied too - without it the game's own
+    assemblies that reference it count as broken in Unity - and an assembly an installed package
+    already has isn't (duplicate types)."""
+    from uniview.unity_packages import provided_by
     decompile, libraries = [], []
     with_scripts = {os.path.splitext(a)[0] for a in script_assemblies}
     for path in sorted(glob.glob(os.path.join(managed, "*.dll"))):
         name = os.path.splitext(os.path.basename(path))[0]
-        if ENGINE_ASSEMBLIES.match(name) or TEST_ASSEMBLIES.search(name):
+        if TEST_ASSEMBLIES.search(name) or (packages is not None and provided_by(name, packages)):
+            continue
+        if ENGINE_ASSEMBLIES.match(name):
+            if packages is not None and name.startswith("Unity."):
+                libraries.append(name)
             continue
         if name in with_scripts or name.startswith("Assembly-CSharp"):
             decompile.append(name)
@@ -193,18 +206,40 @@ def copy_assemblies(managed, names, assets_dir):
     return len(names)
 
 
-def export_scripts(session, assets_dir, progress=None, cancelled=None, unity_version=""):
+def export_il2cpp_stubs(session, game_dir, assets_dir, progress=None, cancelled=None, packages=None):
+    """export_scripts for an IL2CPP build: Cpp2IL's stub assemblies into GameCode (no source - there are no
+    method bodies to read)."""
+    if cpp2il.cpp2il_path() is None:
+        return 0, 0, ("No game scripts: this is an IL2CPP build. Install Cpp2IL (Help → Optional tools...) to "
+                      "rebuild its script classes, so prefabs and scenes get their script components.")
+    shutil.rmtree(os.path.join(assets_dir, *SCRIPTS_DIR), ignore_errors=True)
+    if progress is not None:
+        progress(0, 1, "Rebuilding the game's script classes (Cpp2IL)")
+    stubs = cpp2il.stub_assemblies(game_dir, cancelled=cancelled)
+    script_assemblies = session.script_assemblies() if hasattr(session, "script_assemblies") else []
+    to_copy, libraries = plan_assemblies(stubs, script_assemblies, packages)
+    copied = copy_assemblies(stubs, to_copy + libraries, assets_dir)
+    log.info("Game scripts: %d IL2CPP stub assemblies from Cpp2IL", copied)
+    return 0, copied, (f"The game is IL2CPP, so its code was rebuilt from metadata as {copied} stub assemblies "
+                       "(Assets/UniView/GameCode): prefabs and scenes get their script components with the "
+                       "saved values, but the scripts do nothing when played (no method bodies).")
+
+
+def export_scripts(session, assets_dir, progress=None, cancelled=None, unity_version="", packages=None):
     """The game's compiled assemblies into Assets/UniView/GameCode (used as they are), and their decompiled
     source into Assets/UniView/GameScripts~ (optional). Returns (C# files, assemblies copied, note)."""
     game_dir = session.path if os.path.isdir(session.path) else os.path.dirname(session.path)
     managed = managed_dir(game_dir) or managed_dir(os.path.dirname(game_dir))
-    if managed is None:
-        return 0, 0, "No game scripts: this build has no .NET code (IL2CPP)."
     if os.path.isdir(os.path.join(assets_dir, "GameScripts")):
         # Exporting again into a project whose scripts were already added (and maybe fixed by hand): keep them.
         return 0, 0, "Kept the game's scripts already in Assets/GameScripts (delete that folder to get fresh ones)."
+    if managed is None:
+        il2cpp_dir = next((d for d in (game_dir, os.path.dirname(game_dir)) if cpp2il.is_il2cpp(d)), None)
+        if il2cpp_dir is None:
+            return 0, 0, "No game scripts: this build has no .NET code."
+        return export_il2cpp_stubs(session, il2cpp_dir, assets_dir, progress, cancelled, packages)
     script_assemblies = session.script_assemblies() if hasattr(session, "script_assemblies") else []
-    to_decompile, libraries = plan_assemblies(managed, script_assemblies)
+    to_decompile, libraries = plan_assemblies(managed, script_assemblies, packages)
     copied = copy_assemblies(managed, to_decompile + libraries, assets_dir)
     notes = [f"The game's code is in the project as {copied} compiled assemblies (Assets/UniView/GameCode), so "
              "prefabs and scenes get their script components."]

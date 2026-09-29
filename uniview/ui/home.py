@@ -1,12 +1,15 @@
 """The projects (home) page: one card per saved game."""
 
+import ctypes
 import os
+import sys
 import threading
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from PySide6.QtCore import QEvent, QFileInfo, QRect, QRectF, QSignalBlocker, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPalette, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QImage, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -33,6 +36,26 @@ from uniview.constants import APP_TITLE, log
 from uniview.projects import detect_project_engine, engine_info_text, find_steam_games, game_exe
 from uniview.settings import COMPAT_STATUS, compat_report_url, fetch_compat, load_compat
 from uniview.ui.dialogs import EngineOptionsDialog, SteamPickDialog, TagsDialog, edit_project_notes
+
+
+def exe_icon_image(exe, size=96):
+    """The exe's icon as a QImage (safe off the GUI thread, unlike QFileIconProvider), or None."""
+    if sys.platform != "win32":
+        return None
+    try:
+        shell32, user32 = ctypes.windll.shell32, ctypes.windll.user32
+        hicon = ctypes.c_void_p()
+        # SHDefExtractIconW(file, index, flags, large, small, MAKELONG(large size, small size))
+        if shell32.SHDefExtractIconW(exe, 0, 0, ctypes.byref(hicon), None, size | (16 << 16)) != 0 or not hicon:
+            return None
+        try:
+            image = QImage.fromHICON(hicon.value)
+        finally:
+            user32.DestroyIcon(hicon)
+        return None if image.isNull() else image
+    except Exception:
+        log.debug("Couldn't extract the icon of %s", exe, exc_info=True)
+        return None
 
 
 class CardDelegate(QStyledItemDelegate):
@@ -156,6 +179,7 @@ class HomePage(QWidget):
     unload_requested = Signal(str)
     export_unity_requested = Signal(str)  # project path
     _counted = Signal(str, int)
+    _scanned = Signal(str, bool, object, object)  # path, folder exists, exe, icon QImage
     _detected = Signal(str, object)
     _compat_fetched = Signal(int)
     _games_found = Signal(object)
@@ -177,6 +201,14 @@ class HomePage(QWidget):
         self.is_loaded = is_loaded
         self.settings = settings
         self.icons = QFileIconProvider()
+        # Folder existence and exe icons, looked up off the GUI thread: on a cold disk every
+        # isdir/listdir/icon read can take tens of ms, and refresh() runs again after each burst of
+        # background results, so doing it inline froze the page for seconds at startup.
+        self._scans = {}  # path -> (exists, QIcon or None)
+        self._pending_scans = set()
+        self._std_icons = {}
+        self._scan_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="game-scan")
+        self._scanned.connect(self._on_scanned)
         self.compat = load_compat()
         self._counting = set()
         self._detecting = set()
@@ -327,7 +359,7 @@ class HomePage(QWidget):
 
     # ---- boxes
     def _action_item(self, text, icon, key):
-        item = QListWidgetItem(self.style().standardIcon(icon), text)
+        item = QListWidgetItem(self._std_icon(icon), text)
         item.setData(Qt.UserRole, key)
         item.setData(CardDelegate.STATE_ROLE, "action")
         return item
@@ -370,17 +402,55 @@ class HomePage(QWidget):
             self.tag_combo.addItem("Untagged", self.UNTAGGED)
             self.tag_combo.setCurrentIndex(max(0, self.tag_combo.findData(current)))
 
+    def _std_icon(self, which):
+        """Cached QStyle icon - standardIcon() hits the Windows shell (~20 ms) on every call."""
+        icon = self._std_icons.get(which)
+        if icon is None:
+            icon = self._std_icons[which] = self.style().standardIcon(which)
+        return icon
+
+    def _scan(self, path):
+        """(folder exists, icon or None) for a game, from cache; queues a background look-up if unknown."""
+        scan = self._scans.get(path)
+        if scan is None:
+            self._scans[path] = scan = (True, None)  # optimistic until the scan reports back
+
+            def work():
+                exists = os.path.isdir(path)
+                exe = game_exe(path) if exists else None
+                self._scanned.emit(path, exists, exe, exe_icon_image(exe) if exe else None)
+
+            self._scan_pool.submit(work)
+            self._pending_scans.add(path)
+        return scan
+
+    def _on_scanned(self, path, exists, exe, image):
+        self._pending_scans.discard(path)
+        if image is not None:
+            icon = QIcon(QPixmap.fromImage(image))
+        elif exe:
+            icon = self.icons.icon(QFileInfo(exe))  # warm by now - the scan already read the exe
+        else:
+            icon = None
+        self._scans[path] = (exists, icon)
+        self.refresh_timer.start()
+
+    def rescan(self, path=None):
+        """Forget cached folder/icon look-ups (one game, or all) so the next refresh redoes them."""
+        if path is None:
+            self._scans.clear()
+        else:
+            self._scans.pop(path, None)
+
     def _card_item(self, project):
         path = project["path"]
-        exe = game_exe(path) if os.path.isdir(path) else None
-        icon = (self.icons.icon(QFileInfo(exe)) if exe
-                else self.style().standardIcon(QStyle.SP_DirIcon))
-        item = QListWidgetItem(icon, project["name"])
+        exists, icon = self._scan(path)
+        item = QListWidgetItem(icon or self._std_icon(QStyle.SP_DirIcon), project["name"])
         item.setData(Qt.UserRole, path)
         compat = self.compat_entry(path)
         engine = engine_info_text(project)
         tip = [path]
-        if not os.path.isdir(path):
+        if not exists:
             state, lines = "missing", ["Folder missing"]
         else:
             state = "loaded" if self.is_loaded(path) else "unloaded"
@@ -440,7 +510,8 @@ class HomePage(QWidget):
         shown = []
         for project in self.store.sorted(self.sort_combo.currentData()):
             path = project["path"]
-            if os.path.isdir(path):
+            exists, _icon = self._scan(path)
+            if exists and path not in self._pending_scans:
                 if "engine" not in project or "engine_version" not in project:
                     self._detect_engine(path, project.get("engine"))
                 elif project.get("file_count") is None:
@@ -525,6 +596,8 @@ class HomePage(QWidget):
             if project is None:
                 return
             if not os.path.isdir(project["path"]):
+                self.rescan(project["path"])
+                self.refresh()
                 QMessageBox.warning(self, "Missing", f"Folder not found:\n{project['path']}")
                 return
             self.store.touch(project)

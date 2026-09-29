@@ -13,7 +13,7 @@ import urllib.request
 import webbrowser
 import zipfile
 
-from engines import extdecode
+from engines import cpp2il, extdecode
 from uniview.constants import log
 
 ILSPY_VERSION = "9.1.0.7988"  # runs on .NET 8+; 11.x doesn't install on the .NET 9 SDK
@@ -118,6 +118,14 @@ def install_ilspy(progress=None):
     return command[-1]
 
 
+# --------------------------------------------------------------------------- Cpp2IL
+
+def install_cpp2il(progress=None):
+    if progress:
+        progress("Downloading Cpp2IL (about 15 MB)...")
+    return cpp2il.install()
+
+
 # --------------------------------------------------------------------------- Blender / Unity
 
 def winget():
@@ -172,6 +180,10 @@ def all_tools(blender_path=""):
              "Turns a Unity game's code back into C# for Export as Unity project (Mono games).",
              lambda: (ilspy_command() or [None])[-1], install_ilspy,
              where=os.path.join(tools_dir(), "ilspycmd")),
+        Tool("cpp2il", "Cpp2IL (IL2CPP code rebuilder)",
+             "Rebuilds an IL2CPP Unity game's script classes for Export as Unity project, so prefabs and "
+             "scenes keep their script components.",
+             cpp2il.cpp2il_path, install_cpp2il, where=os.path.join(tools_dir(), "cpp2il")),
         Tool("blender", "Blender", "Open in Blender (Ctrl+B) and checking exported models.",
              lambda: find_blender(blender_path or None), install_blender,
              install_label="Install" if winget() else "Download page", recommended=False),

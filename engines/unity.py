@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -661,9 +662,40 @@ def _aligned_nodes(gen):
 _quiet_lock = threading.Lock()
 
 
+_std_handles_silenced = False
+
+
+def _silence_native_std_handles():
+    """Point the Win32 standard output/error handles at NUL, once and for good.
+
+    Native and .NET code writes through those handles; Python's streams (and faulthandler) use the C
+    runtime's fds 1/2, which keep their own handles, so they still reach the console or log. Swapping fds
+    1/2 around each call instead crashed the app: the .NET type tree generator caches the handle it first
+    wrote to, dup2 closes that handle when the fds are restored, and its next write ended the process."""
+    global _std_handles_silenced
+    if _std_handles_silenced:
+        return True
+    try:
+        import ctypes
+        import msvcrt
+        nul = msvcrt.get_osfhandle(os.open(os.devnull, os.O_WRONLY))  # kept open for the app's lifetime
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetStdHandle.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        for std in (-11 & 0xFFFFFFFF, -12 & 0xFFFFFFFF):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            kernel32.SetStdHandle(std, nul)
+    except (ImportError, OSError, AttributeError) as e:
+        log.debug("Couldn't silence native output: %s", e)
+        return False
+    _std_handles_silenced = True
+    return True
+
+
 @contextmanager
 def _quiet_native_output():
     """Send what native code writes to stdout/stderr to nowhere (Python's own streams are left alone)."""
+    if sys.platform == "win32" and _silence_native_std_handles():
+        yield
+        return
     with _quiet_lock:
         saved = []
         try:
@@ -684,6 +716,25 @@ def _quiet_native_output():
                 os.dup2(copy, fd)
                 os.close(copy)
             os.close(devnull)
+
+
+def _warm_cpp2il(path):
+    """Start Cpp2IL on an IL2CPP game in the background while it opens: the first script view (or export)
+    then finds the result cached instead of waiting up to a minute."""
+    from . import cpp2il
+    game_dir = path if os.path.isdir(path) else os.path.dirname(path)
+    if not cpp2il.is_il2cpp(game_dir):
+        game_dir = os.path.dirname(game_dir)  # opened the _Data folder itself
+    if cpp2il.cpp2il_path() is None or not cpp2il.is_il2cpp(game_dir):
+        return
+
+    def work():
+        try:
+            cpp2il.stub_assemblies(game_dir)
+        except Exception as e:
+            log.warning("Cpp2IL couldn't rebuild the game's code: %s", e)
+
+    threading.Thread(target=work, daemon=True, name="cpp2il").start()
 
 
 class ScriptReader:
@@ -710,6 +761,25 @@ class ScriptReader:
             return
         version = next((f.unity_version for f in getattr(self.env, "assets", []) if getattr(f, "unity_version", "")), "")
         il2cpp = os.path.isfile(os.path.join(self.game_dir, "GameAssembly.dll"))
+        stubs = None
+        if il2cpp:
+            # Cpp2IL's rebuilt assemblies read with the Mono generator: the native IL2CPP one gets some
+            # layouts wrong and can crash the whole app on others.
+            from . import cpp2il
+            try:
+                stubs = cpp2il.stub_assemblies(self.game_dir)
+            except Exception as e:
+                log.warning("Cpp2IL couldn't rebuild the game's code (%s) - using the IL2CPP reader", e)
+        if stubs:
+            try:
+                gen = TypeTreeGenerator(version, "AssetsTools")
+                gen.load_local_dll_folder(stubs)
+                gen.get_nodes_up = _aligned_nodes(gen)
+                self.generators.append(gen)
+                log.info("Script field layouts from the game's IL2CPP code, rebuilt by Cpp2IL")
+                return
+            except Exception as e:
+                log.warning("Couldn't load Cpp2IL's assemblies (%s) - using the IL2CPP reader", e)
         for backend in (("AssetStudio", "AssetsTools") if il2cpp else ("AssetsTools", "AssetStudio")):
             try:
                 gen = TypeTreeGenerator(version, backend)
@@ -2249,6 +2319,7 @@ class UnityPlugin(EnginePlugin):
                 log.warning("Could not load %s: %s: %s", rel, type(e).__name__, e)
         progress("Indexing objects ...")
         session = UnitySession(self, path, env, len(files))
+        _warm_cpp2il(path)
         res_paths = resource_paths(env)
         session.resource_paths = res_paths
         transforms_by_file = {}   # id(assets file) -> (assets file, [Transform readers])
