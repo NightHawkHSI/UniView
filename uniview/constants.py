@@ -64,6 +64,8 @@ VIEW_OPTION_ITEMS = (
      "Scenes and prefabs: show only the most detailed copy of objects that have LODs"),
     ("hide_inactive", "Hide switched-off objects in scenes",
      "Scenes and prefabs: leave out objects and renderers the game has disabled"),
+    ("show_effects", "Show particle effects and lines in scenes",
+     "Scenes and prefabs: particle systems as a few still puffs where they emit, and line renderers"),
 )
 
 PROJECTS_FILE = os.path.join(APP_DIR, "projects.json")

@@ -163,6 +163,8 @@ class MeshView(QWidget):
         self.override = None     # texture the user put on the whole model
         self.parts = []          # [(PolyData of one submesh, its texture or None)]
         self._textures = {}      # (id(img), alpha, flip) -> pv.Texture
+        self.flat = False        # 2D content: straight-on view without perspective
+        self.gizmos = {}         # kind -> (points, segments) line overlays
 
         self.wire = QCheckBox("Wireframe")
         self.edges = QCheckBox("Edges")
@@ -174,7 +176,12 @@ class MeshView(QWidget):
                                   "Off by default: many games store other data there.")
         self.use_colors = QCheckBox("Vertex colors")
         self.use_colors.setChecked(True)
-        for cb in (self.wire, self.edges, self.use_tex, self.flip_v, self.tex_alpha, self.use_colors):
+        self.show_gizmos = QCheckBox("Gizmos")
+        self.show_gizmos.setToolTip("Draw colliders (green, triggers yellow), light ranges (orange), camera views\n"
+                                    "(white) and sound sources (cyan) as wire shapes.")
+        self.show_gizmos.setEnabled(False)
+        for cb in (self.wire, self.edges, self.use_tex, self.flip_v, self.tex_alpha, self.use_colors,
+                   self.show_gizmos):
             cb.toggled.connect(self.redraw)
         zoom_in = QPushButton("+")
         zoom_out = QPushButton("−")
@@ -260,7 +267,7 @@ class MeshView(QWidget):
         self.anim_bar.hide()
         bar = QHBoxLayout()
         for w in (self.wire, self.edges, self.use_tex, self.flip_v, self.tex_alpha, self.use_colors,
-                  zoom_in, zoom_out, reset, self.fly, QLabel("UV:"), self.uv_combo, uv_layout):
+                  self.show_gizmos, zoom_in, zoom_out, reset, self.fly, QLabel("UV:"), self.uv_combo, uv_layout):
             bar.addWidget(w)
         bar.addStretch()
         bar.addWidget(self.info)
@@ -321,6 +328,7 @@ class MeshView(QWidget):
         self._keys.clear()
         self._look = None
         if on:
+            self.plotter.disable_parallel_projection()
             camera.view_angle = self.FLY_FOV
             # Keep walls drawn right up to the camera (VTK otherwise clips close geometry away).
             renderer.SetNearClippingPlaneTolerance(0.0001)
@@ -474,7 +482,26 @@ class MeshView(QWidget):
         self.plotter.render()
 
     def _home_camera(self):
-        """Models are Y-up: look from the front-right, slightly above."""
+        """Models are Y-up: look from the front-right, slightly above. 2D content: straight on, from where a
+        Unity 2D camera looks (-Z; x is mirrored in UniView's space, so this keeps the game's left/right)."""
+        if self.flat and not self.fly.isChecked():
+            self.plotter.view_xy(negative=True)
+            self.plotter.enable_parallel_projection()
+            self.plotter.reset_camera()
+            if self.poly is not None and self.poly.n_points > 8:
+                # Frame the busy part in x/y only: depth (sprite layers can be hundreds of units apart) and
+                # far-off sprites parked off screen would otherwise shrink everything to a dot.
+                pts = np.asarray(self.poly.points)
+                lo, hi = np.percentile(pts, [2, 98], axis=0)
+                camera = self.plotter.camera
+                center = (lo + hi) / 2
+                camera.focal_point = (center[0], center[1], pts[:, 2].mean())
+                camera.position = (center[0], center[1], pts[:, 2].min() - max(hi[0] - lo[0], hi[1] - lo[1], 1.0))
+                aspect = max(self.plotter.interactor.width(), 1) / max(self.plotter.interactor.height(), 1)
+                camera.parallel_scale = max((hi[1] - lo[1]) / 2, (hi[0] - lo[0]) / 2 / aspect, 1e-3) * 1.05
+                self.plotter.renderer.ResetCameraClippingRange()
+            return
+        self.plotter.disable_parallel_projection()
         self.plotter.view_xy()
         self.plotter.camera.azimuth = 35
         self.plotter.camera.elevation = 20
@@ -569,8 +596,17 @@ class MeshView(QWidget):
             self.anim_time = value / 1000.0 * self.animator.length
             self._anim_apply()
 
-    def show_mesh(self, poly, texture_img, parts=None):
-        """parts: [(faces array (M, 3), texture image or None, color or None)] - each submesh with its own look."""
+    def show_mesh(self, poly, texture_img, parts=None, flat=False, gizmos=None, gizmos_only=False):
+        """parts: [(faces array (M, 3), texture image or None, color or None)] - each submesh with its own look.
+        flat: 2D content (sprites facing -Z) - looked at straight on, without perspective."""
+        self.flat = flat
+        self.gizmos = gizmos or {}
+        self.show_gizmos.setEnabled(bool(self.gizmos))
+        if gizmos_only:
+            with QSignalBlocker(self.show_gizmos):
+                self.show_gizmos.setChecked(True)  # nothing else to see
+        if flat and self.fly.isChecked():
+            self.set_fly(False)
         self.anim_timer.stop()
         self.animator = None
         self.anim_bar.hide()
@@ -618,12 +654,26 @@ class MeshView(QWidget):
             self._textures[key] = pv.Texture(np.ascontiguousarray(arr))
         return self._textures[key]
 
+    GIZMO_COLORS = {"collider": "#3ddc84", "trigger": "#e8d44d", "light": "#ff9f43", "camera": "#ffffff",
+                    "audio": "#4dd0e1"}
+
+    def _draw_gizmos(self):
+        if not (self.show_gizmos.isChecked() and self.gizmos):
+            return
+        for kind, (pts, segs) in self.gizmos.items():
+            if not len(segs):
+                continue
+            lines = np.hstack([np.full((len(segs), 1), 2, np.int64), segs]).ravel()
+            self.plotter.add_mesh(pv.PolyData(np.asarray(pts, np.float32), lines=lines),
+                                  color=self.GIZMO_COLORS.get(kind, "#ff00ff"), line_width=2, lighting=False)
+
     def redraw(self, *_, reset_camera=False):
         self.plotter.clear_actors()  # clear() would also drop the lights
         if not self.plotter.renderer.lights:
             self.plotter.enable_lightkit()
         if self.poly is None:
             return
+        self._draw_gizmos()
         animating = self.animator is not None
         kwargs = dict(
             style="wireframe" if self.wire.isChecked() else "surface",

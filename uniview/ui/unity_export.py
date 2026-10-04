@@ -1,14 +1,16 @@
 """'Export as Unity project...': pick a folder, run the export with a progress dialog."""
 
 import os
+import re
 import threading
 import time
+import webbrowser
 
 from PySide6.QtCore import QEventLoop, QObject, Qt, Signal
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
 
 from uniview.constants import log
-from uniview.unity_project import export_unity_project
+from uniview.unity_project import export_unity_project, version_tuple
 from uniview.util import open_path, safe_filename
 
 
@@ -26,6 +28,36 @@ def ask_project_folder(parent, game_name, start_dir):
         if answer != QMessageBox.Yes:
             return None
     return root
+
+
+def unity_download_url(version):
+    """Release page with Unity Hub's install button ('2021.3.5f1' -> .../whats-new/2021.3.5), else the archive."""
+    m = re.fullmatch(r"(\d+\.\d+\.\d+)f1", version or "")
+    return (f"https://unity.com/releases/editor/whats-new/{m.group(1)}" if m
+            else "https://unity.com/releases/editor/archive")
+
+
+def choose_editor_version(parent, game_version, fallback):
+    """The game's Unity version isn't installed: install it first, or set the project up for `fallback`
+    (an upgrade that can break the game's code). Returns the version to export for, or None."""
+    box = QMessageBox(parent)
+    box.setWindowTitle("Export as Unity project")
+    box.setIcon(QMessageBox.Question)
+    box.setText(f"This game was made with Unity {game_version}, which isn't installed.")
+    box.setInformativeText(
+        f"For the best result install Unity {game_version} with Unity Hub, then export again - "
+        f"the project gets the same packages and code the game was built with.\n\n"
+        f"Or export for Unity {fallback} (installed): Unity upgrades the project, which can break "
+        f"the game's scripts and packages. Open that project only with Unity {fallback}.")
+    install = box.addButton(f"Get Unity {game_version}", QMessageBox.AcceptRole)
+    use = box.addButton(f"Use Unity {fallback}", QMessageBox.AcceptRole)
+    box.addButton(QMessageBox.Cancel)
+    box.setDefaultButton(install)
+    box.exec()
+    if box.clickedButton() is install:
+        webbrowser.open(unity_download_url(game_version))
+        return None
+    return fallback if box.clickedButton() is use else None
 
 
 class _Relay(QObject):
@@ -100,6 +132,9 @@ def run_export(parent, session, root, version, editor_exe=None, game_version="")
                "Open this folder with Unity Hub (Add → this folder).")
             + "\nThe first time, Unity takes a while to import everything, then builds the game's prefabs and scenes "
               "(menu: UniView → Rebuild prefabs and scenes)."
+            + ("\nIf the first import stops moving for minutes, Unity's API updater is stuck on the game's DLLs: "
+               "in Unity Hub, project ⋮ → Add command line arguments → -disable-assembly-updater."
+               if version_tuple(version) < (6000,) else "")
             + "".join("\n\n" + n for n in notes) + "\n\nOpen the folder now?")
     if QMessageBox.question(parent, "Export as Unity project", text) == QMessageBox.Yes:
         open_path(root)

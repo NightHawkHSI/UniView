@@ -111,6 +111,35 @@ def test_write_manifest(tmp_path):
     assert not up.write_manifest(str(tmp_path / "p2"), None, "6.14.1")
 
 
+def test_write_manifest_for_another_editor_drops_old_packages(tmp_path):
+    proj = tmp_path / "proj"
+    manifest, lock = proj / "Packages" / "manifest.json", proj / "Packages" / "packages-lock.json"
+    up.write_manifest(str(proj), fake_editor(tmp_path, ("accessibility", "audio")), "6.14.1",
+                      {"com.unity.collections": "6.5.0"}, "6000.5.4f1")
+    deps = json.load(open(manifest))["dependencies"]
+    json.dump({"dependencies": {**deps, "com.unity.textmeshpro": "3.0.6"}}, open(manifest, "w"))
+    lock.write_text("{}")
+    old_editor = tmp_path / "old"
+    old_editor.mkdir()
+    exe = fake_editor(old_editor, ("audio",))
+    up.write_manifest(str(proj), exe, "6.0.1", {"com.unity.collections": "1.2.3"}, "2021.3.5f1")
+    assert json.load(open(manifest))["dependencies"] == {
+        "com.unity.cloud.gltfast": "6.0.1", "com.unity.collections": "1.2.3", "com.unity.modules.audio": "1.0.0",
+        "com.unity.textmeshpro": "3.0.6"}  # the user's package stays, Unity 6's module and versions go
+    assert not lock.exists()
+
+
+def test_write_manifest_without_record_drops_export_packages(tmp_path):
+    """Projects exported before Packages/uniview-packages.json existed."""
+    manifest = tmp_path / "proj" / "Packages" / "manifest.json"
+    manifest.parent.mkdir(parents=True)
+    json.dump({"dependencies": {"com.unity.modules.amd": "1.0.0", "com.unity.visualeffectgraph": "17.5.0",
+                                "com.example.tool": "1.0.0"}}, open(manifest, "w"))
+    up.write_manifest(str(tmp_path / "proj"), fake_editor(tmp_path, ("audio",)), "6.0.1", version="2021.3.5f1")
+    assert json.load(open(manifest))["dependencies"] == {
+        "com.example.tool": "1.0.0", "com.unity.cloud.gltfast": "6.0.1", "com.unity.modules.audio": "1.0.0"}
+
+
 def test_plan_skips_builtins_and_unhandled_kinds(tmp_path):
     assets = [Asset("texture", "Soft", 1, source="unity default resources"),
               Asset("texture", "wall", 2, source="sharedassets0.assets"),
@@ -248,6 +277,14 @@ def test_builder_json_fields_match_the_cs_classes():
                                     "light": {"type": 1, "color": [1, 1, 1, 1], "intensity": 1, "range": 1,
                                               "spot_angle": 1}}], "Assets/x.unity", {}, "")["nodes"][0]["light"]
     assert set(light) <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_light))
+    cs_rect = re.search(r"public class RectInfo\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
+    ui = {"anchor_min": [0, 0], "anchor_max": [1, 1], "pos": [3, 4], "size": [-10, 20], "pivot": [0.5, 1]}
+    rect = up.prefab_description([{**PrefabSession([]).hierarchy(None)[0], "rect": ui}], "Assets/x.prefab", {},
+                                 "")["nodes"][0]["rect"]
+    assert set(rect) <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_rect))
+    assert rect == {"present": True, "anchorMin": [0, 0], "anchorMax": [1, 1], "anchoredPosition": [3, 4],
+                    "sizeDelta": [-10, 20], "pivot": [0.5, 1]}
+    assert "rect" not in desc["nodes"][0]
 
 
 # ---------------------------------------------------------------------------- scenes
@@ -510,3 +547,25 @@ def test_controller_json_matches_builder_classes():
     assert set(js["layers"][0]) <= names("CtrlLayer") and set(js["layers"][0]["states"][0]) <= names("CtrlState")
     assert set(js["layers"][0]["states"][0]["transitions"][0]) <= names("CtrlTransition")
     assert set(js["layers"][0]["states"][1]["treeNodes"][0]) <= names("TreeNode")
+
+
+def test_identical_components_share_one_prop_list():
+    """Big maps hold thousands of copies of one particle effect: their values are written once."""
+    from uniview.unity_builder import BUILDER_CS
+    import re
+    big = [{"p": f"m_Value{k}", "t": "f", "v": float(k)} for k in range(up.SHARE_MIN_PROPS)]
+    base = PrefabSession([]).hierarchy(None)[0]
+    nodes = [{**base, "name": f"fx{i}", "parent": -1,
+              "components": [{"type": "ParticleSystem", "props": big},
+                             {"type": "BoxCollider", "props": [{"p": "m_IsTrigger", "t": "b", "v": i % 2}]}]}
+             for i in range(3)]
+    desc = up.prefab_description(nodes, "Assets/x.unity", {}, "", kind="scene")
+    assert len(desc["shared"]) == 1 and len(desc["shared"][0]["props"]) == up.SHARE_MIN_PROPS
+    for n in desc["nodes"]:
+        fx, box = n["components"]
+        assert fx["shared"] == 0 and fx["props"] == []
+        assert box["shared"] == -1 and len(box["props"]) == 1
+    cs_comp = re.search(r"public class Comp\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
+    assert set(desc["nodes"][0]["components"][0]) <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_comp))
+    cs_list = re.search(r"public class PropList\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
+    assert set(desc["shared"][0]) <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_list))

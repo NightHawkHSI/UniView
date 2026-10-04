@@ -9,6 +9,7 @@ project targets Unity 2020.3 or newer, else OBJ + MTL. GLBs reference the projec
 instead of carrying copies.
 """
 
+import contextlib
 import glob
 import hashlib
 import json
@@ -26,12 +27,19 @@ from uniview.export import (
     write_glb,
     write_obj,
 )
+from uniview.exr import write_exr
 from uniview.search import is_unreadable
 from uniview.unity_builder import BUILDER_CS
 from uniview.unity_layout import KIND_FOLDERS, Layout, collect_usage
 from uniview.unity_layout import target as layout_target
 from uniview.unity_materials import convert, mat_yaml
-from uniview.unity_packages import game_assemblies, packages_for, recommended_versions
+from uniview.unity_packages import (
+    ASSEMBLY_PACKAGES,
+    builtin_packages,
+    game_assemblies,
+    packages_for,
+    recommended_versions,
+)
 from uniview.util import safe_filename
 
 FILE_KINDS = ("texture", "audio", "text", "font", "video")
@@ -41,7 +49,7 @@ BUILTIN_SOURCES = ("unity default resources", "unity_builtin_extra")
 VERSION_RE = re.compile(r"^\d{4}\.\d+\.\d+[abfp]\d+$|^\d{4}\.\d+\.\d+$")
 HUB_EDITORS = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Unity", "Hub", "Editor")
 GLTFAST_MIN = (2020, 3)
-IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tga")
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tga", ".exr")
 
 
 # --------------------------------------------------------------------------- versions
@@ -105,19 +113,30 @@ def gltfast_version(version):
 
 # --------------------------------------------------------------------------- project files
 
-def meta_text(guid, texture_type=None):
+def meta_text(guid, texture_type=None, data=None):
     """A minimal .meta; Unity fills in the rest. Textures need serializedVersion, else Unity reads the
-    settings as a very old format and imports them as cubemaps."""
+    settings as a very old format and imports them as cubemaps.
+
+    data: settings of a float texture that holds data (UnitySession.float_texture) - imported exactly:
+    linear, uncompressed, not resized, with the game's filter/wrap mode and mipmaps."""
     text = f"fileFormatVersion: 2\nguid: {guid}\n"
     if texture_type is not None:
         text += f"TextureImporter:\n  serializedVersion: 4\n  textureType: {texture_type}\n"
+        if data is not None:
+            wrap = data.get("wrap_mode", 0)
+            text += (f"  mipmaps:\n    enableMipMap: {int(bool(data.get('mipmaps')))}\n    sRGBTexture: 0\n"
+                     f"  textureSettings:\n    serializedVersion: 2\n    filterMode: {data.get('filter_mode', 1)}\n"
+                     f"    wrapU: {wrap}\n    wrapV: {wrap}\n    wrapW: {wrap}\n"
+                     "  nPOTScale: 0\n  maxTextureSize: 16384\n  alphaUsage: 0\n"
+                     "  platformSettings:\n  - buildTarget: DefaultTexturePlatform\n    maxTextureSize: 16384\n"
+                     "    textureFormat: -1\n    textureCompression: 0\n")
     return text
 
 
-def write_meta(path, guid, normal_map=False):
+def write_meta(path, guid, normal_map=False, data=None):
     is_image = path.lower().endswith(IMAGE_EXTS)
     with open(path + ".meta", "w", encoding="utf-8", newline="\n") as f:
-        f.write(meta_text(guid, (1 if normal_map else 0) if is_image else None))
+        f.write(meta_text(guid, (1 if normal_map else 0) if is_image else None, data))
 
 
 def write_folder_metas(assets_dir, folder):
@@ -140,9 +159,25 @@ def write_project_settings(root, version):
             f.write(f"m_EditorVersion: {version}\n")
 
 
-def write_manifest(root, editor_exe, gltfast, extra=None):
+MANIFEST_RECORD = "uniview-packages.json"  # in Packages/: what the last export put in manifest.json
+EXPORT_PACKAGES = {"com.unity.cloud.gltfast", "com.unity.2d.sprite"} | {c for _, cs in ASSEMBLY_PACKAGES for c in cs}
+
+
+def _read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_manifest(root, editor_exe, gltfast, extra=None, version=""):
     """Packages/manifest.json: every built-in module the editor ships (as Unity's own default) plus glTFast.
-    Without an editor to read the module list from, Unity's default manifest is left alone."""
+    Without an editor to read the module list from, Unity's default manifest is left alone.
+
+    Re-exporting keeps packages the user added, but not the ones an earlier export chose for another
+    editor: a Unity 6 manifest (com.unity.modules.accessibility, collections 6.5...) doesn't resolve in 2021."""
     builtin = os.path.join(os.path.dirname(editor_exe or ""), "Data", "Resources", "PackageManager", "BuiltInPackages")
     if not editor_exe or not os.path.isdir(builtin):
         return False
@@ -153,16 +188,28 @@ def write_manifest(root, editor_exe, gltfast, extra=None):
     deps.update(extra or {})  # the Unity packages the game was built with (UI, TextMeshPro, Timeline...)
     if os.path.isdir(os.path.join(builtin, "com.unity.2d.sprite")):
         deps.setdefault("com.unity.2d.sprite", "1.0.0")  # UniViewBuilder.cs cuts sprite sheets with it
-    path = os.path.join(root, "Packages", "manifest.json")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    if os.path.isfile(path):  # keep packages the user added to an earlier export
-        try:
-            with open(path, encoding="utf-8") as f:
-                deps = {**json.load(f).get("dependencies", {}), **deps}
-        except (OSError, ValueError, AttributeError):
-            pass
+    folder = os.path.join(root, "Packages")
+    path, record_path = os.path.join(folder, "manifest.json"), os.path.join(folder, MANIFEST_RECORD)
+    os.makedirs(folder, exist_ok=True)
+    old = _read_json(path).get("dependencies")
+    user_added = {}
+    if isinstance(old, dict) and old:
+        record = _read_json(record_path)
+        if record:
+            ours = set(record.get("packages", []))
+        else:  # exported before the record existed: everything an export could have written
+            ours = {n for n in old if n.startswith("com.unity.modules.")} | EXPORT_PACKAGES
+        user_added = {n: v for n, v in old.items() if n not in ours and n not in deps}
+        if record.get("editor") != version:
+            # Resolved for another editor (or unknown); Unity rebuilds the lock file from the new manifest.
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(folder, "packages-lock.json"))
+        if user_added:
+            log.info("Keeping package(s) added to the project earlier: %s", ", ".join(sorted(user_added)))
+    with open(record_path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"editor": version, "packages": sorted(deps)}, f, indent=2)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump({"dependencies": dict(sorted(deps.items()))}, f, indent=2)
+        json.dump({"dependencies": dict(sorted({**user_added, **deps}.items()))}, f, indent=2)
     return True
 
 
@@ -273,10 +320,30 @@ def component_props(props, asset_paths, root, materials=None, prefab_objects=Non
     return out
 
 
+SHARE_MIN_PROPS = 8  # components with fewer values keep them inline
+
+
 def prefab_description(nodes, target, model_paths, root, builtin_meshes=None, kind="prefab", materials=None,
                        prefab_objects=None):
-    """The JSON UniViewBuilder.cs reads: nodes with their model GLB/OBJ (or built-in mesh) instead of mesh uids."""
+    """The JSON UniViewBuilder.cs reads: nodes with their model GLB/OBJ (or built-in mesh) instead of mesh uids.
+    Components with the same values (a scene full of copies of one particle effect) share one prop list in
+    "shared" - written out each time, big maps made JSON files Unity can't read (hundreds of MB)."""
     out = []
+    shared, shared_index = [], {}
+
+    def comp_entry(c):
+        props = component_props(c["props"], model_paths, root, materials, prefab_objects)
+        entry = {"type": c["type"], "script": c.get("script", ""), "props": [], "shared": -1}
+        if len(props) < SHARE_MIN_PROPS:
+            entry["props"] = props
+            return entry
+        key = json.dumps(props, sort_keys=True, separators=(",", ":"))
+        if key not in shared_index:
+            shared_index[key] = len(shared)
+            shared.append({"props": props})
+        entry["shared"] = shared_index[key]
+        return entry
+
     for n in nodes:
         model = model_paths.get(n.get("mesh")) or model_paths.get(n.get("terrain"))
         if model and not model.lower().endswith((".glb", ".obj")):
@@ -292,17 +359,20 @@ def prefab_description(nodes, target, model_paths, root, builtin_meshes=None, ki
                     if materials is not None and (model or builtin) else [],
                     # The game's renderer has no materials, so the game never draws it (collision/helper meshes).
                     "noMaterials": "materials" in n and not n["materials"] and bool(model or builtin),
-                    "components": [{"type": c["type"], "script": c.get("script", ""),
-                                    "props": component_props(c["props"], model_paths, root, materials,
-                                                             prefab_objects)}
-                                   for c in n.get("components") or ()],
+                    "components": [comp_entry(c) for c in n.get("components") or ()],
                     "layer": int(n.get("layer", 0)), "tag": n.get("tag", "")})
+        rect = n.get("rect")
+        if rect:  # a UI object: RectTransform layout
+            out[-1]["rect"] = {"present": True, "anchorMin": [float(v) for v in rect["anchor_min"]],
+                               "anchorMax": [float(v) for v in rect["anchor_max"]],
+                               "anchoredPosition": [float(v) for v in rect["pos"]],
+                               "sizeDelta": [float(v) for v in rect["size"]], "pivot": [float(v) for v in rect["pivot"]]}
         light = n.get("light")
         if light:
             out[-1]["light"] = {"present": True, "type": light["type"], "color": [float(c) for c in light["color"]],
                                 "intensity": light["intensity"], "range": light["range"],
                                 "spotAngle": light["spot_angle"], "enabled": light.get("enabled", True)}
-    return {"version": 1, "kind": kind, "target": unity_path(root, target), "nodes": out}
+    return {"version": 1, "kind": kind, "target": unity_path(root, target), "nodes": out, "shared": shared}
 
 
 def is_scene(asset):
@@ -747,6 +817,13 @@ def _write_model(session, asset, path, texture_paths, normal_keys):
                          image_uri=image_uri, normal_maps=True)
 
 
+def _float_texture(session, asset):
+    if not hasattr(session, "float_texture"):
+        return None
+    with session.lock:
+        return session.float_texture(asset)
+
+
 def _skippable(session, asset):
     """Nothing to export (e.g. a texture the game only fills in while running)?"""
     try:
@@ -782,22 +859,39 @@ def find_owners(session, layout, cancelled=None, progress=None):
 
 
 def export_unity_project(session, root, version="", progress=None, cancelled=None, editor_exe=None,
-                         scripts=True, notes=None):
+                         scripts=True, notes=None, bundle_packages=True):
     """Write the project; returns (files written, failed, skipped). progress(done, total, text) is called
     now and then; cancelled() -> True stops early. editor_exe: the Unity.exe the project is for (its
     module list goes into the package manifest). scripts: also decompile the game's code (Mono games, needs
-    ilspycmd). notes: a list that gets messages for the user (e.g. why there are no scripts)."""
+    ilspycmd). notes: a list that gets messages for the user (e.g. why there are no scripts).
+    bundle_packages: ship the game's Unity packages and their dependencies with the project (.tgz files in
+    LocalPackages/, from Unity's registry) instead of leaving them for Unity to download."""
     assets_dir = os.path.join(root, "Assets")
     os.makedirs(assets_dir, exist_ok=True)
     write_project_settings(root, version)
     gltf = uses_gltf(version)
     game_dir = getattr(session, "path", "") or ""
     game_dir = game_dir if os.path.isdir(game_dir) else os.path.dirname(game_dir)
-    packages = packages_for(game_assemblies(game_dir) + list(getattr(session, "script_assemblies", lambda: [])()),
-                            recommended_versions(editor_exe)) if game_dir else {}
+    bundle_packages = bundle_packages and gltf and bool(editor_exe)
+    wanted = packages_for(game_assemblies(game_dir) + list(getattr(session, "script_assemblies", lambda: [])()),
+                          recommended_versions(editor_exe), others=bundle_packages) if game_dir else {}
+    resolved = {}
+    if bundle_packages and wanted:
+        from uniview.unity_registry import Registry, bundle, resolve
+        if progress is not None:
+            progress(0, 0, "Unity packages")
+        registry = Registry()
+        resolved = resolve(wanted, version, builtin_packages(editor_exe), registry)
+        refs, missing = bundle(root, resolved, registry, cancelled, progress)
+        log.info("Unity packages shipped in LocalPackages/: %s", ", ".join(f"{n} {resolved[n]}" for n in sorted(refs)))
+        if missing and notes is not None:
+            notes.append("Unity downloads these packages on first open (couldn't get them): " + ", ".join(missing))
+        resolved = {n: refs.get(n, v) for n, v in resolved.items()}
+    # The editor's built-in packages keep their versions; everything else is what the resolve picked.
+    packages = {**{n: v for n, v in wanted.items() if v}, **resolved}
     if packages:
         log.info("Unity packages the game uses: %s", ", ".join(f"{k} {v}" for k, v in sorted(packages.items())))
-    if gltf and not write_manifest(root, editor_exe, gltfast_version(version), packages):
+    if gltf and not write_manifest(root, editor_exe, gltfast_version(version), packages, version):
         log.warning("No Unity editor to read the package list from: models are saved as OBJ")
         gltf = False
     layout = Layout(session.assets)
@@ -816,13 +910,20 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
             break
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
+            data = None
             if asset.kind in MODEL_KINDS:
                 files = _write_model(session, asset, path, texture_paths, normal_keys)
+            elif asset.kind == "texture" and (floats := _float_texture(session, asset)) is not None:
+                pixels, data = floats  # data, not colours: .exr keeps the values (a PNG would clamp them)
+                path = os.path.splitext(path)[0] + ".exr"
+                write_exr(path, pixels, data["float32"])
+                texture_paths[asset.key] = path
+                files = [path]
             else:
                 files = write_asset(session, asset, path)
             for out in files:
                 guid = asset_guid(asset.uid if out == path or len(files) == 1 else f"{asset.uid}:{os.path.basename(out)}")
-                write_meta(out, guid, normal_map=asset.key in normal_keys)
+                write_meta(out, guid, normal_map=asset.key in normal_keys, data=data)
                 write_folder_metas(assets_dir, os.path.dirname(out))
                 written += 1
         except Exception as e:

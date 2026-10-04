@@ -194,6 +194,9 @@ class MeshData:
     colors      (N, 4) float32 in 0..1, or None
     material_slots  for each submesh, the index into the model's materials (default: same index)
     skipped     parts that couldn't be shown (lines/points), for the log
+    view_2d     mostly flat 2D content (sprites) facing -Z: shown straight on instead of from an angle
+    gizmos      {kind: (points (N, 3), segments (M, 2))} wire overlays for things without a mesh (colliders,
+                lights, cameras, sound sources), shown on request; gizmos_only: that's all there is
     """
 
     points: NDArray[np.float32]
@@ -204,6 +207,9 @@ class MeshData:
     material_slots: list[int]
     name: str
     skipped: int
+    view_2d: bool
+    gizmos: dict[str, tuple[NDArray[np.float32], NDArray[np.int64]]]
+    gizmos_only: bool
 
     def __init__(self, points: ArrayLike, submeshes: Iterable[ArrayLike], normals: ArrayLike | None = None,
                  uvs: Mapping[str, ArrayLike] | None = None, colors: ArrayLike | None = None,
@@ -218,6 +224,9 @@ class MeshData:
         self.material_slots = list(material_slots) if material_slots is not None else list(range(len(self.submeshes)))
         self.name = name
         self.skipped = skipped
+        self.view_2d = False
+        self.gizmos = {}
+        self.gizmos_only = False
         if not n:
             raise ValueError("Mesh has no vertices.")
         if not any(len(s) for s in self.submeshes):
@@ -336,6 +345,7 @@ VIEW_OPTIONS: dict[str, bool] = {
     "hide_tool_surfaces": True,  # maps: leave out nodraw, trigger, clip, hint and sky brushes
     "hide_lods": True,           # scenes: show only the most detailed LOD of each object
     "hide_inactive": True,       # scenes: leave out objects and renderers the game has switched off
+    "show_effects": True,        # scenes: particle systems (as a few still puffs) and line renderers
 }
 
 
@@ -381,6 +391,14 @@ class GameSession:
     def raw(self, asset: Asset) -> bytes:
         """The asset's bytes as stored (used to export text/file assets as-is)."""
         raise NotImplementedError("This engine plugin can't export raw files.")
+
+    def content_hash(self, asset: Asset) -> bytes | None:
+        """Fingerprint of the asset's content, the same for identical copies (duplicate finder); None if it
+        can't be fingerprinted. Default: a hash of raw(). Override when raw() holds per-copy details (names,
+        offsets into other files) so true copies still match."""
+        import hashlib
+        data = self.raw(asset)
+        return hashlib.blake2b(bytes(data), digest_size=16).digest() if data is not None else None
 
     def audio(self, asset: Asset) -> tuple[bytes, str]:
         """(bytes, extension) of a sound in a format a media player understands:

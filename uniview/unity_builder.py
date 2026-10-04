@@ -34,6 +34,17 @@ namespace UniView
     }
 
     [Serializable]
+    public class RectInfo
+    {
+        public bool present;
+        public float[] anchorMin;
+        public float[] anchorMax;
+        public float[] anchoredPosition;
+        public float[] sizeDelta;
+        public float[] pivot;
+    }
+
+    [Serializable]
     public class Prop
     {
         public string p;   // SerializedProperty path, e.g. m_Center.x or m_Materials.Array.data[0]
@@ -50,6 +61,13 @@ namespace UniView
     {
         public string type;
         public string script;  // "Namespace.Class" for MonoBehaviour
+        public Prop[] props;
+        public int shared = -1;  // >= 0: the values are Description.shared[shared] (identical components share them)
+    }
+
+    [Serializable]
+    public class PropList
+    {
         public Prop[] props;
     }
 
@@ -69,6 +87,7 @@ namespace UniView
         public string[] materials;
         public bool noMaterials;
         public LightInfo light;
+        public RectInfo rect;
         public Comp[] components;
         public int layer;
         public string tag;
@@ -203,6 +222,7 @@ namespace UniView
         public string kind;
         public string target;
         public Node[] nodes;
+        public PropList[] shared;  // prop lists components share (Comp.shared)
         public BatchRef[] batches;
         public Manager[] managers;   // kind "settings" only
         public string[] scenes;
@@ -350,9 +370,20 @@ namespace UniView
             return files;
         }
 
+        const long MaxDescriptionBytes = 300L * 1024 * 1024;  // bigger ones make JsonUtility abort the editor
+
         static Description Load(string file)
         {
-            try { return JsonUtility.FromJson<Description>(File.ReadAllText(file)); }
+            try
+            {
+                long size = new FileInfo(file).Length;
+                if (size > MaxDescriptionBytes)
+                {
+                    Debug.LogWarning("UniView: skipped " + file + " (" + (size >> 20) + " MB is too big for Unity to read)");
+                    return null;
+                }
+                return JsonUtility.FromJson<Description>(File.ReadAllText(file));
+            }
             catch (Exception e) { Debug.LogWarning("UniView: can't read " + file + ": " + e.Message); return null; }
         }
 
@@ -465,6 +496,22 @@ namespace UniView
             return a != null && a.Length >= 4 ? new Quaternion(a[0], a[1], a[2], a[3]) : Quaternion.identity;
         }
 
+        static Vector2 V2(float[] a, Vector2 fallback)
+        {
+            return a != null && a.Length >= 2 ? new Vector2(a[0], a[1]) : fallback;
+        }
+
+        static void SetRect(RectTransform rt, RectInfo r, float z)
+        {
+            // Anchors, pivot and size first: anchoredPosition is measured from them.
+            rt.anchorMin = V2(r.anchorMin, new Vector2(0.5f, 0.5f));
+            rt.anchorMax = V2(r.anchorMax, new Vector2(0.5f, 0.5f));
+            rt.pivot = V2(r.pivot, new Vector2(0.5f, 0.5f));
+            rt.sizeDelta = V2(r.sizeDelta, new Vector2(100f, 100f));
+            Vector2 p = V2(r.anchoredPosition, Vector2.zero);
+            rt.anchoredPosition3D = new Vector3(p.x, p.y, z);
+        }
+
         static GameObject[] BuildObjects(Description d, Dictionary<string, Renderer> parts, bool rootsCanBeInactive)
         {
             var objects = new GameObject[d.nodes.Length];
@@ -472,10 +519,13 @@ namespace UniView
             {
                 Node n = d.nodes[i];
                 var go = new GameObject(string.IsNullOrEmpty(n.name) ? "GameObject" : n.name);
+                bool ui = n.rect != null && n.rect.present;
+                if (ui) go.AddComponent<RectTransform>();  // replaces the Transform
                 if (n.parent >= 0 && n.parent < i) go.transform.SetParent(objects[n.parent].transform, false);
                 go.transform.localPosition = V(n.pos, Vector3.zero);
                 go.transform.localRotation = Q(n.rot);
                 go.transform.localScale = V(n.scale, Vector3.one);
+                if (ui) SetRect((RectTransform)go.transform, n.rect, V(n.pos, Vector3.zero).z);
                 if (n.layer > 0 && n.layer < 32) go.layer = n.layer;
                 if (!string.IsNullOrEmpty(n.tag) && n.tag != "Untagged")
                 {
@@ -917,9 +967,12 @@ namespace UniView
                 Comp[] comps = d.nodes[i].components;
                 for (int j = 0; j < comps.Length; j++)
                 {
-                    if (made[i][j] == null || comps[j].props == null) continue;
+                    Prop[] props = comps[j].props;
+                    if (comps[j].shared >= 0 && d.shared != null && comps[j].shared < d.shared.Length)
+                        props = d.shared[comps[j].shared].props;
+                    if (made[i][j] == null || props == null) continue;
                     var so = new SerializedObject(made[i][j]);
-                    foreach (Prop pr in comps[j].props) SetProp(so, pr, objects, byNode, parts);
+                    foreach (Prop pr in props) SetProp(so, pr, objects, byNode, parts);
                     so.ApplyModifiedPropertiesWithoutUndo();
                 }
             }

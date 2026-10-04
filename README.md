@@ -75,7 +75,8 @@ Each game is read by an **engine plugin**. UniView picks the plugin automaticall
 
 - **Textures per part**: models with several materials show each part with its own texture. Materials without a texture show their color (and export it in GLB/OBJ); the info panel shows each material's color swatch, and hovering a material lists its shader values.
 - **Fonts, videos, scripts & data** (Unity): fonts preview as a sample sheet and save as `.ttf`/`.otf`; VideoClips play in a built-in video player; named MonoBehaviours / ScriptableObjects (item stats, loot tables, dialogue, configs) show every field as readable text and save as JSON. Script fields are read from the game's own code (Mono, or IL2CPP's `GameAssembly.dll` + `global-metadata.dat`), each asset is labeled with its class, and references to other objects say what they point to (e.g. `icon → Texture2D 'ItemBattery'`). Games that use Addressables (`StreamingAssets/aa`) load too, and models find textures stored in other bundles.
-- **Scenes & prefabs** (Unity): open a level or a prefab to see every object in place, with static batching, hidden objects and lower-detail LODs handled.
+- **Scenes & prefabs** (Unity): open a level or a prefab to see every object in place, with static batching, hidden objects and lower-detail LODs handled. Sprites (2D games), particle effects (as still puffs) and line renderers show too, and the **Gizmos** switch draws colliders, light ranges, cameras and sound sources as wire shapes; mostly-2D scenes open straight on.
+- **UI prefabs** (Unity): HUDs, menus and crosshairs are drawn as a 2D picture the way the game lays them out (anchors, layout groups, sliced/filled images, masks, Shadow/Outline), with the game's own TextMeshPro fonts and their outline/drop-shadow. Click an object in the tree to outline it. Prefabs with nothing to draw (sounds, logic) show their objects, every component's values and the sprites/sounds/textures they use, with links.
 - **Terrains** (Unity): terrain heightmaps show as 3D ground (listed as `Terrain: name`, and inside their scenes), painted with the terrain layers blended by their splat maps. Holes are cut out.
 - **Sprite sheets & 2D animations** (Unity): a texture outlines every sprite cut from it (toggle **Sprite outlines**) and lists them; a sprite animation clip plays frame by frame with **Play sprite animation**.
 - **Maps**: Source `.bsp` maps show the whole level with textures, terrain (displacements) and all static props; the 3D skybox is left out.
@@ -91,6 +92,10 @@ Unreal notes:
 ## Features
 
 **Finding things**
+- **Search inside files** (Ctrl+Shift+F, any engine): find which assets contain a piece of text (an ID, a line of dialogue, a config key), with the text around each match; double-click to open it.
+- **Inspect any file** (Ctrl+R, any engine): see what an asset's bytes are - text in its own encoding (UTF-16, Shift-JIS, Windows-1252...), images or archives hidden inside, or readable strings plus a hex dump. Files without a preview open this way.
+- **Duplicate finder** (Asset → Find duplicate assets, any engine): groups identical assets (e.g. the same texture shipped in five bundles), shows how much space the copies take, and can hide the extra copies in the list.
+- **Game versions** (File → Game versions, any engine): save a snapshot of a game, and after it updates see what was added, removed or changed.
 - **Search with filters**: type a name, or add filters like `tris>1000`, `size>1mb`, `w>=512` or `type:mesh`. Combine them, e.g. `gun tris>2000 size<5mb`.
 - **Sortable columns**: click Name, Info (triangles or pixel size) or Size to sort. Every asset is measured in the background.
 - **Favorites**: press Ctrl+D (or right-click) to star the good stuff, then pick **★ Favorites** in the type box to see only those. Favorites are saved per game.

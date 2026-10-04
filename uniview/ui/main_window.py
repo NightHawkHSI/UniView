@@ -39,8 +39,8 @@ from PySide6.QtWidgets import (
 )
 
 import engines
-from engines.sdk import IMAGE_KINDS, KIND_LABELS, KINDS, MODEL_KINDS, THUMB_KINDS, VIEW_OPTIONS
-from uniview import __version__
+from engines.sdk import IMAGE_KINDS, KIND_LABELS, KINDS, MODEL_KINDS, VIEW_OPTIONS
+from uniview import __version__, prefab_info
 from uniview.constants import (
     APP_DIR,
     APP_SHORT,
@@ -71,6 +71,7 @@ from uniview.export import (
 from uniview.model_display import is_place, model_info_rows, texture_groups, texture_loader
 from uniview.projects import ProjectStore, detect_project_engine, engine_info_text, project_options
 from uniview.search import FILTER_HELP, AssetFilter, is_unreadable
+from uniview.textdecode import inspect_bytes
 from uniview.settings import BLENDER_IMPORT, Settings, find_blender
 from uniview.tools import missing_recommended
 from uniview.ui.asset_tree import AssetTree
@@ -78,9 +79,15 @@ from uniview.ui.console import ConsoleDock
 from uniview.ui.dialogs import ExportDialog, PluginsDialog, edit_project_notes, open_plugins_folder
 from uniview.ui.home import HomePage
 from uniview.ui.media import AnimationView, AudioView, ImageView, ImageWindow, VideoView
+from uniview.ui import canvas_render
 from uniview.ui.mesh_view import MeshView
+from uniview.ui.prefab_view import PrefabView
+from uniview.ui.duplicates_dialog import DuplicatesDialog
+from uniview.ui.search_dialog import ContentSearchDialog
+from uniview.ui.versions_dialog import VersionsDialog
+from uniview.ui.ui_prefab import has_thumbnail, ui_picture, uid_map
 from uniview.ui.tools_dialog import ToolsDialog
-from uniview.ui.unity_export import ask_project_folder, run_export
+from uniview.ui.unity_export import ask_project_folder, choose_editor_version, run_export
 from uniview.unity_project import installed_editors, target_version, unity_version
 from uniview.util import blank_icon, fmt_size, norm_path, open_path, pil_to_pixmap, safe_filename
 from uniview.workers import Loader, StatsWorker, ThumbnailWorker, meshdata_to_polydata
@@ -234,6 +241,13 @@ class MainWindow(QMainWindow):
         self.image_view.save_requested.connect(self.save_shown_image)
         self.image_view.goto_requested.connect(self.goto_asset)
         self.text_view = QPlainTextEdit(readOnly=True)
+        self._content_search = None  # Search inside files window (made on first use)
+        self._duplicates = None      # Duplicate assets window (made on first use)
+        self._versions = None        # Game versions window (made on first use)
+        self.hidden_copies = set()   # uids the duplicate finder hides from the list
+        self.prefab_view = PrefabView()
+        self.prefab_view.goto_requested.connect(self.goto_asset)
+        self.prefab_view.save_requested.connect(lambda: self.save_shown_image(self.prefab_view.picture))
         self.anim_view = AnimationView()
         self.anim_view.play_requested.connect(self.play_animation)
         self.anim_view.export_requested.connect(self.export_animated)
@@ -259,7 +273,7 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         for w in (self.placeholder_page, self.mesh_view, self.image_view, self.text_view, self.audio_view,
-                  self.anim_view, self.video_view):
+                  self.anim_view, self.video_view, self.prefab_view):
             self.stack.addWidget(w)
 
         self.viewer = QSplitter()
@@ -371,6 +385,10 @@ class MainWindow(QMainWindow):
         game_version = unity_version(project.get("engine_version"), session.engine_version)
         editors = installed_editors()
         version = target_version(game_version, editors)
+        if game_version and version != game_version:
+            version = choose_editor_version(self, game_version, version)
+            if not version:
+                return
         run_export(self, session, root, version, editors.get(version), game_version)
 
     def edit_current_notes(self):
@@ -408,6 +426,8 @@ class MainWindow(QMainWindow):
         add(m, "Export all textures...", lambda: self.export_all(IMAGE_KINDS))
         add(m, "Export everything shown in the list...", self.export_shown)
         m.addSeparator()
+        add(m, "Game versions (snapshots / compare)...", self.show_versions)
+        m.addSeparator()
         add(m, "Quit", self.close, "Ctrl+Q")
 
         a = self.menuBar().addMenu("&Asset")
@@ -415,8 +435,11 @@ class MainWindow(QMainWindow):
         add(a, "Toggle favorite", self.toggle_favorite_selected, "Ctrl+D")
         add(a, "Open model in Blender", self.open_in_blender, "Ctrl+B")
         add(a, "Show UV layout", self.show_uv_layout, "Ctrl+U")
+        add(a, "Show raw bytes", lambda: self.show_raw(), "Ctrl+R")
         a.addSeparator()
         add(a, "Find (search box)", self.focus_search, "Ctrl+F")
+        add(a, "Search inside files...", self.show_content_search, "Ctrl+Shift+F")
+        add(a, "Find duplicate assets...", self.show_duplicates)
         add(a, "Set Blender location...", self.choose_blender)
 
         view = self.menuBar().addMenu("&View")
@@ -568,6 +591,11 @@ class MainWindow(QMainWindow):
             if session.warnings:
                 QTimer.singleShot(0, lambda: QMessageBox.information(
                     self, "Loaded with notes", "\n\n".join(session.warnings)))
+        if self.session is not session:
+            self.hidden_copies = set()  # the duplicate finder's results belong to the previous game
+            if self._duplicates is not None:
+                with QSignalBlocker(self._duplicates.hide):
+                    self._duplicates.hide.setChecked(False)
         self.session = session
         self.thumb_cache = entry["thumbs"]
         self.stats = entry["stats"]
@@ -599,7 +627,7 @@ class MainWindow(QMainWindow):
                 child.setData(0, Qt.UserRole, asset)
                 child.setData(0, SORT_ROLE, asset.name.lower())
                 child.setData(2, SORT_ROLE, asset.size if asset.size is not None else -1)
-                child.setIcon(0, self.thumb_cache.get(asset.key, self.blank) if kind in THUMB_KINDS else
+                child.setIcon(0, self.thumb_cache.get(asset.key, self.blank) if has_thumbnail(asset) else
                               kind_icons.get(kind, file_icon))
                 if asset.uid in self.favorites:
                     self._mark_favorite(child, True)
@@ -702,6 +730,8 @@ class MainWindow(QMainWindow):
                             ok = False
                         if ok and want == "fav":
                             ok = asset.uid in self.favorites
+                        if ok and asset.uid in self.hidden_copies:
+                            ok = False
                         child.setHidden(not ok)
                         shown += ok
                 count = top.childCount()
@@ -754,7 +784,7 @@ class MainWindow(QMainWindow):
             for _item, asset in rows[:GRID_LIMIT]:
                 key = asset.key
                 fav = asset.uid in self.favorites
-                icon = self.thumb_cache.get(key, self.blank_big) if asset.kind in THUMB_KINDS else file_icon
+                icon = self.thumb_cache.get(key, self.blank_big) if has_thumbnail(asset) else file_icon
                 it = QListWidgetItem(icon, ("\u2605 " if fav else "") + os.path.basename(asset.name))
                 it.setData(Qt.UserRole, asset)
                 stats = self.stats.get(key) or {}
@@ -796,7 +826,7 @@ class MainWindow(QMainWindow):
                 last = first + 150
             for row in range(first, min(self.grid.count(), last + 40)):
                 asset = self.grid.item(row).data(Qt.UserRole)
-                if asset and asset.kind in THUMB_KINDS and asset.key not in self.thumb_cache:
+                if asset and has_thumbnail(asset) and asset.key not in self.thumb_cache:
                     jobs.append((asset.key, self.session, asset))
         else:
             height = self.tree.viewport().height()
@@ -806,7 +836,7 @@ class MainWindow(QMainWindow):
                 if self.tree.visualItemRect(item).top() > height:
                     extra += 1
                 asset = item.data(0, Qt.UserRole)
-                if asset and asset.kind in THUMB_KINDS and asset.key not in self.thumb_cache:
+                if asset and has_thumbnail(asset) and asset.key not in self.thumb_cache:
                     jobs.append((asset.key, self.session, asset))
                 item = self.tree.itemBelow(item)
         self.thumbs.request_visible(jobs)
@@ -837,7 +867,7 @@ class MainWindow(QMainWindow):
         for asset in assets:
             if asset.key in self.thumb_cache:
                 setter(asset.key, self.thumb_cache[asset.key])
-            elif asset.kind in THUMB_KINDS:
+            elif has_thumbnail(asset):
                 missing.append((asset.key, self.session, asset))
         self.thumbs.request_priority(missing)
 
@@ -864,8 +894,15 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             with session.lock:
-                if asset.kind in MODEL_KINDS:
-                    self.show_mesh(asset)
+                if asset.kind == "scene" and hasattr(session, "is_ui") and session.is_ui(asset) and                         self.show_structure(asset, ui=True):
+                    pass  # a UI prefab: drawn as a 2D picture
+                elif asset.kind in MODEL_KINDS:
+                    try:
+                        self.show_mesh(asset)
+                    except ValueError as e:
+                        # Nothing to draw (a sound or logic-only prefab): show what it's made of instead.
+                        if asset.kind != "scene" or not self.show_structure(asset, str(e)):
+                            raise
                 elif asset.kind in IMAGE_KINDS:
                     self.show_texture(asset, session.image(asset))
                 elif asset.kind == "audio":
@@ -907,17 +944,9 @@ class MainWindow(QMainWindow):
                     self.anim_view.show_clip(text, targets, flipbook=len(frames))
                     self.stack.setCurrentWidget(self.anim_view)
                 elif asset.kind == "text":
-                    text = session.text(asset)
-                    if isinstance(text, bytes):
-                        text = text.decode("utf-8", "replace")
-                    self.text_view.setPlainText(text[:MAX_TEXT_CHARS])
-                    self.stack.setCurrentWidget(self.text_view)
+                    self.show_text_file(asset)
                 else:
-                    rows = [f"{label}: {value}" for label, value in session.describe(asset)]
-                    self.text_view.setPlainText(
-                        f"{asset.name}\n\n" + "\n".join(rows) + f"\nSize: {fmt_size(asset.size)}\n\n"
-                        "No preview for this kind of file. Right-click \u2192 Save... exports it as-is.")
-                    self.stack.setCurrentWidget(self.text_view)
+                    self.show_raw(asset)  # no dedicated preview: show what the bytes are
         except (ValueError, NotImplementedError) as e:
             # Expected cases (nothing visible, unsupported format...): a plain message is enough.
             log.info("No preview for %s '%s': %s", asset.kind, asset.name, e)
@@ -1041,8 +1070,10 @@ class MainWindow(QMainWindow):
         tex = image_of(display_texture(md, materials))
         parts = [(tris, image_of(tex_asset), color) for tex_asset, color, tris in groups]
         self.stack.setCurrentWidget(self.mesh_view)
-        self.mesh_view.show_mesh(poly, tex, parts)
-        self.mesh_view.set_fly(is_place(asset))
+        flat = bool(getattr(md, "view_2d", False))
+        self.mesh_view.show_mesh(poly, tex, parts, flat=flat, gizmos=getattr(md, "gizmos", None),
+                                 gizmos_only=bool(getattr(md, "gizmos_only", False)))
+        self.mesh_view.set_fly(is_place(asset) and not flat)
         n_tex = sum(len(m.textures) for m in materials)
         log.info("Model '%s': %s verts, %s tris, %d material(s), %d texture(s)%s", asset.name,
                  f"{poly.n_points:,}", f"{poly.n_cells:,}", len(materials), n_tex,
@@ -1067,6 +1098,145 @@ class MainWindow(QMainWindow):
             self.show_asset(data)
 
         QTimer.singleShot(250, check)
+
+    def show_text_file(self, asset):
+        """A text asset: decoded in its own encoding, or - when it's really binary - shown as an image, unpacked,
+        or described with its readable strings and a hex dump."""
+        session = self.session
+        try:
+            data = session.raw(asset)
+        except Exception:
+            data = None
+        if not isinstance(data, (bytes, bytearray)):
+            text = session.text(asset)
+            data = text if isinstance(text, bytes) else None
+            if data is None:
+                self.text_view.setPlainText(text[:MAX_TEXT_CHARS])
+                self.stack.setCurrentWidget(self.text_view)
+                return
+        self._show_bytes(asset, bytes(data))
+
+    def _show_bytes(self, asset, data, header=""):
+        """Bytes through the inspector: text in its encoding, an image, or format + strings + hex dump."""
+        found = inspect_bytes(data)
+        if found["image"] is not None:
+            self.image_view.show_image(found["image"], asset.name)
+            self.image_view.set_links("", [], f"{found['format']} inside {asset.name}")
+            self.stack.setCurrentWidget(self.image_view)
+            return
+        self.text_view.setPlainText((header + found["text"])[:MAX_TEXT_CHARS])
+        self.stack.setCurrentWidget(self.text_view)
+        what = found["format"] or "text"
+        if found["encoding"] and found["encoding"] != "utf-8":
+            what += f" ({found['encoding']})"
+        self.statusBar().showMessage(f"{asset.name}: {what}, {len(data):,} bytes")
+
+    def show_content_search(self):
+        if self._content_search is None:
+            self._content_search = ContentSearchDialog(lambda: self.session, self)
+            self._content_search.goto_requested.connect(self._goto_from_search)
+        self._content_search.show()
+        self._content_search.raise_()
+        self._content_search.activateWindow()
+        self._content_search.query.setFocus()
+
+    def show_duplicates(self):
+        if self._duplicates is None:
+            self._duplicates = DuplicatesDialog(lambda: self.session, self)
+            self._duplicates.goto_requested.connect(self._goto_from_search)
+            self._duplicates.hide_changed.connect(self._set_hidden_copies)
+        self._duplicates.show()
+        self._duplicates.raise_()
+        self._duplicates.activateWindow()
+
+    def show_versions(self):
+        if self._versions is None:
+            self._versions = VersionsDialog(self._open_game, self)
+            self._versions.goto_requested.connect(self._goto_from_search)
+        self._versions.show()
+        self._versions.raise_()
+        self._versions.activateWindow()
+        self._versions.refresh()
+
+    def _open_game(self):
+        """(session, game name, game folder) of the game being viewed, or None."""
+        if self.session is None:
+            return None
+        project = self.current_project()
+        folder = self.loading_path or self.session.path
+        return self.session, (project or {}).get("name") or os.path.basename(folder.rstrip("\\/")), folder
+
+    def _set_hidden_copies(self, uids):
+        self.hidden_copies = set(uids)
+        self.apply_filter()
+
+    def _goto_from_search(self, key):
+        self.pages.setCurrentWidget(self.viewer)
+        self.goto_asset(key)
+
+    def show_raw(self, asset=None):
+        """Any asset, any engine: what its stored bytes are (Asset > Show raw bytes, and assets without a preview)."""
+        asset = asset or self.current
+        session = self.session
+        if asset is None or session is None:
+            return
+        self.current = asset
+        rows = []
+        try:
+            rows = [f"{label}: {value}" for label, value in session.describe(asset)]
+        except Exception:
+            pass
+        header = f"{asset.name}\n" + "".join(f"{r}\n" for r in rows) + f"Kind: {asset.kind}\n\n"
+        try:
+            with session.lock:
+                data = session.raw(asset)
+        except Exception as e:
+            self.text_view.setPlainText(header + f"No raw bytes for this asset: {e}")
+            self.stack.setCurrentWidget(self.text_view)
+            return
+        self._show_bytes(asset, bytes(data), header)
+
+    def show_structure(self, asset, reason="", ui=False):
+        """Prefab/scene structure view (GameObjects, components, assets used; ui: also a 2D picture of a UI
+        prefab). False if the engine can't."""
+        session = self.session
+        if not hasattr(session, "hierarchy"):
+            return False
+        try:
+            nodes = session.hierarchy(asset)
+        except Exception:
+            log.exception("Reading the objects of '%s' failed", asset.name)
+            return False
+        if not nodes:
+            return False
+        by_uid = uid_map(session)
+
+        def material_textures(uid):
+            try:
+                details = session.material_details(uid)
+            except Exception:
+                return []
+            return [tex for _prop, tex, _scale, _offset in (details or {}).get("textures", []) if tex is not None]
+
+        used = prefab_info.used_assets(nodes, by_uid,
+                                       material_textures if hasattr(session, "material_details") else None)
+        picture = None
+        if ui:
+            picture = ui_picture(session, nodes, by_uid)
+            if picture is not None:
+                picture = (canvas_render.to_pil(picture[0]),) + picture[1:]
+        if ui and picture is None:
+            return False  # nothing drawn: let the 3D view (or its fallback) have it
+        if ui:
+            header = ("UI prefab drawn in 2D with the game's sprites and fonts - close to the game, but without "
+                      "scripts or effects (shadows, outlines, blur). ")
+        else:
+            header = f"{reason} Showing what it's made of: "
+        log.info("Structure view for '%s': %d object(s)%s", asset.name, len(nodes), ", UI picture" if ui else "")
+        self.prefab_view.show_prefab(asset.name, header, nodes, by_uid, used, self.blank_big, picture)
+        self._request_icons(used, self.prefab_view.set_link_icon)
+        self.stack.setCurrentWidget(self.prefab_view)
+        return True
 
     def show_texture(self, asset, img):
         name = asset.name
@@ -1180,6 +1350,7 @@ class MainWindow(QMainWindow):
         fav = all(d.uid in self.favorites for d in selected)
         menu.addAction(("Remove from favorites" if fav else "Add to favorites") + "   Ctrl+D",
                        lambda: self.toggle_favorites(selected))
+        menu.addAction("Show raw bytes   Ctrl+R", lambda: self.show_raw(data))
         menu.addSeparator()
         menu.addAction("Save...", lambda: self.export_item(data))
         if len(selected) > 1:
@@ -1253,8 +1424,8 @@ class MainWindow(QMainWindow):
         if self.current and self.current.kind in MODEL_KINDS:
             self.export_item(self.current)
 
-    def save_shown_image(self):
-        img = self.image_view.image
+    def save_shown_image(self, view=None):
+        img = (view or self.image_view).image
         if img is None:
             return
         name = os.path.basename(self.current.name) if self.current else "texture"

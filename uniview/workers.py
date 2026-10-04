@@ -64,10 +64,11 @@ def meshdata_to_polydata(md):
         poly.point_data["vertex_colors"] = (np.clip(md.colors, 0, 1) * 255).astype(np.uint8)
     return poly
 
-def render_mesh_thumbnail(points, tris, size, max_tris=20000):
-    """Cheap software render of a mesh: flat-shaded, seen from front-right and above."""
+def render_mesh_thumbnail(points, tris, size, max_tris=20000, flat=False):
+    """Cheap software render of a mesh: flat-shaded, seen from front-right and above (flat: 2D content seen
+    straight on from -Z, like the 2D camera of the game)."""
     pts = points - (points.min(0) + points.max(0)) / 2
-    yaw, pitch = np.radians(35), np.radians(-25)
+    yaw, pitch = (np.radians(180), 0.0) if flat else (np.radians(35), np.radians(-25))
     ry = np.array([[np.cos(yaw), 0, np.sin(yaw)], [0, 1, 0], [-np.sin(yaw), 0, np.cos(yaw)]])
     rx = np.array([[1, 0, 0], [0, np.cos(pitch), -np.sin(pitch)], [0, np.sin(pitch), np.cos(pitch)]])
     pts = pts @ (rx @ ry).T
@@ -95,11 +96,19 @@ def render_mesh_thumbnail(points, tris, size, max_tris=20000):
     return img.resize((size, size), Image.LANCZOS)
 
 def make_thumbnail(session, asset, size):
-    with session.lock:
-        if asset.kind == "model":
-            md = session.mesh(asset)
-        else:
-            img = session.image(asset)
+    if asset.kind == "scene":  # a prefab: UI ones as their 2D picture, the rest as their 3D model
+        from uniview.ui.ui_prefab import ui_thumbnail
+        img = ui_thumbnail(session, asset, size)
+        if img is None:
+            with session.lock:
+                md = session.mesh(asset)
+            return render_mesh_thumbnail(md.points, md.triangles, size, flat=md.view_2d)
+    else:
+        with session.lock:
+            if asset.kind == "model":
+                md = session.mesh(asset)
+            else:
+                img = session.image(asset)
     if asset.kind == "model":
         return render_mesh_thumbnail(md.points, md.triangles, size)
     img = img.convert("RGBA")

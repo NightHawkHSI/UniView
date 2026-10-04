@@ -220,11 +220,41 @@ def mesh_to_meshdata(mesh):
                     name=mesh.m_Name or "", skipped=skipped)
 
 
+# TextureFormat -> (channels, numpy dtype) of the float formats: RHalf, RGHalf, RGBAHalf, RFloat, RGFloat, RGBAFloat.
+FLOAT_FORMATS = {15: (1, "<f2"), 16: (2, "<f2"), 17: (4, "<f2"), 18: (1, "<f4"), 19: (2, "<f4"), 20: (4, "<f4")}
+
+
+def float_pixels(tex):
+    """(rows top-down, H x W x channels float32) of a half/float Texture2D, else None. These often hold data,
+    not colours (vertex animation, lookup tables) with values outside 0..1."""
+    fmt = FLOAT_FORMATS.get(int(getattr(tex, "m_TextureFormat", -1) or -1))
+    if fmt is None:
+        return None
+    channels, dtype = fmt
+    w, h = tex.m_Width, tex.m_Height
+    data = tex.get_image_data() if hasattr(tex, "get_image_data") else tex.image_data
+    count = w * h * channels
+    arr = np.frombuffer(bytes(data), dtype=dtype, count=count).astype(np.float32)
+    return arr.reshape(h, w, channels)[::-1]  # Unity stores the bottom row first
+
+
+def float_preview(pixels):
+    """8-bit RGBA PIL image of float pixels (clamped to 0..1; missing channels 0, alpha 1)."""
+    from PIL import Image
+    h, w, c = pixels.shape
+    rgba = np.zeros((h, w, 4), dtype=np.float32)
+    rgba[..., 3] = 1.0
+    rgba[..., :c] = pixels
+    rgba = np.nan_to_num(rgba, nan=0.0, posinf=1.0, neginf=0.0)
+    return Image.fromarray((np.clip(rgba, 0.0, 1.0) * 255 + 0.5).astype(np.uint8))  # H x W x 4 -> RGBA
+
+
 def asset_image(asset):
     """PIL image of a Texture2D/Sprite, with a clear error for textures that have no pixels.
 
     Some textures (e.g. "Font Texture") are generated while the game runs, so the files only
     hold an empty 0x0 placeholder; UnityPy would otherwise fail with a confusing file error.
+    Half/float textures are decoded here: UnityPy's converter fails on values outside 0..1.
     """
     width = getattr(asset, "m_Width", None)
     stream = getattr(asset, "m_StreamData", None)
@@ -232,6 +262,10 @@ def asset_image(asset):
             not getattr(asset, "image_data", None) and (stream is None or not stream.path))):
         raise ValueError("Empty texture - it's created while the game runs (e.g. a font), "
                          "so there are no pixels saved in the game files.")
+    if width is not None:
+        pixels = float_pixels(asset)
+        if pixels is not None:
+            return float_preview(pixels)
     return asset.image
 
 
@@ -974,6 +1008,7 @@ class UnitySession(GameSession):
         self._humanoid = {}      # (clip key, rig) -> clip converted to bone curves
         self._material_readers = {}  # "material:<file>:<id>" -> ObjectReader (filled by hierarchy())
         self._tags = None            # custom tag names (TagManager)
+        self._tmp_fonts = {}         # obj key -> tmp_font() result (TextMeshPro font assets)
         self._controller_readers = {}  # "controller:<file>:<id>" -> ObjectReader (filled by controllers())
 
     def _asset_for(self, obj, type_name="Texture2D", name=None):
@@ -1051,6 +1086,22 @@ class UnitySession(GameSession):
             return font_preview(self.raw(asset), asset.name)
         return asset_image(asset.ref.read())
 
+    def float_texture(self, asset):
+        """(pixels H x W x C float32, settings dict) of a half/float Texture2D, else None. Settings: the
+        game's filter_mode, wrap_mode, mipmaps and whether it was 32-bit float."""
+        if asset.kind != "texture" or self._is_terrain(asset):
+            return None
+        tex = asset.ref.read()
+        if int(getattr(tex, "m_TextureFormat", -1) or -1) not in FLOAT_FORMATS or not tex.m_Width:
+            return None
+        ts = getattr(tex, "m_TextureSettings", None)
+        return float_pixels(tex), {
+            "filter_mode": int(getattr(ts, "m_FilterMode", 1)),
+            "wrap_mode": int(getattr(ts, "m_WrapU", getattr(ts, "m_WrapMode", 0)) or 0),
+            "mipmaps": int(getattr(tex, "m_MipCount", 1) or 1) > 1,
+            "float32": FLOAT_FORMATS[int(tex.m_TextureFormat)][1] == "<f4",
+        }
+
     def mesh(self, asset):
         if self._is_terrain(asset):
             md = self.terrain(asset.ref["obj"])[0]
@@ -1089,12 +1140,97 @@ class UnitySession(GameSession):
             transform = father.deref()
         return [transform]
 
+    def is_ui(self, asset):
+        """True for a prefab whose root is a UI object (RectTransform): drawn as a 2D picture, not in 3D."""
+        if asset.kind != "scene" or asset.ref["type"] == "scene":
+            return False
+        try:
+            with self.lock:
+                return all(r.type.name == "RectTransform" for r in self._scene_roots(asset))
+        except Exception:
+            return False
+
+    def sprite_info(self, asset):
+        """{"border": [left, bottom, right, top] in pixels, "ppu": pixels per unit, "size": [w, h] of the sprite's
+        rect, "trim": [x, y from the bottom, w, h] - the part of that rect image() returns (trimmed of empty
+        space)} of a sprite, or None."""
+        if asset.kind != "sprite":
+            return None
+        with self.lock:
+            tree = asset.ref.read_typetree()
+        border = tree.get("m_Border") or {}
+        rect = tree.get("m_Rect") or {}
+        size = [float(rect.get("width", 0)), float(rect.get("height", 0))]
+        rd = tree.get("m_RD") or {}
+        tex_rect, offset = rd.get("textureRect") or {}, rd.get("textureRectOffset") or {}
+        trim = [float(offset.get("x", 0)), float(offset.get("y", 0)),
+                float(tex_rect.get("width", size[0])), float(tex_rect.get("height", size[1]))]
+        return {"border": [float(border.get(k, 0)) for k in ("x", "y", "z", "w")],
+                "ppu": float(tree.get("m_PixelsToUnits", 100.0) or 100.0), "size": size, "trim": trim}
+
+    def tmp_font(self, asset):
+        """A TextMeshPro font asset ready to draw text with: unity_tmp.parse_font() plus "images" (PIL "L" image
+        of each atlas: the distance field or coverage), "fallback_fonts" (the same for its fallbacks, in order)
+        and "font_file" (Asset of the TTF it was made from, when the game ships it). None if it isn't one."""
+        reader = getattr(asset, "ref", None)
+        if getattr(getattr(reader, "type", None), "name", "") != "MonoBehaviour":
+            return None
+        with self.lock:
+            return self._tmp_font(reader, set())
+
+    def _tmp_font(self, reader, seen):
+        from .unity_tmp import parse_font
+        key = obj_key(reader.assets_file, reader.path_id)
+        if key in self._tmp_fonts:
+            return self._tmp_fonts[key]
+        if key in seen or len(seen) > 8:
+            return None
+        seen.add(key)
+
+        def deref(ptr):
+            if not isinstance(ptr, dict) or not ptr.get("m_PathID"):
+                return None
+            target = self.finder._file(reader.assets_file, ptr.get("m_FileID", 0))
+            return target.objects.get(ptr["m_PathID"]) if target is not None else None
+
+        try:
+            if script_class(reader) not in ("TMPro.TMP_FontAsset", "TMPro.TextMeshProFont"):
+                return None
+            font = parse_font(self._scripts().read(reader)[0])
+        except Exception as e:
+            log.debug("TMP font %s: %s", reader.peek_name(), e)
+            self._tmp_fonts[key] = None
+            return None
+        font["images"] = []
+        for ptr in font.pop("atlases"):
+            obj = deref(ptr)
+            try:
+                img = asset_image(obj.read()) if obj is not None else None
+            except Exception as e:
+                log.debug("TMP atlas of %s: %s", font["name"], e)
+                img = None
+            if img is not None:
+                img = img.getchannel("A") if "A" in img.getbands() else img.convert("L")
+            font["images"].append(img)
+        font["fallback_fonts"] = []
+        for ptr in font.pop("fallbacks"):
+            obj = deref(ptr)
+            fallback = self._tmp_font(obj, seen) if obj is not None and obj.type.name == "MonoBehaviour" else None
+            if fallback is not None:
+                font["fallback_fonts"].append(fallback)
+        source = deref(font.pop("source_font"))
+        font["font_file"] = self._asset_for(source, "Font") if source is not None and source.type.name == "Font" else None
+        self._tmp_fonts[key] = font
+        return font
+
     def hierarchy(self, asset):
         """GameObject tree of a scene/prefab asset as a flat list (parents before children):
         [{"name", "parent" (index or -1), "active", "pos" (x,y,z), "rot" (x,y,z,w), "scale",
           "mesh" (uid of the Mesh asset or None), "skinned" (bool), "renderer_enabled",
           "batch" (static batching: {"mesh": combined mesh uid, "first", "count", "materials": [Material]}),
           "light" ({"type", "color", "intensity", "range", "spot_angle"}), "terrain" (uid of the terrain model),
+          "rect" (UI objects' RectTransform: {"anchor_min", "anchor_max", "pos" (anchored), "size" (size delta),
+          "pivot"} as [x, y]),
           "components" ([{"type": Unity class, "props": unity_components.flatten() entries}] for the other
           built-in components: colliders, rigidbodies, audio sources, cameras, LOD groups..., and
           {"type": "MonoBehaviour", "script": "Namespace.Class", "props"} for script components)}],
@@ -1162,6 +1298,13 @@ class UnitySession(GameSession):
                     "tag": self.tag_name(int(getattr(go, "m_Tag", 0) or 0)),
                     "pos": [p.x, p.y, p.z], "rot": [r.x, r.y, r.z, r.w], "scale": [s.x, s.y, s.z],
                     "mesh": None, "skinned": False, "renderer_enabled": True}
+            if transform_reader.type.name == "RectTransform":
+                try:
+                    node["rect"] = {key: [float(v.x), float(v.y)] for key, v in (
+                        ("anchor_min", t.m_AnchorMin), ("anchor_max", t.m_AnchorMax), ("pos", t.m_AnchoredPosition),
+                        ("size", t.m_SizeDelta), ("pivot", t.m_Pivot))}
+                except Exception:
+                    pass
             comps = _components(go)
             mesh_ptr = None
             batch = None
@@ -1420,8 +1563,66 @@ class UnitySession(GameSession):
         if asset.kind == "animation":
             import json
             return json.dumps(self._clip(asset), indent=1).encode("utf-8")
-        script = asset.ref.read().m_Script
-        return script.encode("utf-8", "surrogateescape") if isinstance(script, str) else bytes(script)
+        if asset.kind == "text":
+            script = asset.ref.read().m_Script
+            return script.encode("utf-8", "surrogateescape") if isinstance(script, str) else bytes(script)
+        if hasattr(asset.ref, "get_raw_data"):
+            # Anything else: the object as the game stores it (big pixel/sound data may sit in a .resS file).
+            with self.lock:
+                return bytes(asset.ref.get_raw_data())
+        raise ValueError("This asset is built from several objects, so there are no single raw bytes to show.")
+
+    def content_hash(self, asset):
+        """Hash of the object's fields without its name, with streamed pixel / sound / vertex data hashed in
+        place of where it sits in the .resS file - so copies of one asset in different bundles match."""
+        import hashlib
+        reader = asset.ref
+        if not hasattr(reader, "read_typetree"):
+            return None
+        from UnityPy.helpers.ResourceReader import get_resource_data
+        h = hashlib.blake2b(digest_size=16)
+        h.update(reader.type.name.encode())
+        with self.lock:
+            try:
+                tree = reader.read_typetree()
+            except Exception:  # e.g. script data without a stored field layout: the stored bytes will do
+                h.update(bytes(reader.get_raw_data()))
+                return h.digest()
+
+            def external(source, offset, size):
+                if not size or not source:
+                    return False
+                try:
+                    h.update(get_resource_data(source, reader.assets_file, offset, size))
+                    return True
+                except Exception:
+                    return False
+
+            def feed(value):
+                if isinstance(value, dict):
+                    if {"offset", "size", "path"} <= set(value) and external(value["path"], value["offset"], value["size"]):
+                        return  # m_StreamData: the data, not where it is
+                    if {"m_Source", "m_Offset", "m_Size"} <= set(value) and external(
+                            value["m_Source"], value["m_Offset"], value["m_Size"]):
+                        return  # m_Resource / m_ExternalResources (sound, video)
+                    for key, item in value.items():
+                        if key in ("m_Name", "m_CorrespondingSourceObject", "m_PrefabInstance", "m_PrefabAsset"):
+                            continue
+                        h.update(key.encode())
+                        feed(item)
+                elif isinstance(value, (list, tuple)):
+                    h.update(b"[%d" % len(value))
+                    for item in value:
+                        feed(item)
+                elif isinstance(value, (bytes, bytearray, memoryview)):
+                    h.update(bytes(value))
+                elif isinstance(value, str):
+                    h.update(value.encode("utf-8", "surrogateescape"))
+                else:
+                    h.update(repr(value).encode())
+
+            feed(tree)
+        return h.digest()
 
     def text(self, asset):
         if asset.kind == "data":

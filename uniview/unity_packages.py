@@ -25,6 +25,28 @@ ASSEMBLY_PACKAGES = [
     (r"Unity\.Netcode\.Runtime", ["com.unity.netcode.gameobjects"]),
     (r"Unity\.Recorder", ["com.unity.recorder"]),
     (r"Unity\.VisualEffectGraph\.Runtime", ["com.unity.visualeffectgraph"]),
+    (r"Unity\.RenderPipelines\.Core\.Runtime", ["com.unity.render-pipelines.core"]),
+    (r"Unity\.RenderPipelines\.Universal\.Runtime", ["com.unity.render-pipelines.universal"]),
+    (r"Unity\.RenderPipelines\.HighDefinition\.Runtime", ["com.unity.render-pipelines.high-definition"]),
+    (r"Unity\.(Entities(?!\.Graphics)|Scenes|Transforms)", ["com.unity.entities"]),
+    (r"Unity\.Entities\.Graphics", ["com.unity.entities.graphics"]),
+    (r"Unity\.(Rendering\.Hybrid|Deformations)", ["com.unity.rendering.hybrid"]),
+    (r"Unity\.Physics", ["com.unity.physics"]),
+    (r"Unity\.Localization", ["com.unity.localization"]),
+    (r"Unity\.MemoryProfiler", ["com.unity.memoryprofiler"]),
+]
+# Assemblies of packages the ones above depend on: never asked for directly, but not copied as DLLs
+# when the dependency is in the project.
+DEPENDENCY_ASSEMBLIES = [
+    (r"Unity\.RenderPipelines?\.(Universal|Core|ShaderGraph)\.\w*(Library|Shaders)",
+     ["com.unity.render-pipelines.universal", "com.unity.render-pipelines.core", "com.unity.shadergraph"]),
+    (r"Unity\.InternalAPIEngineBridge\.\d+", ["com.unity.rendering.hybrid", "com.unity.entities.graphics"]),
+    (r"Unity\.Jobs", ["com.unity.jobs"]),
+    (r"Unity\.Properties", ["com.unity.properties"]),
+    (r"Unity\.Serialization", ["com.unity.serialization"]),
+    (r"Unity\.Platforms", ["com.unity.platforms"]),
+    (r"Unity\.Profiling\.Core", ["com.unity.profiling.core"]),
+    (r"Unity\.ScriptableBuildPipeline", ["com.unity.scriptablebuildpipeline"]),
 ]
 
 
@@ -32,7 +54,7 @@ def provided_by(assembly, installed):
     """Is this assembly (name without .dll) part of one of the installed packages?"""
     # A package's other assemblies share its name: Unity.Burst.Unsafe, Unity.Collections.LowLevel.ILSupport...
     return any(re.fullmatch(rf"(?:{pattern})(?:\..+)?", assembly) and any(c in installed for c in candidates)
-               for pattern, candidates in ASSEMBLY_PACKAGES)
+               for pattern, candidates in ASSEMBLY_PACKAGES + DEPENDENCY_ASSEMBLIES)
 
 
 def recommended_versions(editor_exe):
@@ -52,8 +74,10 @@ def recommended_versions(editor_exe):
     return out
 
 
-def packages_for(assembly_names, recommended):
-    """{package: version} for the assemblies a game ships (names with or without .dll)."""
+def packages_for(assembly_names, recommended, others=False):
+    """{package: version} for the assemblies a game ships (names with or without .dll). Versions are the
+    editor's recommended ones; others: also packages the editor doesn't list, with version None (the
+    newest one the registry has for the editor)."""
     out = {}
     names = {os.path.splitext(n)[0] if n.lower().endswith(".dll") else n for n in assembly_names}
     for pattern, candidates in ASSEMBLY_PACKAGES:
@@ -61,7 +85,18 @@ def packages_for(assembly_names, recommended):
             package = next((c for c in candidates if c in recommended), None)
             if package:
                 out[package] = recommended[package]
+            elif others:
+                out[candidates[0]] = None
     return out
+
+
+def builtin_packages(editor_exe):
+    """Names of the packages built into the editor (modules, ugui in 2021, the render pipelines...)."""
+    path = os.path.join(os.path.dirname(editor_exe or ""), "Data", "Resources", "PackageManager", "BuiltInPackages")
+    try:
+        return {n for n in os.listdir(path) if os.path.isdir(os.path.join(path, n))}
+    except OSError:
+        return set()
 
 
 def game_assemblies(game_dir):
