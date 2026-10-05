@@ -21,9 +21,11 @@
 
 Unzip it and run `UniView.exe`. You don't need Python.
 
-[Download](#download) · [Screenshots](#screenshots) · [Engines](#supported-engines) · [Features](#features) · [How to use](#how-to-use) · [Plugins](#engine-plugins) · [Compatibility](#game-compatibility-list) · [Build](#build) · [FAQ](#faq)
+[Download](#download) · [Screenshots](#screenshots) · [Engines](#supported-engines) · [Features](#features) · [Modding](#modding-unity-games) · [How to use](#how-to-use) · [Plugins](#engine-plugins) · [Compatibility](#game-compatibility-list) · [Build](#build) · [FAQ](#faq)
 
-<img src="ScreenShots/UAV%20Main.png" alt="UniView projects page" width="850">
+<img src="ScreenShots/unity-model-materials.png" alt="A Valheim dragon in UniView's 3D viewer with its material's color, normal, emission and metallic maps listed" width="900">
+
+<sub>Valheim's dragon with its full material: color, normal, emission and metallic maps, all exported with the model.</sub>
 
 </div>
 
@@ -35,8 +37,9 @@ Unzip it and run `UniView.exe`. You don't need Python.
 |---|---|
 | **What it opens** | Unity, Source, Source 2, Unreal and Fallout 1/2 game folders; loose files and zip archives of any game; any engine that has a [plugin](#engine-plugins) |
 | **What it shows** | Models and maps (3D), textures, sprites, sounds (built-in player), animations (played on their models), text files; everything else can be exported as-is |
-| **What it exports** | Models as `.obj` + `.mtl` + `.png` or a single `.glb` (both open textured in Blender), textures as `.png`, sounds as `.wav`/`.mp3`/`.ogg`, animations as JSON keyframes or a rigged, animated `.glb`, text as-is |
-| **Game files** | Read only. UniView never changes anything |
+| **What it exports** | Models as `.obj` + `.mtl` + `.png` or a single `.glb` with their full PBR materials (color, normal, metallic, roughness, AO, emission, height), textures as `.png`, sounds as `.wav`/`.mp3`/`.ogg`, animations as JSON keyframes or a rigged, animated `.glb`, text as-is, or a whole Unity game as a **Unity project** |
+| **Modding** | Swap textures, sprites, text, data, fonts, sounds and models in Unity games with the [Mod Maker](#modding-unity-games) |
+| **Game files** | Only read. The one exception is **Mod Maker → Install into game**, which backs up the originals first and can restore them |
 | **Tested with** | Robocraft, Muck, Valheim (Unity) · Team Fortress 2, Portal (Source) · CS2, Deadlock (Source 2) · Satisfactory, Headliners, Dead as Disco (Unreal) · Fallout 1 & 2 · Project Zomboid, Serious Sam 2 (loose files) |
 | **Built with** | [UnityPy](https://github.com/K0lb3/UnityPy) · [PySide6](https://doc.qt.io/qtforpython-6/) · [PyVista](https://pyvista.org/) |
 
@@ -50,13 +53,24 @@ Unzip it and run `UniView.exe`. You don't need Python.
 
 ## Screenshots
 
-**Projects page**: one box per game. Green means loaded, red means not loaded, and each box shows its file count. The console at the bottom shows what the app is doing.
+**Your game library**: one card per game, with its engine, version, file count and how well it works. Search, tag, group and sort them.
 
-<img src="ScreenShots/UAV%20Main.png" alt="Projects page" width="850">
+<img src="ScreenShots/projects.png" alt="Projects page with a card per game" width="900">
 
-**Game view**: the asset list with thumbnails on the left, the 3D model in the middle, and model info plus materials/textures on the right.
-
-<img src="ScreenShots/UAV%20Game.png" alt="Game view with 3D model and info panel" width="850">
+<table>
+<tr>
+<td width="50%"><img src="ScreenShots/source-model.png" alt="TF2 Heavy in the 3D viewer"><br><b>Source</b>: TF2's Heavy with his <code>.vmt</code> materials (base texture, normal map, light warp).</td>
+<td width="50%"><img src="ScreenShots/unreal-model.png" alt="Headliners Tormentor in the 3D viewer"><br><b>Unreal</b>: a skeletal mesh from Headliners (IoStore + Oodle), textures found through its material instance.</td>
+</tr>
+<tr>
+<td><img src="ScreenShots/animation.png" alt="Animation clip playing on a Valheim character"><br><b>Animations</b>: Valheim's "Axe combo 3" playing on the player model. Save it as a rigged, animated GLB.</td>
+<td><img src="ScreenShots/unity-ui-prefab.png" alt="Procelio HUD prefab drawn in 2D"><br><b>UI prefabs</b>: Procelio's battle HUD drawn the way the game lays it out, with its object tree and every sprite it uses.</td>
+</tr>
+<tr>
+<td><img src="ScreenShots/grid-and-texture.png" alt="Grid of Muck item icons and the texture viewer"><br><b>Grid view + texture viewer</b>: flip through thumbnails; sprite outlines show what is cut from each sheet.</td>
+<td><img src="ScreenShots/mod-maker.png" alt="Mod Maker dialog with four replaced textures"><br><b>Mod Maker</b>: collect replacements, then install them into the game (with a backup) or export a mod folder.</td>
+</tr>
+</table>
 
 ## Supported engines
 
@@ -91,7 +105,8 @@ Unreal notes:
 
 ## Features
 
-**Finding things**
+### Finding things
+
 - **Search inside files** (Ctrl+Shift+F, any engine): find which assets contain a piece of text (an ID, a line of dialogue, a config key), with the text around each match; double-click to open it.
 - **Inspect any file** (Ctrl+R, any engine): see what an asset's bytes are - text in its own encoding (UTF-16, Shift-JIS, Windows-1252...), images or archives hidden inside, or readable strings plus a hex dump. Files without a preview open this way.
 - **Duplicate finder** (Asset → Find duplicate assets, any engine): groups identical assets (e.g. the same texture shipped in five bundles), shows how much space the copies take, and can hide the extra copies in the list.
@@ -102,7 +117,8 @@ Unreal notes:
 - **Grid view**: big thumbnails you can flip through with the arrow keys (View → Grid, or Ctrl+2).
 - **Jump between related assets**: double-click a model's texture to jump to it. A texture lists every model that uses it (click one to jump back), and a sprite links to its sprite sheet.
 
-**Model viewer**
+### Model viewer
+
 - Rotate, and zoom with the mouse wheel or +/−. Wireframe, edges, vertex colors and texture alpha can each be toggled on and off. The model's texture is found automatically.
 - **UV sets**: switch between UV0/UV1/... (UV1 is often the baked-lighting layout), and use **UV layout** to see the UVs drawn over the texture.
 - **Model panel**: vertex/triangle counts, the source file, the prefab path, what uses the model, and its materials and textures.
@@ -110,17 +126,20 @@ Unreal notes:
 - **Animation playback**: play Unity animation clips (generic and humanoid) on their skinned models.
 - **Texture viewer**: zoom under the mouse, drag to pan, with a checkerboard background for transparency.
 
-**Export**
-- **OBJ + MTL + PNG** or **GLB** (one file with the textures inside). Skinned models (Unity) save to GLB with their skeleton and skin weights, and **Save animated GLB...** on an animation adds the clip, so a rigged, animated character opens in Blender.
+### Export
+
+- **OBJ + MTL + PNG** or **GLB** (one file with the textures inside). Every map of the material comes along and is plugged into the right slot: color, normal, metallic/roughness, ambient occlusion and emission (Blender wires them up on import), plus height (`disp` in the MTL; a PNG next to a GLB). Unity's packed normal maps are unpacked and its metallic/smoothness maps converted, so they look right outside the game. Skinned models (Unity) save to GLB with their skeleton and skin weights, and **Save animated GLB...** on an animation adds the clip, so a rigged, animated character opens in Blender.
 - **Open in Blender** (Ctrl+B): exports the model and opens it in Blender in one click. Blender is found automatically, or you can point to it.
 - **Bulk export** of all models, all textures, everything shown in the list, or a selection. It can **keep the game's folder structure** (e.g. `assets/prefabs/weapons/...`) so big dumps stay easy to browse.
-- **Export as Unity project** (Unity games: right-click the game on the Projects page): a folder you open with Unity Hub, with the game's textures, models (GLB via Unity's glTFast package), materials, sounds, fonts and text, and its **prefabs and scenes rebuilt** by a small editor script the first time Unity opens it (menu **UniView → Rebuild prefabs and scenes**). The game's code comes along so prefabs and scenes keep their script components and saved values: Mono games ship their compiled assemblies (plus decompiled C# with the optional ILSpy tool); for IL2CPP games the optional **Cpp2IL** tool rebuilds the script classes from the game's metadata (fields and attributes only - the scripts don't run). Custom shaders aren't included: materials go on Unity's built-in shaders.
+- **Export as Unity project** (Unity games: right-click the game on the Projects page): a folder you open with Unity Hub, with the game's textures, models (GLB via Unity's glTFast package), materials, sounds, fonts and text, and its **prefabs and scenes rebuilt** by a small editor script the first time Unity opens it (menu **UniView → Rebuild prefabs and scenes**). The game's code comes along so prefabs and scenes keep their script components and saved values: Mono games ship their compiled assemblies (plus decompiled C# with the optional ILSpy tool); for IL2CPP games the optional **Cpp2IL** tool rebuilds the script classes from the game's metadata (fields and attributes only - the scripts don't run). Custom shaders aren't included: materials go on Unity's built-in Standard shader, with their normal, metallic, occlusion, height, emission and detail maps attached.
 
-**Modding (Unity games)**
+### Modding (Unity games)
+
 - **Mod Maker** (Mod → Mod Maker, Ctrl+M): right-click a texture, sprite, text asset, data asset, font, sound or model → **Replace with file...** and pick your PNG / text / JSON / TTF / WAV, OGG, MP3, FLAC / GLB, OBJ. Sprites are pasted into their sprite sheet; data assets take the JSON that **Save...** writes, edited (fields keep their types). Sounds are stored uncompressed (16-bit PCM), so they take more space than the game's own. Models keep the game mesh's vertex layout: save the model as GLB, edit it in Blender, export GLB and replace; what your file doesn't have (lightmap UVs, a character's bone weights) is copied from the nearest original vertex, so reshaped characters keep their rig. Scene objects merged by Unity's static batching are drawn from the scene's *Combined Mesh*, not their own mesh.
 - **Install into game** rewrites only the changed game files (`.assets` or AssetBundles), backs up the originals first, and reloads the game. **Restore original files** puts them back. **Export mod folder...** writes the modded files + a README to share instead. For Addressables games (`StreamingAssets/aa`), the catalog's CRC check is switched off for the modded bundles so the game still loads them.
 
-**Projects page**
+### Projects page
+
 - A box for each game. **Green** means its assets are already loaded; **red** means they aren't loaded yet. Each box shows file/asset counts and how well the game works with UniView.
 - **Drag and drop** a game folder onto the page to add it, or use **Find games in Steam**, which lists every game an engine plugin recognizes.
 - **Engine and version**: each box shows the engine and what UniView can tell about it without loading the game, e.g. `Unity 2019.4.40f1 · IL2CPP`, `Source · tf, hl2`, `UE 4.26-5.2 · pak v11 · Oodle`.
