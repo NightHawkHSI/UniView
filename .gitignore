@@ -16,6 +16,7 @@ crash.log
 settings.json
 compat_cache.json
 cache/
+mods/
 
 # Personal notes
 Bugs.txt

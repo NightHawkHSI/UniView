@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from uniview.content_search import TEXT_KINDS, ContentSearch
+from uniview.ui.theme import role
 
 MAX_RESULTS = 5000
 
@@ -50,7 +51,7 @@ class ContentSearchDialog(QDialog):
         top.addWidget(self.stop_btn)
 
         self.status = QLabel("Matches ignore upper/lower case and find UTF-8 and UTF-16 text.")
-        self.status.setStyleSheet("color: gray;")
+        role(self.status, "muted")
         self.list = QTreeWidget()
         self.list.setHeaderLabels(["Asset", "Kind", "Found"])
         self.list.setRootIsDecorated(False)

@@ -37,7 +37,7 @@ UNITYPY_PACKAGES = [
 # Files that make up the project (what goes in the GitHub folder).
 SOURCE_FILES = [
     "unity_viewer.py", "uniview", "requirements.txt", "run.bat", "build.bat", "build.py",
-    "Icon.png", "README.md", ".gitignore", "ScreenShots", "compat.json",
+    "Icon.png", "README.md", "LICENSE", "CREDITS.md", ".gitignore", "ScreenShots", "compat.json",
     "engines", "plugins", "PLUGINS.md", "tests",
     ".github", "ruff.toml", "requirements-dev.txt",
 ]
@@ -198,9 +198,10 @@ def build_release(version, test_game=None):
     if os.path.exists(out_dir):
         shutil.rmtree(out_dir)
     shutil.move(os.path.join(dist, APP_NAME), out_dir)
-    readme = os.path.join(ROOT, "README.md")
-    if os.path.isfile(readme):
-        shutil.copy2(readme, out_dir)
+    for name in ("README.md", "LICENSE", "CREDITS.md"):
+        src = os.path.join(ROOT, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, out_dir)
     # User plugins live next to the exe: ship the template and the guide.
     os.makedirs(os.path.join(out_dir, "plugins"), exist_ok=True)
     for name, target in (("plugins/_template.py", "plugins/_template.py"), ("PLUGINS.md", "PLUGINS.md")):

@@ -121,10 +121,7 @@ class AssetTree(QTreeWidget):
         self.sticky = QToolButton(self.viewport())
         self.sticky.setCursor(Qt.PointingHandCursor)
         self.sticky.setToolTip("Close this group and go back to its top")
-        self.sticky.setStyleSheet(
-            "QToolButton { text-align: left; padding: 2px 8px; border: none; font-weight: bold;"
-            " background: palette(button); border-bottom: 1px solid palette(mid); }"
-            "QToolButton:hover { background: palette(midlight); }")
+        self.sticky.setObjectName("stickyHeader")
         self.sticky.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.sticky.hide()
         self.sticky.clicked.connect(self.close_sticky_group)
@@ -152,7 +149,7 @@ class AssetTree(QTreeWidget):
         if group is None:
             self.sticky.hide()
             return
-        self.sticky.setText(f"▾  {group.text(0)}     (click to close)")
+        self.sticky.setText(f"▾  {group.text(0).replace('&', '&&')}     (click to close)")
         self.sticky.setGeometry(0, 0, self.viewport().width(), self.STICKY_HEIGHT)
         self.sticky.show()
         self.sticky.raise_()

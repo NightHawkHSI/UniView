@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 from uniview import versions
 from uniview.duplicates import DuplicateScan
 from uniview.util import fmt_size
+from uniview.ui.theme import role
 
 MAX_ROWS = 20000
 
@@ -79,7 +80,7 @@ class VersionsDialog(QDialog):
         split.setSizes([300, 700])
 
         self.status = QLabel("Save a snapshot now; after the game updates, compare the new version with it.")
-        self.status.setStyleSheet("color: gray;")
+        role(self.status, "muted")
         self.status.setWordWrap(True)
         lay = QVBoxLayout(self)
         lay.addWidget(self.game_label)

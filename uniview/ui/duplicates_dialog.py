@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 
 from uniview.duplicates import DuplicateScan, extra_copies, wasted
 from uniview.util import fmt_size
+from uniview.ui.theme import role
 
 MAX_GROUPS = 5000
 
@@ -56,7 +57,7 @@ class DuplicatesDialog(QDialog):
         self.list.itemDoubleClicked.connect(self._open)
         self.list.itemActivated.connect(self._open)
         self.status = QLabel("Compares the content of every asset (names and where they're stored don't matter).")
-        self.status.setStyleSheet("color: gray;")
+        role(self.status, "muted")
 
         lay = QVBoxLayout(self)
         lay.addLayout(top)

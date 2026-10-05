@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 import engines
 from uniview.constants import APP_SHORT, PLUGINS_DIR, REPO_URL, log
 from uniview.projects import game_exe, project_options
+from uniview.ui.theme import role
 
 
 class ExportDialog(QDialog):
@@ -183,7 +184,7 @@ class EngineOptionsDialog(QDialog):
             if opt.get("help"):
                 hint = QLabel(opt["help"])
                 hint.setWordWrap(True)
-                hint.setStyleSheet("color: gray;")
+                role(hint, "muted")
                 form.addRow(hint)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)

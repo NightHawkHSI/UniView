@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 
 from uniview.constants import APP_SHORT, log
 from uniview.util import checker_brush, fmt_size, pil_to_pixmap, safe_filename, wheel_steps
+from uniview.ui.theme import role
 
 
 class ZoomGraphicsView(QGraphicsView):
@@ -111,7 +112,7 @@ class ImageView(QWidget):
         links_lay.addWidget(self.links_title)
         links_lay.addWidget(self.links, 1)
         hint = QLabel("Click one to jump to it.")
-        hint.setStyleSheet("color: gray;")
+        role(hint, "muted")
         links_lay.addWidget(hint)
         links_box.setVisible(show_links)
         self._link_items = {}
@@ -215,10 +216,10 @@ class VideoView(QWidget):
         self._file_index = 0
 
         self.title = QLabel()
-        self.title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        role(self.title, "heading")
         self.status = QLabel()
         self.status.setWordWrap(True)
-        self.status.setStyleSheet("color: #e0a030;")
+        role(self.status, "warn")
         self.play_btn = QPushButton("\u25b6 Play")
         self.play_btn.setMinimumWidth(110)
         self.play_btn.clicked.connect(self.toggle)
@@ -310,13 +311,13 @@ class AudioView(QWidget):
 
         self.title = QLabel()
         self.title.setWordWrap(True)
-        self.title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        role(self.title, "heading")
         self.details = QLabel()
         self.details.setWordWrap(True)
         self.details.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.status = QLabel()
         self.status.setWordWrap(True)
-        self.status.setStyleSheet("color: #e0a030;")
+        role(self.status, "warn")
 
         self.play_btn = QPushButton("\u25b6 Play")
         self.play_btn.setMinimumWidth(110)
@@ -447,7 +448,7 @@ class AnimationView(QWidget):
         self.flipbook.clicked.connect(self.flipbook_requested)
         self.flipbook.hide()
         self.note = QLabel()
-        self.note.setStyleSheet("color: gray;")
+        role(self.note, "muted")
         row = QHBoxLayout()
         row.addWidget(QLabel("Model:"))
         row.addWidget(self.targets, 1)

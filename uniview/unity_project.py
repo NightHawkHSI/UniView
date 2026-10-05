@@ -17,7 +17,8 @@ import os
 import re
 from types import SimpleNamespace
 
-from engines.sdk import NORMAL, Material
+from engines.sdk import Material
+from uniview import pbr
 from uniview.constants import log
 from uniview.export import (
     export_ext,
@@ -252,10 +253,39 @@ class MaterialLibrary:
         self.texture_paths = texture_paths  # texture asset key -> exported path
         self.paths = {}                     # material uid -> "Assets/..." ('' if it couldn't be written)
         self.used = set()
+        self.repacks = {}                   # (recipe, (channel, texture key)...) -> guid of the repacked PNG
         self.written = self.failed = 0
 
     def texture_guid(self, asset):
         return asset_guid(asset.uid) if asset.key in self.texture_paths else None
+
+    def repacked(self, folder, recipe, sources):
+        """GUID of a PNG repacked from the game's maps for the Standard shader (see unity_materials.convert),
+        written once next to the first material that needs it; None if a source can't be read."""
+        key = (recipe,) + tuple((ch, asset.key) for ch, asset in sources)
+        if key not in self.repacks:
+            self.repacks[key] = None
+            try:
+                with self.session.lock:
+                    images = [(ch, self.session.image(asset)) for ch, asset in sources]
+                if recipe == "ao":
+                    img = pbr.occlusion(*images[0])
+                else:
+                    img = pbr.unity_metal_gloss(*images[0], second=images[1] if len(images) > 1 else None)
+                suffix = "Occlusion" if recipe == "ao" else "MetallicSmoothness"
+                stem = safe_filename(f"{os.path.basename(sources[0][1].name)}_{suffix}")
+                path, n = os.path.join(folder, stem + ".png"), 1
+                while path.lower() in self.used:  # (a file from an earlier export is overwritten)
+                    n += 1
+                    path = os.path.join(folder, f"{stem}_{n}.png")
+                self.used.add(path.lower())
+                img.save(path)
+                guid = asset_guid("repacked:" + "|".join(map(str, key)))
+                write_meta(path, guid)
+                self.repacks[key] = guid
+            except Exception as e:
+                log.warning("Could not repack %s for a material: %s", recipe, e)
+        return self.repacks[key]
 
     def path_for(self, uid):
         if not uid:
@@ -283,8 +313,12 @@ class MaterialLibrary:
         self.used.add(os.path.join(folder, name).lower())
         path = os.path.join(folder, f"{name}.mat")
         os.makedirs(folder, exist_ok=True)
+
+        def make_texture(recipe, sources):
+            return self.repacked(folder, recipe, sources)
+
         with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(mat_yaml(convert(details, self.texture_guid)))
+            f.write(mat_yaml(convert(details, self.texture_guid, make_texture)))
         write_meta(path, asset_guid(uid))
         write_folder_metas(self.assets_dir, folder)
         return unity_path(self.root, path)
@@ -447,7 +481,7 @@ def write_static_batches(session, nodes, folder, texture_paths):
             target = texture_paths.get(tex_asset.key)
             return os.path.relpath(target, folder).replace(os.sep, "/") if target else None
 
-        write_glb(session, md, materials, path, image_uri=image_uri, normal_maps=True)
+        write_glb(session, md, materials, path, image_uri=image_uri)
         written.append((path, uids))
     return written
 
@@ -804,7 +838,8 @@ def _write_model(session, asset, path, texture_paths, normal_keys):
         md = session.mesh(asset)
         materials = session_materials(session, asset)
         for mat in materials:
-            normal_keys.update(t.asset.key for t in mat.textures if t.role == NORMAL)
+            maps = pbr.assign(mat.textures)
+            normal_keys.update(maps[ch].asset.key for ch in (pbr.NORMAL, pbr.DETAIL_NORMAL) if ch in maps)
         if not path.lower().endswith(".glb"):
             return write_obj(session, md, materials, path)
         folder = os.path.dirname(path)
@@ -813,8 +848,7 @@ def _write_model(session, asset, path, texture_paths, normal_keys):
             target = texture_paths.get(tex_asset.key)
             return os.path.relpath(target, folder).replace("\\", "/") if target else None
 
-        return write_glb(session, md, materials, path, rig=rig_for_export(session, asset, md),
-                         image_uri=image_uri, normal_maps=True)
+        return write_glb(session, md, materials, path, rig=rig_for_export(session, asset, md), image_uri=image_uri)
 
 
 def _float_texture(session, asset):
@@ -918,6 +952,10 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
                 path = os.path.splitext(path)[0] + ".exr"
                 write_exr(path, pixels, data["float32"])
                 texture_paths[asset.key] = path
+                files = [path]
+            elif asset.kind == "texture" and asset.key in normal_keys and path.lower().endswith(".png"):
+                with session.lock:  # DXT5nm / BC5 -> the RGB normal map Unity expects from a PNG
+                    pbr.unpack_normal(session.image(asset)).save(path)
                 files = [path]
             else:
                 files = write_asset(session, asset, path)

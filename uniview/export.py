@@ -8,8 +8,8 @@ import struct
 import numpy as np
 from PIL import Image, ImageDraw
 
-from engines.sdk import IMAGE_KINDS, KIND_LABELS, MODEL_KINDS, NORMAL, main_texture
-from uniview import __version__
+from engines.sdk import IMAGE_KINDS, KIND_LABELS, MODEL_KINDS, main_texture
+from uniview import __version__, pbr
 from uniview.constants import APP_SHORT, log
 from uniview.util import safe_filename
 
@@ -41,15 +41,133 @@ def display_texture(md, materials):
             return tex.asset
     return main_texture(materials)
 
-def write_glb(session, md, materials, path, rig=None, animation=None, image_uri=None, normal_maps=False):
-    """Binary glTF: positions, normals, UVs, vertex colors and embedded base-color textures.
+GLOSS_SCALE = ("_GlossMapScale", "_Smoothness", "_SmoothnessRemapMax")
+GLOSS = ("_Glossiness", "_Smoothness")
+EMISSION_COLOR = ("_EmissionColor", "_EmissiveColor", "_GlowColor")
+EXTRA_MAPS = (pbr.HEIGHT, pbr.SPECULAR, pbr.DETAIL_ALBEDO, pbr.DETAIL_NORMAL, pbr.DETAIL_MASK)  # no glTF slot
+
+
+def _normal_image(session, tex):
+    return pbr.unpack_normal(session.image(tex.asset))
+
+
+def base_texture(mat, maps):
+    """The albedo TextureRef, else the material's main texture unless it's known to be another map."""
+    if pbr.ALBEDO in maps:
+        return maps[pbr.ALBEDO]
+    tex = mat.main_texture()
+    return tex if tex is not None and tex not in maps.values() else None
+
+
+def metal_rough_sources(maps):
+    """(channel, TextureRef, second (channel, TextureRef) or None) of the maps holding metallic/roughness, or None."""
+    for ch in (pbr.METAL_GLOSS, pbr.MASK, pbr.ORM):
+        if ch in maps:
+            return ch, maps[ch], None
+    metal = (pbr.METALLIC, maps[pbr.METALLIC]) if pbr.METALLIC in maps else None
+    rough = next(((ch, maps[ch]) for ch in (pbr.ROUGHNESS, pbr.SMOOTHNESS) if ch in maps), None)
+    first = metal or rough
+    if first is None:
+        return None
+    return first[0], first[1], rough if metal and rough else None
+
+
+def _gltf_maps(mat, maps, texture):
+    """glTF material fields (base color / normal / metallicRoughness / occlusion / emissive textures and factors)
+    for a Material whose textures pbr.assign() sorted into `maps`. texture(TextureRef, convert=None) -> index."""
+    out = {}
+    base = base_texture(mat, maps)
+    if base is not None and (i := texture(base)) is not None:
+        out["baseColorTexture"] = {"index": i}
+    if pbr.NORMAL in maps and (i := texture(maps[pbr.NORMAL], ("normal", _normal_image))) is not None:
+        out["normalTexture"] = {"index": i}
+        scale = pbr.property_float(mat, ("_BumpScale", "_NormalScale"))
+        if scale is not None and scale != 1:
+            out["normalTexture"]["scale"] = scale
+
+    metallic = pbr.property_float(mat, ("_Metallic",))
+    smooth = pbr.property_float(mat, GLOSS)
+    out["metallicFactor"] = min(1.0, max(0.0, metallic)) if metallic is not None else 0.0
+    out["roughnessFactor"] = min(1.0, max(0.0, 1 - smooth)) if smooth is not None else 1.0
+    found = metal_rough_sources(maps)
+    if found is not None:
+        ch, tex, second = found
+        if ch == pbr.ORM:
+            i = texture(tex)  # already glTF's layout
+        else:
+            scale = pbr.property_float(mat, GLOSS_SCALE)
+            scale = 1.0 if scale is None else min(1.0, max(0.0, scale))
+
+            def repack(session, t, ch=ch, second=second, scale=scale):
+                other = (second[0], session.image(second[1].asset)) if second else None
+                return pbr.gltf_metal_rough(ch, session.image(t.asset), scale, other)
+
+            tag = f"mr:{ch}:{scale}" + (f":{second[0]}:{second[1].asset.key}" if second else "")
+            i = texture(tex, (tag, repack))
+        if i is not None:
+            out["metallicRoughnessTexture"] = {"index": i}
+            channels = {ch} | ({second[0]} if second else set())
+            if channels & {pbr.METAL_GLOSS, pbr.MASK, pbr.ORM, pbr.METALLIC}:
+                out["metallicFactor"] = 1.0
+            if channels & {pbr.METAL_GLOSS, pbr.MASK, pbr.ORM, pbr.ROUGHNESS, pbr.SMOOTHNESS}:
+                out["roughnessFactor"] = 1.0
+
+    occlusion = None
+    if pbr.AO in maps:
+        occlusion = texture(maps[pbr.AO])
+    elif pbr.ORM in maps:
+        occlusion = texture(maps[pbr.ORM])
+    elif pbr.MASK in maps:
+        occlusion = texture(maps[pbr.MASK], ("ao", lambda session, t: pbr.occlusion(pbr.MASK, session.image(t.asset))))
+    if occlusion is not None:
+        out["occlusionTexture"] = {"index": occlusion}
+        strength = pbr.property_float(mat, ("_OcclusionStrength", "_AORemapMax"))
+        if strength is not None and strength != 1:
+            out["occlusionTexture"]["strength"] = min(1.0, max(0.0, strength))
+
+    color = pbr.property_color(mat, EMISSION_COLOR)
+    if pbr.EMISSION in maps and (color is None or max(color) > 0.001):
+        if (i := texture(maps[pbr.EMISSION])) is not None:
+            out["emissiveTexture"] = {"index": i}
+            out["emissiveFactor"] = list(color or (1.0, 1.0, 1.0))
+    elif color is not None and max(color) > 0.001:
+        out["emissiveFactor"] = list(color)
+    return out
+
+
+def _save_extra_maps(session, maps, folder, stem, already):
+    """PNGs next to a GLB for the maps glTF has no slot for (height, specular, detail). Returns the new paths."""
+    written = []
+    for ch in EXTRA_MAPS:
+        tex = maps.get(ch)
+        if tex is None:
+            continue
+        target = os.path.join(folder, f"{stem}_{safe_filename(tex.name or ch)}_{ch}.png")
+        if target in already or target in written:
+            continue
+        try:
+            with session.lock:
+                img = _normal_image(session, tex) if ch == pbr.DETAIL_NORMAL else session.image(tex.asset)
+            img.save(target)
+            written.append(target)
+        except Exception as e:
+            log.warning("Could not save the %s map %s: %s", ch, os.path.basename(target), e)
+    return written
+
+
+def write_glb(session, md, materials, path, rig=None, animation=None, image_uri=None):
+    """Binary glTF: positions, normals, UVs, vertex colors and the materials' textures (base color, normal,
+    metallic/roughness, occlusion, emission - see _gltf_maps).
 
     One primitive per submesh, each with its material. Opens directly in Blender.
     rig / animation (see GameSession.skeleton): adds the skeleton, the skin weights and an animation.
     image_uri(texture Asset) -> relative path/URI: reference that image file instead of embedding a copy
-    (None -> embed as usual). normal_maps: also add each material's normal map.
+    (None -> embed as usual, and save maps glTF has no slot for - height, specular, detail - as PNGs next to it).
     """
     count = len(md.points)
+    extras_folder = os.path.dirname(path) if image_uri is None and materials else None
+    extras_stem = os.path.splitext(os.path.basename(path))[0]
+    extra_files = []
     buf, views, accessors = bytearray(), [], []
 
     def add_view(data, target=None):
@@ -92,19 +210,23 @@ def write_glb(session, md, materials, path, rig=None, animation=None, image_uri=
 
     gl_materials, images, textures, texture_index, mat_index = [], [], [], {}, {}
 
-    def texture(tex):
-        """glTF texture index for a TextureRef (referenced or embedded once), or None if it can't be read."""
-        key = tex.asset.key
+    def texture(tex, convert=None):
+        """glTF texture index for a TextureRef (referenced or embedded once), or None if it can't be read.
+        convert: (tag, fn(session, tex) -> PIL image) - embed a converted copy instead (e.g. a repacked map)."""
+        key = (tex.asset.key, convert[0] if convert else None)
         if key not in texture_index:
             texture_index[key] = None
-            uri = image_uri(tex.asset) if image_uri is not None else None
+            # Referenced files are what the project export wrote: plain images, normal maps already unpacked.
+            uri = image_uri(tex.asset) if image_uri is not None and (convert is None or convert[0] == "normal") else None
             if uri:  # an image file next to the model: reference it
                 images.append({"uri": uri, "name": tex.name or "texture"})
+            elif image_uri is not None and convert is not None:
+                return None  # project export: no converted copies inside the model
             else:
                 try:
                     png = io.BytesIO()
                     with session.lock:
-                        img = session.image(tex.asset)
+                        img = convert[1](session, tex) if convert else session.image(tex.asset)
                     img.convert("RGBA").save(png, "PNG")
                     images.append({"bufferView": add_view(png.getvalue()), "mimeType": "image/png",
                                    "name": tex.name or "texture"})
@@ -118,15 +240,15 @@ def write_glb(session, md, materials, path, rig=None, animation=None, image_uri=
     for mat in materials:
         entry = {"name": mat.name or "material", "doubleSided": True,
                  "pbrMetallicRoughness": {"metallicFactor": 0.0, "roughnessFactor": 1.0}}
+        pbr_entry = entry["pbrMetallicRoughness"]
         if mat.color is not None:
-            entry["pbrMetallicRoughness"]["baseColorFactor"] = [min(1.0, max(0.0, float(c)))
-                                                                for c in (list(mat.color) + [1.0])[:4]]
-        tex = mat.main_texture()
-        if tex is not None and texture(tex) is not None:
-            entry["pbrMetallicRoughness"]["baseColorTexture"] = {"index": texture(tex)}
-        normal = next((t for t in mat.textures if t.role == NORMAL), None) if normal_maps else None
-        if normal is not None and texture(normal) is not None:
-            entry["normalTexture"] = {"index": texture(normal)}
+            pbr_entry["baseColorFactor"] = [min(1.0, max(0.0, float(c))) for c in (list(mat.color) + [1.0])[:4]]
+        maps = pbr.assign(mat.textures)
+        for key, value in _gltf_maps(mat, maps, texture).items():
+            (pbr_entry if key in ("baseColorTexture", "metallicRoughnessTexture", "metallicFactor", "roughnessFactor")
+             else entry)[key] = value
+        if extras_folder is not None:
+            extra_files.extend(_save_extra_maps(session, maps, extras_folder, extras_stem, extra_files))
         mat_index[id(mat)] = len(gl_materials)
         gl_materials.append(entry)
 
@@ -170,7 +292,7 @@ def write_glb(session, md, materials, path, rig=None, animation=None, image_uri=
         f.write(js)
         f.write(struct.pack("<II", len(buf), 0x004E4942))
         f.write(buf)
-    return [path]
+    return [path] + extra_files
 
 def _add_skeleton(gltf, rig, animation, add_accessor):
     """Joint nodes, the skin on node 0 (the mesh) and, if given, the animation."""
@@ -214,33 +336,76 @@ def _add_skeleton(gltf, rig, animation, add_accessor):
     gltf["animations"] = [{"name": animation["name"] or "animation", "samplers": samplers, "channels": channels}]
 
 def write_obj(session, md, materials, path):
-    """<name>.obj + <name>.mtl + PNG textures, so it opens textured in Blender."""
+    """<name>.obj + <name>.mtl + PNG textures, so it opens textured in Blender. The MTL links the base color,
+    normal (map_Bump), metallic (map_Pm), roughness (map_Pr), emission (map_Ke) and height (disp) maps; the
+    material's other textures are saved next to it too."""
     folder = os.path.dirname(path)
     stem = os.path.splitext(os.path.basename(path))[0]
     written, mtl, mat_names = [path], [], {}
+
+    def save(tex, suffix="", make=None):
+        """File name of a texture (converted by make(session, tex) if given) saved next to the OBJ, or None."""
+        png = f"{stem}_{safe_filename(tex.name)}{suffix}.png"
+        png_path = os.path.join(folder, png)
+        if png_path in written:
+            return png
+        try:
+            with session.lock:
+                img = make(session, tex) if make else session.image(tex.asset)
+            img.save(png_path)
+        except Exception as e:
+            log.warning("Could not save the texture %s: %s", png, e)
+            return None
+        written.append(png_path)
+        return png
+
     for i, mat in enumerate(materials):
         mat_name = f"{safe_filename(mat.name or 'material')}_{i}"
         mat_names[id(mat)] = mat_name
         kd = " ".join(f"{min(1.0, max(0.0, c)):.4f}" for c in mat.color[:3]) if mat.color is not None else "1 1 1"
         mtl += [f"newmtl {mat_name}", f"Kd {kd}"]
-        have_diffuse = False
-        for tex in mat.textures:
-            png = f"{stem}_{safe_filename(tex.name)}.png"
-            png_path = os.path.join(folder, png)
-            try:
-                if png_path not in written:
-                    with session.lock:
-                        img = session.image(tex.asset)
-                    img.save(png_path)
-                    written.append(png_path)
-            except Exception as e:
-                log.warning("Could not save the texture %s: %s", png, e)
-                continue
-            if tex.role == NORMAL:
-                mtl.append(f"map_Bump {png}")
-            elif not have_diffuse:
-                mtl.append(f"map_Kd {png}")
-                have_diffuse = True
+        maps = pbr.assign(mat.textures)
+        used = set()
+        base = base_texture(mat, maps)
+        if base is not None and (png := save(base)):
+            mtl.append(f"map_Kd {png}")
+            used.add(id(base))
+        if pbr.NORMAL in maps and (png := save(maps[pbr.NORMAL], make=_normal_image)):
+            mtl.append(f"map_Bump {png}")
+            used.add(id(maps[pbr.NORMAL]))
+        metallic = pbr.property_float(mat, ("_Metallic",))
+        smooth = pbr.property_float(mat, GLOSS)
+        found = metal_rough_sources(maps)
+        sources = {}
+        if found is not None:
+            sources[found[0]] = found[1]
+            if found[2]:
+                sources[found[2][0]] = found[2][1]
+        for want, key, channels in ((pbr.METALLIC, "Pm", (pbr.METALLIC, pbr.METAL_GLOSS, pbr.MASK, pbr.ORM)),
+                                    (pbr.ROUGHNESS, "Pr", (pbr.ROUGHNESS, pbr.SMOOTHNESS, pbr.METAL_GLOSS, pbr.MASK,
+                                                           pbr.ORM))):
+            ch = next((c for c in channels if c in sources), None)
+            if ch is not None:
+                tex = sources[ch]
+                png = save(tex, f"_{want}", lambda session, t, ch=ch, want=want:
+                           pbr.single(ch, session.image(t.asset), want))
+                if png:
+                    mtl.append(f"map_{key} {png}")
+                    used.add(id(tex))
+                    continue
+            value = metallic if want == pbr.METALLIC else (1 - smooth if smooth is not None else None)
+            if value is not None:
+                mtl.append(f"{key} {min(1.0, max(0.0, value)):.4f}")
+        if pbr.EMISSION in maps and (png := save(maps[pbr.EMISSION])):
+            color = pbr.property_color(mat, EMISSION_COLOR) or (1.0, 1.0, 1.0)
+            mtl += ["Ke " + " ".join(f"{c:.4f}" for c in color), f"map_Ke {png}"]
+            used.add(id(maps[pbr.EMISSION]))
+        if pbr.HEIGHT in maps and (png := save(maps[pbr.HEIGHT])):
+            mtl.append(f"disp {png}")
+            used.add(id(maps[pbr.HEIGHT]))
+        for tex in mat.textures:  # occlusion, detail maps, masks...: saved next to it
+            if id(tex) not in used:
+                save(tex, make=_normal_image if tex is maps.get(pbr.DETAIL_NORMAL) else None)
         mtl.append("")
 
     uv = next(iter(md.uvs.values()), None)

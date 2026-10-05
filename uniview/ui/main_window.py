@@ -9,7 +9,7 @@ import webbrowser
 
 from PIL import Image
 from PySide6.QtCore import QPoint, QSignalBlocker, QSize, Qt, QThread, QTimer
-from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QFontDatabase, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
 
 import engines
 from engines.sdk import IMAGE_KINDS, KIND_LABELS, KINDS, MODEL_KINDS, VIEW_OPTIONS
-from uniview import __version__, prefab_info
+from uniview import __version__, code_links, game_data, modmaker, prefab_info
 from uniview.constants import (
     APP_DIR,
     APP_SHORT,
@@ -82,7 +82,9 @@ from uniview.ui.media import AnimationView, AudioView, ImageView, ImageWindow, V
 from uniview.ui import canvas_render
 from uniview.ui.mesh_view import MeshView
 from uniview.ui.prefab_view import PrefabView
+from uniview.ui.decompile_dialog import decompile_game_code
 from uniview.ui.duplicates_dialog import DuplicatesDialog
+from uniview.ui.modmaker_dialog import ModMakerDialog, replace_asset
 from uniview.ui.search_dialog import ContentSearchDialog
 from uniview.ui.versions_dialog import VersionsDialog
 from uniview.ui.ui_prefab import has_thumbnail, ui_picture, uid_map
@@ -91,6 +93,8 @@ from uniview.ui.unity_export import ask_project_folder, choose_editor_version, r
 from uniview.unity_project import installed_editors, target_version, unity_version
 from uniview.util import blank_icon, fmt_size, norm_path, open_path, pil_to_pixmap, safe_filename
 from uniview.workers import Loader, StatsWorker, ThumbnailWorker, meshdata_to_polydata
+from uniview.ui import theme
+from uniview.ui.theme import role
 
 
 class SortItem(QTreeWidgetItem):
@@ -114,7 +118,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_TITLE)
         self.resize(1500, 900)
         self.settings = Settings.load()
-        self.session = None      # GameSession of the game being viewed
+        theme.apply(QApplication.instance(), self.settings.theme)
+        self.session = None     # GameSession of the game being viewed
         self.current = None      # Asset shown on the right
         self.thread = None
         self.last_dir = self.settings.last_dir
@@ -144,11 +149,13 @@ class MainWindow(QMainWindow):
         self.resort_timer.timeout.connect(self.resort)
 
         # left: buttons, search, type/view, list or grid
-        back = QPushButton("\u2190 Projects")
+        back = theme.set_icon(QPushButton("All games"), "back")
         back.clicked.connect(self.show_home)
         self.notes_btn = QPushButton("Notes")
         self.notes_btn.setToolTip("Your notes for this game")
         self.notes_btn.clicked.connect(self.edit_current_notes)
+        back.setFlat(True)
+        back.setStyleSheet("text-align: left;")
         top_row = QHBoxLayout()
         top_row.addWidget(back, 1)
         top_row.addWidget(self.notes_btn)
@@ -163,8 +170,10 @@ class MainWindow(QMainWindow):
             self.type_combo.addItem(KIND_LABELS[kind], kind)
         self.type_combo.addItem("\u2605 Favorites", "fav")
         self.type_combo.currentIndexChanged.connect(lambda _: self.apply_filter())
-        self.list_btn = QToolButton(text="\u2630 List", checkable=True, checked=True)
-        self.grid_btn = QToolButton(text="\u25a6 Grid", checkable=True)
+        self.list_btn = theme.set_icon(QToolButton(text="List", checkable=True, checked=True), "list")
+        self.grid_btn = theme.set_icon(QToolButton(text="Grid", checkable=True), "grid")
+        for btn in (self.list_btn, self.grid_btn):
+            btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.grid_btn.setToolTip("Big thumbnails - use the arrow keys to flip through quickly")
         view_group = QButtonGroup(self)
         view_group.setExclusive(True)
@@ -220,9 +229,11 @@ class MainWindow(QMainWindow):
         self.list_stack.addWidget(self.tree)
         self.list_stack.addWidget(self.grid)
 
-        left = QWidget()
+        left = QWidget(objectName="sidePanel")
+        left.setAttribute(Qt.WA_StyledBackground, True)
         ll = QVBoxLayout(left)
-        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setContentsMargins(8, 8, 6, 8)
+        ll.setSpacing(6)
         ll.addLayout(top_row)
         ll.addWidget(self.search)
         ll.addLayout(type_row)
@@ -237,6 +248,7 @@ class MainWindow(QMainWindow):
         panel.save_texture.connect(self.export_item)
         panel.save_model.connect(self.export_selected_mesh)
         panel.open_blender.connect(self.open_in_blender)
+        panel.show_code.connect(self.show_code)
         self.image_view = ImageView()
         self.image_view.save_requested.connect(self.save_shown_image)
         self.image_view.goto_requested.connect(self.goto_asset)
@@ -244,6 +256,7 @@ class MainWindow(QMainWindow):
         self._content_search = None  # Search inside files window (made on first use)
         self._duplicates = None      # Duplicate assets window (made on first use)
         self._versions = None        # Game versions window (made on first use)
+        self._modmaker = None        # Mod Maker window (made on first use)
         self.hidden_copies = set()   # uids the duplicate finder hides from the list
         self.prefab_view = PrefabView()
         self.prefab_view.goto_requested.connect(self.goto_asset)
@@ -260,7 +273,7 @@ class MainWindow(QMainWindow):
         self.video_view.save_requested.connect(lambda: self.current and self.export_item(self.current))
         self.audio_view.save_requested.connect(lambda: self.current and self.export_item(self.current))
 
-        self.placeholder = QLabel("Loading...", alignment=Qt.AlignCenter)
+        self.placeholder = role(QLabel("Loading...", alignment=Qt.AlignCenter), "muted")
         self.load_bar = QProgressBar()
         self.load_bar.setFixedWidth(420)
         self.load_bar.hide()
@@ -286,6 +299,7 @@ class MainWindow(QMainWindow):
         self.home.open_requested.connect(self.open_project)
         self.home.unload_requested.connect(self.unload_game)
         self.home.export_unity_requested.connect(self.export_unity_project)
+        self.home.decompile_requested.connect(self.decompile_code)
 
         self.pages = QStackedWidget()
         self.pages.addWidget(self.home)
@@ -297,7 +311,7 @@ class MainWindow(QMainWindow):
         self.progress.hide()
         self.statusBar().addPermanentWidget(self.progress)
         self.engine_label = QLabel()
-        self.engine_label.setStyleSheet("color: gray; padding: 0 6px;")
+        self.engine_label.setContentsMargins(6, 0, 6, 0)
         self.statusBar().addPermanentWidget(self.engine_label)
 
         self.console = None
@@ -361,6 +375,17 @@ class MainWindow(QMainWindow):
         self.engine_label.setText(info)
         log.info("Opening game '%s'%s", name, f" ({info})" if info else "")
         self.load(path)
+
+    def decompile_code(self, path=None):
+        """File -> Decompile game code... (the open game), or a Unity game's right-click menu on Projects."""
+        path = path or (self.session.path if self.session is not None else None)
+        if not path:
+            QMessageBox.information(self, "Decompile game code", "Open a game first (or right-click one on the "
+                                    "Projects page).")
+            return
+        project = self.store.get(path)
+        name = project["name"] if project else os.path.basename(os.path.normpath(path))
+        decompile_game_code(self, path if os.path.isdir(path) else os.path.dirname(path), name)
 
     def export_unity_project(self, path):
         """Projects page -> right-click a Unity game -> Export as Unity project..."""
@@ -427,6 +452,7 @@ class MainWindow(QMainWindow):
         add(m, "Export everything shown in the list...", self.export_shown)
         m.addSeparator()
         add(m, "Game versions (snapshots / compare)...", self.show_versions)
+        add(m, "Decompile game code (C#)...", self.decompile_code)
         m.addSeparator()
         add(m, "Quit", self.close, "Ctrl+Q")
 
@@ -442,6 +468,10 @@ class MainWindow(QMainWindow):
         add(a, "Find duplicate assets...", self.show_duplicates)
         add(a, "Set Blender location...", self.choose_blender)
 
+        mod = self.menuBar().addMenu("&Mod")
+        add(mod, "Mod Maker...", self.show_modmaker, "Ctrl+M")
+        add(mod, "Replace selected asset with file...", self.replace_selected)
+
         view = self.menuBar().addMenu("&View")
         add(view, "List view", lambda: self.list_btn.setChecked(True), "Ctrl+1")
         add(view, "Grid view", lambda: self.grid_btn.setChecked(True), "Ctrl+2")
@@ -450,6 +480,15 @@ class MainWindow(QMainWindow):
             toggle = self.console.toggleViewAction()
             toggle.setShortcut("Ctrl+`")
             view.addAction(toggle)
+        view.addSeparator()
+        looks = view.addMenu("Theme")
+        group = QActionGroup(self)
+        for mode, text in (("dark", "Dark"), ("light", "Light"), ("system", "Match Windows")):
+            act = QAction(text, self, checkable=True)
+            act.setChecked(self.settings.theme == mode)
+            act.triggered.connect(lambda _=False, m=mode: self.set_theme(m))
+            group.addAction(act)
+            looks.addAction(act)
 
         options = self.menuBar().addMenu("&Options")
         for key, text, tip in VIEW_OPTION_ITEMS:
@@ -476,6 +515,12 @@ class MainWindow(QMainWindow):
         help_menu.addAction("Open log file", lambda: open_path(LOG_FILE))
         help_menu.addAction("Open crash log", lambda: open_path(CRASH_FILE))
         help_menu.addAction("Open app folder", lambda: os.startfile(APP_DIR))
+
+    def set_theme(self, mode):
+        self.settings.theme = mode
+        self.settings.save()
+        theme.apply(QApplication.instance(), mode)
+        log.info("Theme: %s", mode)
 
     def _set_view_option(self, key, on):
         self.settings.set_option(key, on)
@@ -597,6 +642,8 @@ class MainWindow(QMainWindow):
                 with QSignalBlocker(self._duplicates.hide):
                     self._duplicates.hide.setChecked(False)
         self.session = session
+        if self._modmaker is not None and self._modmaker.isVisible():
+            self._modmaker.refresh()
         self.thumb_cache = entry["thumbs"]
         self.stats = entry["stats"]
         project = self.current_project()
@@ -1084,6 +1131,58 @@ class MainWindow(QMainWindow):
                                favorite=asset.uid in self.favorites)
         jobs = self.mesh_view.panel.set_info(asset.name, "<br>".join(rows), materials, self.blank_big)
         self._request_icons(jobs, self.mesh_view.panel.set_icon)
+        nodes = self._structure_nodes(asset)
+        self.mesh_view.panel.set_structure(nodes, uid_map(session), self._game_entries(asset, nodes))
+
+    def _game_entries(self, asset, nodes):
+        """Game data entries that name a prefab, each with its code links (see uniview.game_data)."""
+        if not nodes or asset.ref.get("type") == "scene":
+            return []
+        try:
+            entries = game_data.entries_for(self.session, asset.name, nodes)
+            for entry in entries:
+                entry["links"] = code_links.links(self.session.path, [r[:2] for r in entry["rows"]])
+            return entries
+        except Exception:
+            log.exception("Looking up game data for '%s' failed", asset.name)
+            return []
+
+    def show_code(self, link):
+        """Decompile the function a game data entry points at and show it in a window."""
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.statusBar().showMessage("Decompiling with ILSpy...")
+        try:
+            type_name, method, text = code_links.method_source(link)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            self.statusBar().clearMessage()
+            log.warning("Couldn't decompile %s: %s", link["title"], e)
+            QMessageBox.warning(self, "C# code", str(e))
+            return
+        QApplication.restoreOverrideCursor()
+        self.statusBar().clearMessage()
+        header = f"// {os.path.basename(link['dll'])}  ›  {type_name}\n// decompiled with ILSpy\n\n"
+        view = QPlainTextEdit(header + text, readOnly=True)
+        view.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        view.setTabStopDistance(view.fontMetrics().horizontalAdvance(" ") * 4)
+        view.setWindowTitle(f"{type_name.rsplit('.', 1)[-1]}.{method} - {APP_SHORT}")
+        view.resize(760, 420)
+        view.setAttribute(Qt.WA_DeleteOnClose)
+        view.destroyed.connect(lambda *_: self._windows.remove(view) if view in self._windows else None)
+        self._windows.append(view)
+        view.show()
+        log.info("Showing decompiled %s.%s", type_name, method)
+
+    def _structure_nodes(self, asset):
+        """hierarchy() nodes of a prefab or scene for the info panel's Objects & scripts tab, or None."""
+        if asset.kind != "scene" or not hasattr(self.session, "hierarchy"):
+            return None
+        try:
+            return self.session.hierarchy(asset)
+        except Exception:
+            log.exception("Reading the objects of '%s' failed", asset.name)
+            return None
 
     def _retry_when_indexed(self, data):
         session = self.session
@@ -1148,6 +1247,48 @@ class MainWindow(QMainWindow):
         self._duplicates.show()
         self._duplicates.raise_()
         self._duplicates.activateWindow()
+
+    # ---- Mod Maker
+    def show_modmaker(self):
+        if self._modmaker is None:
+            self._modmaker = ModMakerDialog(self)
+        self._modmaker.show()
+        self._modmaker.refresh()
+        self._modmaker.raise_()
+        self._modmaker.activateWindow()
+
+    def replace_selected(self):
+        selected = self.selected_assets()
+        if not selected:
+            QMessageBox.information(self, "Mod Maker", "Select an asset first.")
+            return
+        self.replace_with_file(selected[0])
+
+    def replace_with_file(self, data):
+        folder = replace_asset(self, self.session, data, self.last_dir)
+        if folder is None:
+            return
+        self.last_dir = folder
+        count = len(modmaker.ModProject(self.session.path).edits)
+        self.statusBar().showMessage(f"'{data.name}' added to the mod ({count} replacement(s)) - "
+                                     "Mod → Mod Maker to install or export it", 8000)
+        if self._modmaker is not None and self._modmaker.isVisible():
+            self._modmaker.refresh()
+
+    def remove_replacement(self, data):
+        modmaker.ModProject(self.session.path).remove(data.uid)
+        self.statusBar().showMessage(f"'{data.name}' removed from the mod", 5000)
+        if self._modmaker is not None and self._modmaker.isVisible():
+            self._modmaker.refresh()
+
+    def unload_for_mod(self):
+        """Let go of the open game's files before Mod Maker replaces them."""
+        if self.loading_path:
+            self.unload_game(self.loading_path)
+
+    def reload_game(self):
+        if self.loading_path:
+            self.load(self.loading_path)
 
     def show_versions(self):
         if self._versions is None:
@@ -1351,6 +1492,11 @@ class MainWindow(QMainWindow):
         menu.addAction(("Remove from favorites" if fav else "Add to favorites") + "   Ctrl+D",
                        lambda: self.toggle_favorites(selected))
         menu.addAction("Show raw bytes   Ctrl+R", lambda: self.show_raw(data))
+        if modmaker.can_replace(self.session, data):
+            menu.addSeparator()
+            menu.addAction("Replace with file... (Mod Maker)", lambda: self.replace_with_file(data))
+            if modmaker.ModProject(self.session.path).edit_for(data.uid) is not None:
+                menu.addAction("Remove replacement from mod", lambda: self.remove_replacement(data))
         menu.addSeparator()
         menu.addAction("Save...", lambda: self.export_item(data))
         if len(selected) > 1:

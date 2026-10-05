@@ -3,24 +3,24 @@
 import logging
 import logging.handlers
 
-from PySide6.QtGui import QColor, QFontDatabase, QPalette, QTextCharFormat, QTextCursor
+from PySide6.QtGui import QColor, QFontDatabase, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import QCheckBox, QDockWidget, QHBoxLayout, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget
 
 from uniview.constants import CRASH_FILE, LOG_FILE
+from uniview.ui import theme
 from uniview.util import open_path
 
 
 class ConsoleDock(QDockWidget):
     """Bottom panel showing the log as it happens."""
 
-    COLORS = {logging.DEBUG: "#8a8a8a", logging.WARNING: "#e0a030",
-              logging.ERROR: "#ef5350", logging.CRITICAL: "#ff4081"}
+    COLORS = {logging.DEBUG: "FAINT", logging.WARNING: "WARNING", logging.ERROR: "DANGER"}  # theme tokens
 
     def __init__(self, handler, parent=None):
         super().__init__("Console", parent)
         self.setObjectName("console")
         self.handler = handler
-        self.text = QPlainTextEdit(readOnly=True)
+        self.text = QPlainTextEdit(readOnly=True, objectName="consoleText")
         self.text.setMaximumBlockCount(5000)
         self.text.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
         self.text.setLineWrapMode(QPlainTextEdit.NoWrap)
@@ -37,6 +37,8 @@ class ConsoleDock(QDockWidget):
 
         bar = QHBoxLayout()
         bar.setContentsMargins(0, 0, 0, 0)
+        for btn in (clear, open_log, open_crash):
+            btn.setFlat(True)
         for w in (debug, clear):
             bar.addWidget(w)
         bar.addStretch()
@@ -44,7 +46,7 @@ class ConsoleDock(QDockWidget):
         bar.addWidget(open_crash)
         body = QWidget()
         lay = QVBoxLayout(body)
-        lay.setContentsMargins(4, 0, 4, 4)
+        lay.setContentsMargins(8, 0, 8, 6)
         lay.addLayout(bar)
         lay.addWidget(self.text)
         self.setWidget(body)
@@ -54,7 +56,11 @@ class ConsoleDock(QDockWidget):
         bar = self.text.verticalScrollBar()
         at_bottom = bar.value() >= bar.maximum() - 4
         fmt = QTextCharFormat()
-        fmt.setForeground(QColor(self.COLORS.get(level, self.palette().color(QPalette.Text))))
+        # Plain lines get no colour of their own, so they follow the palette after a theme switch.
+        if level >= logging.CRITICAL:
+            fmt.setForeground(QColor("#ff4081"))
+        elif level in self.COLORS:
+            fmt.setForeground(QColor(getattr(theme, self.COLORS[level])))
         cursor = QTextCursor(self.text.document())
         cursor.movePosition(QTextCursor.End)
         if not self.text.document().isEmpty():

@@ -170,10 +170,11 @@ def test_texture_embedded_once_and_png(tmp_path):
     path = str(tmp_path / "m.glb")
     uv.write_glb(session, quad(), mats, path)
     gltf, buf = parse_glb(path)
-    assert session.calls == ["t1"]  # deduplicated by asset key, normal map not used
-    assert len(gltf["images"]) == 1 and len(gltf["textures"]) == 1
+    assert session.calls == ["t1", "n"]  # deduplicated by asset key
+    assert len(gltf["images"]) == 2 and len(gltf["textures"]) == 2
     for m in gltf["materials"]:
         assert m["pbrMetallicRoughness"]["baseColorTexture"] == {"index": 0}
+    assert gltf["materials"][0]["normalTexture"] == {"index": 1}
     view = gltf["bufferViews"][gltf["images"][0]["bufferView"]]
     assert "target" not in view
     png = buf[view["byteOffset"]:view["byteOffset"] + view["byteLength"]]

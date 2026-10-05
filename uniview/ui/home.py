@@ -8,8 +8,8 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-from PySide6.QtCore import QEvent, QFileInfo, QRect, QRectF, QSignalBlocker, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QImage, QPainter, QPalette, QPen, QPixmap
+from PySide6.QtCore import QEvent, QFileInfo, QPoint, QPointF, QRect, QRectF, QSignalBlocker, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -32,10 +32,12 @@ from PySide6.QtWidgets import (
 
 import engines
 from uniview.catalog import UNKNOWN_ENGINE, UNTAGGED, compat_entry, group_projects, project_shown
-from uniview.constants import APP_TITLE, log
+from uniview.constants import log
 from uniview.projects import detect_project_engine, engine_info_text, find_steam_games, game_exe
 from uniview.settings import COMPAT_STATUS, compat_report_url, fetch_compat, load_compat
+from uniview.ui import theme
 from uniview.ui.dialogs import EngineOptionsDialog, SteamPickDialog, TagsDialog, edit_project_notes
+from uniview.ui.theme import role
 
 
 def exe_icon_image(exe, size=96):
@@ -59,21 +61,20 @@ def exe_icon_image(exe, size=96):
 
 
 class CardDelegate(QStyledItemDelegate):
-    """Draws a game box: icon, name, counts, compatibility. Green = loaded, red = not loaded."""
+    """Draws a game box: icon on a darker band, name, counts, engine, compatibility. Loaded games get a
+    green "Loaded" pill, games whose folder is gone a red one; the rest stay plain."""
 
     STATE_ROLE = Qt.UserRole + 1
     SUB_ROLE = Qt.UserRole + 2
     PIN_ROLE = Qt.UserRole + 3
     NOTES_ROLE = Qt.UserRole + 4
     TAGS_ROLE = Qt.UserRole + 5
-    STYLES = {  # state: (border, fill)
-        "loaded": ("#43a047", QColor(67, 160, 71, 60)),
-        "unloaded": ("#e53935", QColor(229, 57, 53, 40)),
-        "missing": ("#888888", QColor(128, 128, 128, 35)),
-        "action": ("#666666", QColor(0, 0, 0, 0)),
-    }
-    SIZE = QSize(176, 244)
-    ICON = 80
+    COMPAT_ROLE = Qt.UserRole + 6
+    PILLS = {"loaded": ("Loaded", "SUCCESS"), "missing": ("Folder missing", "DANGER")}  # text, theme token
+    COMPAT_COLORS = {"works": "SUCCESS", "partial": "WARNING", "broken": "DANGER"}
+    SIZE = QSize(184, 222)
+    ICON = 72
+    BAND = 112  # height of the icon band at the top of a card (status pill above the icon)
 
     def sizeHint(self, option, index):
         return index.data(Qt.SizeHintRole) or self.SIZE  # group headers set their own (full-width) size
@@ -83,80 +84,140 @@ class CardDelegate(QStyledItemDelegate):
         if state == "header":
             self._paint_header(painter, option, index)
             return
-        border, fill = self.STYLES[state]
+        if state == "action":
+            self._paint_action(painter, option, index)
+            return
         hover = bool(option.state & QStyle.State_MouseOver)
-        rect = option.rect.adjusted(5, 5, -5, -5)
+        rect = QRectF(option.rect.adjusted(6, 6, -6, -6))
 
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
-        fill = QColor(fill)
-        if hover:
-            fill = QColor(61, 142, 230, 45) if state == "action" else QColor(fill.red(), fill.green(),
-                                                                              fill.blue(), fill.alpha() + 45)
-        border = QColor(border).lighter(135) if hover else QColor(border)
-        painter.setPen(QPen(border, 1 if state == "action" else 2))
-        painter.setBrush(fill)
-        painter.drawRoundedRect(QRectF(rect), 10, 10)
-
-        # Corner badges: pinned (top-right), has notes (top-left).
-        badge_font = QFont(option.font)
-        badge_font.setPointSizeF(option.font.pointSizeF() * 1.1)
-        painter.setFont(badge_font)
-        painter.setPen(QColor("#f4c542"))
-        if index.data(self.PIN_ROLE):
-            painter.drawText(QRect(rect.right() - 26, rect.top() + 6, 20, 20), Qt.AlignCenter, "\U0001F4CC")
-        if index.data(self.NOTES_ROLE):
-            painter.drawText(QRect(rect.left() + 6, rect.top() + 6, 20, 20), Qt.AlignCenter, "\U0001F4DD")
+        card = QPainterPath()
+        card.addRoundedRect(rect, 10, 10)
+        painter.fillPath(card, QColor(theme.HOVER if hover else theme.SURFACE))
+        # Icon band: the top of the card, a shade darker.
+        painter.save()
+        painter.setClipPath(card)
+        painter.fillRect(QRectF(rect.left(), rect.top(), rect.width(), self.BAND),
+                         QColor(theme.RAISED if hover else theme.BG))
+        painter.restore()
+        painter.setPen(QPen(QColor(theme.ACCENT if hover else theme.BORDER), 1.5 if hover else 1))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(card)
 
         icon = index.data(Qt.DecorationRole)
         if icon is not None:
-            icon.paint(painter, QRect(rect.center().x() - self.ICON // 2, rect.top() + 12, self.ICON, self.ICON))
-
-        text_rect = QRect(rect.left() + 8, rect.top() + 20 + self.ICON,
-                          rect.width() - 16, rect.height() - self.ICON - 26)
-        name_font = QFont(option.font)
-        name_font.setBold(True)
-        painter.setFont(name_font)
-        painter.setPen(option.palette.color(QPalette.Text))
-        flags = Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap
-        name = index.data(Qt.DisplayRole) or ""
-        painter.drawText(text_rect, flags, name)
+            if state == "missing":
+                painter.setOpacity(0.35)
+            top = rect.top() + self.BAND - self.ICON - 10
+            icon.paint(painter, QRect(int(rect.center().x() - self.ICON / 2), int(top), self.ICON, self.ICON))
+            painter.setOpacity(1.0)
 
         small = QFont(option.font)
-        small.setPointSizeF(max(7.0, option.font.pointSizeF() * 0.9))
+        small.setPointSizeF(max(7.0, option.font.pointSizeF() * 0.88))
+        r = rect.toRect()
+        # Status pill top-left; badges top-right: pinned, then notes.
+        painter.setFont(small)
+        badge_x = r.right() - 26
+        for badge_role, glyph in ((self.PIN_ROLE, "\U0001F4CC"), (self.NOTES_ROLE, "\U0001F4DD")):
+            if index.data(badge_role):
+                painter.drawText(QRect(badge_x, r.top() + 6, 20, 20), Qt.AlignCenter, glyph)
+                badge_x -= 22
+        pill = self.PILLS.get(state)
+        if pill:
+            self._paint_pill(painter, small, QPoint(r.left() + 7, r.top() + 7), pill[0], getattr(theme, pill[1]))
+
+        text_rect = QRect(r.left() + 12, r.top() + self.BAND + 10, r.width() - 24, r.height() - self.BAND - 18)
+        name_font = QFont(option.font)
+        name_font.setBold(True)
+        name_font.setPointSizeF(option.font.pointSizeF() * 1.05)
+        painter.setFont(name_font)
+        painter.setPen(QColor(theme.MUTED if state == "missing" else theme.TEXT))
+        name_metrics = QFontMetrics(name_font)
+        name = index.data(Qt.DisplayRole) or ""
+        flags = Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap
+        name_h = min(name_metrics.boundingRect(text_rect, flags, name).height(), name_metrics.lineSpacing() * 2)
+        painter.drawText(QRect(text_rect.left(), text_rect.top(), text_rect.width(), name_h), flags, name)
+
+        metrics = QFontMetrics(small)
+        painter.setFont(small)
+        y = text_rect.top() + name_h + 4
         tags = index.data(self.TAGS_ROLE)
-        tag_height = 0
+        bottom = text_rect.bottom() - (metrics.lineSpacing() if tags else 0)
+
+        def line(text, color):
+            nonlocal y
+            if y + metrics.height() > bottom:
+                return
+            painter.setPen(QColor(color))
+            painter.drawText(QRect(text_rect.left(), y, text_rect.width(), metrics.height()),
+                             Qt.AlignLeft | Qt.AlignVCenter, metrics.elidedText(text, Qt.ElideRight, text_rect.width()))
+            y += metrics.lineSpacing()
+
+        for text in (index.data(self.SUB_ROLE) or "").split("\n"):
+            if text:
+                line(text, theme.MUTED)
+        compat = index.data(self.COMPAT_ROLE)
+        if compat in COMPAT_STATUS:
+            line(COMPAT_STATUS[compat], getattr(theme, self.COMPAT_COLORS.get(compat, "MUTED")))
         if tags:
             # Tags sit on the bottom line of the box, cut short with "..." if they don't fit.
-            metrics = QFontMetrics(small)
-            tag_height = metrics.height() + 2
-            tag_rect = QRect(text_rect.left(), text_rect.bottom() - metrics.height(),
-                             text_rect.width(), metrics.height())
-            painter.setFont(small)
-            painter.setPen(QColor("#5aa0e6"))
+            painter.setPen(QColor(theme.ACCENT_HOVER))
             text = "  ".join(f"#{t}" for t in tags)
-            painter.drawText(tag_rect, Qt.AlignHCenter | Qt.AlignVCenter,
-                             metrics.elidedText(text, Qt.ElideRight, tag_rect.width()))
+            painter.drawText(QRect(text_rect.left(), text_rect.bottom() - metrics.height(), text_rect.width(),
+                                   metrics.height()), Qt.AlignLeft | Qt.AlignVCenter,
+                             metrics.elidedText(text, Qt.ElideRight, text_rect.width()))
+        painter.restore()
 
-        sub = index.data(self.SUB_ROLE)
-        if sub:
-            used = QFontMetrics(name_font).boundingRect(text_rect, flags, name).height()
-            painter.setFont(small)
-            painter.setPen(QColor("#a0a0a0"))
-            painter.drawText(text_rect.adjusted(0, used + 4, 0, -tag_height), flags, sub)
+    @staticmethod
+    def _paint_pill(painter, font, pos, text, color):
+        metrics = QFontMetrics(font)
+        h = metrics.height() + 6
+        box = QRectF(pos.x(), pos.y(), metrics.horizontalAdvance(text) + 26, h)
+        tint = QColor(color)
+        tint.setAlpha(50)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(tint)
+        painter.drawRoundedRect(box, h / 2, h / 2)
+        painter.setBrush(QColor(color))
+        painter.drawEllipse(QPointF(box.left() + 10, box.center().y()), 3.5, 3.5)
+        painter.setPen(QColor(color).lighter(125))
+        painter.drawText(box.adjusted(18, 0, -6, 0), Qt.AlignLeft | Qt.AlignVCenter, text)
+
+    def _paint_action(self, painter, option, index):
+        """'Add game' / 'Find games' boxes: dashed outline, icon and label in the middle."""
+        hover = bool(option.state & QStyle.State_MouseOver)
+        rect = QRectF(option.rect.adjusted(6, 6, -6, -6))
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor(theme.ACCENT if hover else theme.BORDER_STRONG), 1.5, Qt.DashLine))
+        tint = QColor(theme.ACCENT)
+        tint.setAlpha(28)
+        painter.setBrush(tint if hover else Qt.NoBrush)
+        painter.drawRoundedRect(rect, 10, 10)
+        icon = index.data(Qt.DecorationRole)
+        size = 40
+        center = rect.center()
+        if icon is not None:
+            icon.paint(painter, QRect(int(center.x() - size / 2), int(center.y() - size), size, size))
+        font = QFont(option.font)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor(theme.ACCENT_HOVER if hover else theme.MUTED))
+        painter.drawText(QRectF(rect.left() + 10, center.y() + 10, rect.width() - 20, rect.height() / 2 - 20),
+                         Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap, index.data(Qt.DisplayRole) or "")
         painter.restore()
 
     def _paint_header(self, painter, option, index):
-        rect = option.rect.adjusted(4, 0, -4, 0)
+        rect = option.rect.adjusted(6, 0, -6, 0)
         painter.save()
         font = QFont(option.font)
         font.setBold(True)
-        font.setPointSizeF(option.font.pointSizeF() * 1.15)
+        font.setPointSizeF(option.font.pointSizeF() * 1.1)
         painter.setFont(font)
-        painter.setPen(option.palette.color(QPalette.Text))
-        text = index.data(Qt.DisplayRole) or ""
-        painter.drawText(rect.adjusted(0, 0, 0, -4), Qt.AlignLeft | Qt.AlignBottom, text)
-        painter.setPen(QPen(QColor("#555555"), 1))
+        painter.setPen(QColor(theme.TEXT))
+        painter.drawText(rect.adjusted(0, 0, 0, -6), Qt.AlignLeft | Qt.AlignBottom, index.data(Qt.DisplayRole) or "")
+        painter.setPen(QPen(QColor(theme.BORDER), 1))
         y = rect.bottom() - 1
         painter.drawLine(rect.left(), y, rect.right(), y)
         painter.restore()
@@ -178,6 +239,7 @@ class HomePage(QWidget):
     open_requested = Signal(str)  # project path
     unload_requested = Signal(str)
     export_unity_requested = Signal(str)  # project path
+    decompile_requested = Signal(str)  # project path
     _counted = Signal(str, int)
     _scanned = Signal(str, bool, object, object)  # path, folder exists, exe, icon QImage
     _detected = Signal(str, object)
@@ -225,13 +287,9 @@ class HomePage(QWidget):
         self.refresh_timer = QTimer(self, singleShot=True, interval=150)
         self.refresh_timer.timeout.connect(self.refresh)
 
-        title = QLabel(APP_TITLE)
-        title.setStyleSheet("font-size: 22px; font-weight: bold;")
-        hint = QLabel("Pick a game to browse its models and textures.  "
-                      "<span style='color:#43a047'>Green</span> = already loaded (opens instantly), "
-                      "<span style='color:#e53935'>red</span> = not loaded yet.  "
-                      "Drag a game folder here to add it.")
-        hint.setStyleSheet("color: gray;")
+        title = role(QLabel("Your games"), "title")
+        hint = role(QLabel("Click a game to browse its assets. Games marked Loaded are already in memory and "
+                           "open instantly. Drag a game folder here to add it."), "muted")
 
         # Catalog bar: search, tag filter, grouping and sort order.
         self.search = QLineEdit(placeholderText="Search games...  e.g.  shooter tag:lowpoly engine:unity version:2019")
@@ -261,13 +319,14 @@ class HomePage(QWidget):
         self.sort_combo.currentIndexChanged.connect(lambda _: self._catalog_changed("home_sort",
                                                                                     self.sort_combo))
         self.count_label = QLabel()
-        self.count_label.setStyleSheet("color: gray;")
+        role(self.count_label, "muted")
         bar = QHBoxLayout()
+        bar.setSpacing(8)
         bar.addWidget(self.search, 1)
         bar.addWidget(self.engine_combo)
         bar.addWidget(self.tag_combo)
         bar.addWidget(self.group_combo)
-        bar.addWidget(QLabel("Sort:"))
+        bar.addWidget(role(QLabel("Sort"), "muted"))
         bar.addWidget(self.sort_combo)
         bar.addWidget(self.count_label)
 
@@ -279,7 +338,9 @@ class HomePage(QWidget):
         self.grid.setFocusPolicy(Qt.NoFocus)
         self.grid.setMouseTracking(True)
         self.grid.setItemDelegate(CardDelegate(self.grid))
-        self.grid.setStyleSheet("QListWidget { border: none; background: transparent; }")
+        self.grid.setStyleSheet("QListWidget { border: none; background: transparent; }"
+                                "QListWidget::item, QListWidget::item:hover, QListWidget::item:selected"
+                                " { background: transparent; }")
         self.grid.itemClicked.connect(self.on_activate)
         self.grid.setContextMenuPolicy(Qt.CustomContextMenu)
         self.grid.customContextMenuRequested.connect(self.on_context_menu)
@@ -290,10 +351,13 @@ class HomePage(QWidget):
         self.grid.viewport().installEventFilter(self)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setContentsMargins(28, 22, 28, 12)
+        lay.setSpacing(6)
         lay.addWidget(title)
         lay.addWidget(hint)
+        lay.addSpacing(10)
         lay.addLayout(bar)
+        lay.addSpacing(6)
         lay.addWidget(self.grid, 1)
         self.refresh()
         if self.settings.online_compat:
@@ -451,19 +515,19 @@ class HomePage(QWidget):
         engine = engine_info_text(project)
         tip = [path]
         if not exists:
-            state, lines = "missing", ["Folder missing"]
+            state, lines = "missing", [path]
         else:
             state = "loaded" if self.is_loaded(path) else "unloaded"
             files = project.get("file_count")
             parts = [f"{files:,} files" if files is not None else "counting files..."]
             if project.get("asset_count") is not None:
                 parts.append(f"{project['asset_count']:,} assets")
-            lines = [" · ".join(parts), "Loaded" if state == "loaded" else "Not loaded",
+            lines = [" · ".join(parts),
                      engine or ("detecting engine..." if "engine" not in project else "Unknown engine")]
         if engine:
             tip.append(engine)
         if compat and compat.get("status") in COMPAT_STATUS:
-            lines.append(COMPAT_STATUS[compat["status"]])
+            item.setData(CardDelegate.COMPAT_ROLE, compat["status"])
             if compat.get("notes"):
                 tip.append(f"Community notes: {compat['notes']}")
         if project.get("tags"):
@@ -530,7 +594,7 @@ class HomePage(QWidget):
                 self.grid.addItem(self._card_item(project))
         total = len(self.store.projects)
         self.count_label.setText(f"{len(shown)} of {total} games" if len(shown) != total else f"{total} games")
-        self.grid.addItem(self._action_item("＋ Add game", QStyle.SP_FileDialogNewFolder, self.ADD))
+        self.grid.addItem(self._action_item("Add game", QStyle.SP_FileDialogNewFolder, self.ADD))
         self.grid.addItem(self._action_item("Find games in Steam",
                                             QStyle.SP_FileDialogContentsView, self.FIND))
 
@@ -711,6 +775,7 @@ class HomePage(QWidget):
             menu.addAction("Unload from memory", lambda: self.unload_requested.emit(path))
         if project.get("engine") == "unity":
             menu.addAction("Export as Unity project...", lambda: self.export_unity_requested.emit(path))
+            menu.addAction("Decompile game code...", lambda: self.decompile_requested.emit(path))
         menu.addAction("Unpin" if project.get("pinned") else "Pin to top", lambda: self.toggle_pin(project))
         menu.addAction("Notes...", lambda: self.edit_notes(project))
         menu.addAction("Tags...", lambda: self.edit_tags(project))

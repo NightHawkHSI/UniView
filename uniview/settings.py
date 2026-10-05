@@ -15,7 +15,7 @@ from uniview.constants import COMPAT_BUNDLED, COMPAT_CACHE, COMPAT_URL, REPO_URL
 from uniview.projects import engine_info_text, steam_library_dirs
 from uniview.util import read_json, write_json
 
-SETTING_CHOICES = {"model_format": ("obj", "glb"), "view": ("list", "grid")}
+SETTING_CHOICES = {"model_format": ("obj", "glb"), "view": ("list", "grid"), "theme": ("system", "dark", "light")}
 
 _SETTINGS_INTERNAL = ("options", "path", "extra")
 
@@ -34,6 +34,7 @@ class Settings:
     volume: float = 0.7  # 0..1
     autoplay: bool = False
     view: str = "list"
+    theme: str = "dark"  # dark / light / system (follow Windows)
     home_engine: str = ""
     home_group: str = "engine"
     home_sort: str = "recent"

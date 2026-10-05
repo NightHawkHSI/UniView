@@ -43,6 +43,19 @@ def test_node_text_labels_refs_and_values():
     assert "UnityEngine.UI.Image" in root and "m_Color.r = 0.5" in root and "m_RaycastTarget = true" in root
 
 
+def test_components_mark_scripts_and_keep_referenced_assets():
+    comps = prefab_info.components(nodes()[0], nodes(), assets())
+    assert [(c["title"], c["script"]) for c in comps] == [("UnityEngine.UI.Image", True)]
+    sprite_row = comps[0]["rows"][0]
+    assert sprite_row[0] == "m_Sprite" and sprite_row[2].uid == "s1"
+    audio = prefab_info.components(nodes()[1], nodes(), assets())[0]
+    assert audio["script"] is False and audio["rows"][1][2] is None  # ref to a node, not an asset
+
+
+def test_scripts_listed_once():
+    assert prefab_info.scripts(nodes() + nodes()) == ["UnityEngine.UI.Image"]
+
+
 def test_summary_and_component_names():
     assert prefab_info.component_names(nodes()[0]) == ["Image"]
     assert prefab_info.summary(nodes()).startswith("3 object(s)")

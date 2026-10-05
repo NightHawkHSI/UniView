@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 
 from uniview import prefab_info
 from uniview.ui.media import ImageView
+from uniview.ui.theme import role
 
 
 class PrefabView(QWidget):
@@ -57,7 +58,7 @@ class PrefabView(QWidget):
         links_lay.addWidget(self.links_title)
         links_lay.addWidget(self.links, 1)
         hint = QLabel("Click one to jump to it.")
-        hint.setStyleSheet("color: gray;")
+        role(hint, "muted")
         links_lay.addWidget(hint)
 
         self.picture = ImageView(show_links=False)

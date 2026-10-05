@@ -116,6 +116,10 @@ Unreal notes:
 - **Bulk export** of all models, all textures, everything shown in the list, or a selection. It can **keep the game's folder structure** (e.g. `assets/prefabs/weapons/...`) so big dumps stay easy to browse.
 - **Export as Unity project** (Unity games: right-click the game on the Projects page): a folder you open with Unity Hub, with the game's textures, models (GLB via Unity's glTFast package), materials, sounds, fonts and text, and its **prefabs and scenes rebuilt** by a small editor script the first time Unity opens it (menu **UniView → Rebuild prefabs and scenes**). The game's code comes along so prefabs and scenes keep their script components and saved values: Mono games ship their compiled assemblies (plus decompiled C# with the optional ILSpy tool); for IL2CPP games the optional **Cpp2IL** tool rebuilds the script classes from the game's metadata (fields and attributes only - the scripts don't run). Custom shaders aren't included: materials go on Unity's built-in shaders.
 
+**Modding (Unity games)**
+- **Mod Maker** (Mod → Mod Maker, Ctrl+M): right-click a texture, sprite, text asset, data asset, font, sound or model → **Replace with file...** and pick your PNG / text / JSON / TTF / WAV, OGG, MP3, FLAC / GLB, OBJ. Sprites are pasted into their sprite sheet; data assets take the JSON that **Save...** writes, edited (fields keep their types). Sounds are stored uncompressed (16-bit PCM), so they take more space than the game's own. Models keep the game mesh's vertex layout: save the model as GLB, edit it in Blender, export GLB and replace; what your file doesn't have (lightmap UVs, a character's bone weights) is copied from the nearest original vertex, so reshaped characters keep their rig. Scene objects merged by Unity's static batching are drawn from the scene's *Combined Mesh*, not their own mesh.
+- **Install into game** rewrites only the changed game files (`.assets` or AssetBundles), backs up the originals first, and reloads the game. **Restore original files** puts them back. **Export mod folder...** writes the modded files + a README to share instead. For Addressables games (`StreamingAssets/aa`), the catalog's CRC check is switched off for the modded bundles so the game still loads them.
+
 **Projects page**
 - A box for each game. **Green** means its assets are already loaded; **red** means they aren't loaded yet. Each box shows file/asset counts and how well the game works with UniView.
 - **Drag and drop** a game folder onto the page to add it, or use **Find games in Steam**, which lists every game an engine plugin recognizes.
@@ -201,3 +205,16 @@ To add or update a game, right-click it in UniView → **Report compatibility...
 ## Notes
 
 - Extracted assets are still owned by the game's creators. Viewing them for personal use is fine, but check before sharing them.
+
+## Legal Disclaimers
+
+- UniView is licensed under the [GNU General Public License v3.0](LICENSE).
+- UniView is not sponsored by or affiliated with Unity Technologies, Epic Games, Valve Corporation, ZeniMax Media / Bethesda Softworks, Epic Games Tools (RAD Game Tools), or any game developer or publisher, or their affiliates.
+- "Unity" is a registered trademark of Unity Technologies or its affiliates in the U.S. and elsewhere.
+- "Unreal" and "Unreal Engine" are trademarks or registered trademarks of Epic Games, Inc. in the U.S. and elsewhere.
+- "Source", "Steam" and "Valve" are trademarks or registered trademarks of Valve Corporation.
+- "Fallout" is a trademark or registered trademark of ZeniMax Media Inc.
+- "Oodle" is a trademark of Epic Games Tools LLC.
+- "FMOD" is a trademark of Firelight Technologies Pty Ltd. UniView uses the FMOD Engine, copyright © Firelight Technologies Pty Ltd.
+- All other trademarks and game names belong to their respective owners and are used only to identify compatible games.
+- The [Credits](CREDITS.md) page contains a list of attributions.

@@ -116,9 +116,11 @@ def plan_assemblies(managed, script_assemblies, packages=None):
     return decompile, libraries
 
 
-def decompile(ilspycmd, dll, out_dir, reference_dir, language="CSharp9_0", timeout=600, cancelled=None):
+def decompile(ilspycmd, dll, out_dir, reference_dir, language="CSharp9_0", timeout=600, cancelled=None,
+              keep_project=False):
     """Decompile one assembly to a folder of .cs files (one per type). Returns the number of files.
-    ilspycmd: the command (list, or one path) that runs ilspycmd. cancelled() -> True stops it early."""
+    ilspycmd: the command (list, or one path) that runs ilspycmd. cancelled() -> True stops it early.
+    keep_project: keep ILSpy's .csproj, Properties and resources (for reading the code in an IDE, not Unity)."""
     from uniview.tools import ilspy_env
     os.makedirs(out_dir, exist_ok=True)
     command = list(ilspycmd) if isinstance(ilspycmd, (list, tuple)) else [ilspycmd]
@@ -139,6 +141,8 @@ def decompile(ilspycmd, dll, out_dir, reference_dir, language="CSharp9_0", timeo
                 raise RuntimeError("stopped" if cancelled is not None and cancelled() else "took too long")
     if proc.returncode != 0:
         raise RuntimeError((err or out or "ilspycmd failed").strip().splitlines()[-1])
+    if keep_project:
+        return sum(name.endswith(".cs") for _b, _d, files in os.walk(out_dir) for name in files)
     # Project files and assembly attributes would clash when everything compiles into Unity's assemblies;
     # extracted resources (odd names, binary data) are no use to Unity either.
     shutil.rmtree(os.path.join(out_dir, "Properties"), ignore_errors=True)

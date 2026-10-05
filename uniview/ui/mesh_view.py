@@ -8,39 +8,49 @@ import pyvista as pv
 from PySide6.QtCore import QEvent, QSignalBlocker, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
-    QCheckBox,
+    QApplication,
     QComboBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMenu,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSplitter,
+    QTabWidget,
+    QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 from pyvistaqt import QtInteractor
 
+from uniview import prefab_info
 from uniview.constants import log
 from uniview.util import fmt_distance, wheel_steps
+from uniview.ui import theme
+from uniview.ui.theme import role
 
 
 class MeshInfoPanel(QWidget):
     """Right-hand panel for a model: stats, source file, materials and their textures."""
 
     apply_texture = Signal(object)  # texture Asset
-    open_texture = Signal(object)   # jump to the texture in the asset list
+    open_texture = Signal(object)   # jump to an asset (texture, or anything a component references) in the list
     save_texture = Signal(object)
     save_model = Signal()
     open_blender = Signal()
+    show_code = Signal(object)      # a uniview.code_links link to decompile and show
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.title = QLabel()
         self.title.setWordWrap(True)
-        self.title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        role(self.title, "heading")
         self.details = QLabel()
         self.details.setWordWrap(True)
         self.details.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -55,11 +65,11 @@ class MeshInfoPanel(QWidget):
         self.textures.customContextMenuRequested.connect(self._context_menu)
         hint = QLabel("Click a texture to put it on the model. Double-click to jump to it in the list.")
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: gray;")
+        role(hint, "muted")
 
         save_tex = QPushButton("Save selected texture...")
         save_tex.clicked.connect(self._save_selected)
-        save_model = QPushButton("Save model...")
+        save_model = role(QPushButton("Save model..."), "primary")
         save_model.setToolTip("OBJ + MTL + PNG textures, or a single GLB with the textures inside.\n"
                               "Both open textured in Blender.")
         save_model.clicked.connect(self.save_model)
@@ -67,17 +77,213 @@ class MeshInfoPanel(QWidget):
         blender.setToolTip("Exports the model as GLB and opens it in Blender (Ctrl+B).")
         blender.clicked.connect(self.open_blender)
 
+        # Objects & scripts (prefabs / scenes): GameObject tree with each object's components and their values.
+        self.objects_summary = role(QLabel(), "muted")
+        self.objects_filter = QLineEdit(placeholderText="Filter objects and components...")
+        self.objects_filter.setClearButtonEnabled(True)
+        self.objects_filter.textChanged.connect(self._filter_objects)
+        self.objects = QTreeWidget()
+        self.objects.setHeaderLabels(["Name", "Value"])
+        self.objects.setColumnWidth(0, 200)
+        self.objects.setUniformRowHeights(True)
+        self.objects.setToolTip("Every object in the prefab with its components (scripts in blue).\n"
+                                "Open a component to see its values; double-click a referenced asset to jump to it.")
+        self.objects.itemExpanded.connect(self._fill_component)
+        self.objects.itemDoubleClicked.connect(self._object_double_clicked)
+        self.objects.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.objects.customContextMenuRequested.connect(self._objects_menu)
+        self._structure = None  # (nodes, by_uid) shown in the objects tree
+
+        materials_page = QWidget()
+        ml = QVBoxLayout(materials_page)
+        ml.setContentsMargins(0, 6, 0, 0)
+        ml.addWidget(self.textures, 1)
+        ml.addWidget(hint)
+        objects_page = QWidget()
+        ol = QVBoxLayout(objects_page)
+        ol.setContentsMargins(0, 6, 0, 0)
+        ol.addWidget(self.objects_summary)
+        ol.addWidget(self.objects_filter)
+        ol.addWidget(self.objects, 1)
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.addTab(materials_page, "Materials")
+        self.tabs.addTab(objects_page, "Objects && scripts")
+        self.materials_label = role(QLabel("MATERIALS & TEXTURES"), "section")
+        self._prefer_objects = True  # open prefabs on the objects tab until the user picks Materials
+        self.tabs.tabBarClicked.connect(lambda i: setattr(self, "_prefer_objects", i == 1))
+        self.tabs.currentChanged.connect(lambda i: save_tex.setVisible(i == 0))
+
+        # Stats on top, tabs below, with a handle between them (a prefab's stats run long).
+        details_scroll = QScrollArea()
+        details_scroll.setWidgetResizable(True)
+        details_scroll.setFrameShape(QScrollArea.NoFrame)
+        details_scroll.setWidget(self.details)
+        details_scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
+        bottom = QWidget()
+        bl = QVBoxLayout(bottom)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.addWidget(self.materials_label)
+        bl.addWidget(self.tabs, 1)
+        self.split = QSplitter(Qt.Vertical)
+        self.split.setChildrenCollapsible(False)
+        self.split.addWidget(details_scroll)
+        self.split.addWidget(bottom)
+        self.split.setStretchFactor(1, 1)
+        self.split.setSizes([170, 500])
+
+        self.setObjectName("sidePanel")
+        self.setAttribute(Qt.WA_StyledBackground, True)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(6, 0, 0, 0)
+        lay.setContentsMargins(14, 12, 12, 12)
+        lay.setSpacing(6)
         lay.addWidget(self.title)
-        lay.addWidget(self.details)
-        lay.addWidget(QLabel("<b>Materials &amp; textures</b>"))
-        lay.addWidget(self.textures, 1)
-        lay.addWidget(hint)
+        lay.addWidget(self.split, 1)
         lay.addWidget(save_tex)
         lay.addWidget(save_model)
         lay.addWidget(blender)
         self._items = {}  # thumb key -> [QListWidgetItem]
+        self.set_structure(None)
+
+    # ---- objects & scripts
+    def set_structure(self, nodes, by_uid=None, game_entries=None):
+        """Show a prefab/scene's GameObjects and components (hierarchy() nodes), or hide the tab (None).
+        game_entries: game data that names the prefab ([{"title", "rows": [(field, value)], "links"}],
+        see uniview.game_data / code_links), shown as a "Game data" group on top."""
+        has = bool(nodes)
+        self.tabs.setTabVisible(1, has)
+        self.tabs.tabBar().setVisible(has)
+        self.materials_label.setVisible(not has)
+        self.objects.clear()
+        self.objects_filter.clear()
+        self._structure = (nodes, by_uid or {}) if has else None
+        if not has:
+            self.tabs.setCurrentIndex(0)
+            return
+        visible = prefab_info.visible_flags(nodes)
+        scripts = prefab_info.scripts(nodes)
+        data = f" · {len(game_entries)} game data entr{'y' if len(game_entries) == 1 else 'ies'}" \
+            if game_entries else ""
+        self.objects_summary.setText(f"{len(nodes):,} object(s) · {len(scripts)} script(s){data}"
+                                     + ("  (hover for the list)" if scripts else ""))
+        self.objects_summary.setToolTip("Scripts used:\n" + "\n".join(scripts) if scripts else "")
+        bold = self.objects.font()
+        bold.setBold(True)
+        muted, accent = QColor(theme.MUTED), QColor(theme.ACCENT_HOVER)
+        items = []
+        for i, n in enumerate(nodes):
+            names = prefab_info.component_names(n)
+            item = QTreeWidgetItem([n["name"], ", ".join(names)])
+            item.setFont(0, bold)
+            item.setForeground(1, muted)
+            state = prefab_info.node_state(nodes, i, visible)
+            p, s = n.get("pos") or (0, 0, 0), n.get("scale") or (1, 1, 1)
+            item.setToolTip(0, "\n".join([n["name"]] + state + [f"position ({p[0]:g}, {p[1]:g}, {p[2]:g})",
+                                                              f"scale ({s[0]:g}, {s[1]:g}, {s[2]:g})"]))
+            if not visible[i]:
+                item.setForeground(0, muted)
+            for comp in prefab_info.components(n, nodes, by_uid or {}):
+                child = QTreeWidgetItem([comp["title"].rsplit(".", 1)[-1], "script" if comp["script"] else ""])
+                child.setToolTip(0, comp["title"])
+                child.setForeground(1, muted)
+                if comp["script"]:
+                    child.setForeground(0, accent)
+                child.setData(0, Qt.UserRole + 1, comp["rows"])  # filled in when opened
+                if comp["rows"]:
+                    child.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+                item.addChild(child)
+            parent = n.get("parent", -1)
+            if 0 <= parent < len(items):
+                items[parent].addChild(item)
+            else:
+                self.objects.addTopLevelItem(item)
+            items.append(item)
+        for item in items[:1]:
+            item.setExpanded(True)
+        if game_entries:
+            self._add_game_data(game_entries, bold, muted, accent)
+        if self._prefer_objects:
+            self.tabs.setCurrentIndex(1)
+
+    def _add_game_data(self, entries, bold, muted, accent):
+        group = QTreeWidgetItem(["Game data", f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'} name this"])
+        group.setFont(0, bold)
+        group.setForeground(1, muted)
+        group.setToolTip(0, "Entries in the game's data tables (JSON text assets) that name this prefab.\n"
+                            "Data-driven games keep an item's gameplay values here instead of on the prefab.")
+        for entry in entries:
+            item = QTreeWidgetItem([entry["title"], f"{len(entry['rows'])} field(s)"])
+            item.setToolTip(0, entry["title"])
+            item.setForeground(1, muted)
+            for link in entry.get("links") or []:
+                code = QTreeWidgetItem(["C# code", f"{link['title']}  (double-click)"])
+                code.setForeground(0, accent)
+                code.setForeground(1, accent)
+                code.setData(0, Qt.UserRole + 2, link)
+                code.setToolTip(0, "Decompile the game function that runs this:\n" + "\n".join(
+                    f"{t.rsplit('.', 1)[-1]}.{m}" for t in link["types"] for m in link["methods"]))
+                item.addChild(code)
+            item.setData(0, Qt.UserRole + 1, [(field, value, None) for field, value in entry["rows"]])
+            item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+            group.addChild(item)
+        self.objects.insertTopLevelItem(0, group)
+        group.setExpanded(True)
+        # Open the entries that link to code (else the first one) so the main facts show straight away.
+        linked = [i for i, e in enumerate(entries) if e.get("links")] or [0]
+        for i in linked:
+            group.child(i).setExpanded(True)
+
+    def _fill_component(self, item):
+        rows = item.data(0, Qt.UserRole + 1)
+        if rows is None:
+            return
+        item.setData(0, Qt.UserRole + 1, None)
+        link = QColor(theme.ACCENT_HOVER)
+        for field, value, asset in rows:
+            row = QTreeWidgetItem([field, value])
+            row.setToolTip(0, field)
+            row.setToolTip(1, value)
+            if asset is not None:
+                row.setData(0, Qt.UserRole, asset)
+                row.setForeground(1, link)
+            item.addChild(row)
+
+    def _filter_objects(self, text):
+        terms = text.lower().split()
+
+        def walk(item):
+            own = all(t in (item.text(0) + " " + item.toolTip(0)).lower() for t in terms)
+            shown = False
+            for i in range(item.childCount()):
+                shown |= walk(item.child(i))
+            visible = not terms or own or shown
+            item.setHidden(not visible)
+            if terms and shown:
+                item.setExpanded(True)
+            return visible
+
+        for i in range(self.objects.topLevelItemCount()):
+            walk(self.objects.topLevelItem(i))
+
+    def _object_double_clicked(self, item, _column):
+        if item.data(0, Qt.UserRole + 2):
+            self.show_code.emit(item.data(0, Qt.UserRole + 2))
+        elif item.data(0, Qt.UserRole):
+            self.open_texture.emit(item.data(0, Qt.UserRole))
+
+    def _objects_menu(self, pos):
+        item = self.objects.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        asset = item.data(0, Qt.UserRole)
+        if asset:
+            menu.addAction("Go to asset in list", lambda: self.open_texture.emit(asset))
+        menu.addAction("Copy", lambda: QApplication.clipboard().setText(
+            f"{item.text(0)} = {item.text(1)}" if item.text(1) else item.text(0)))
+        menu.addAction("Expand all", self.objects.expandAll)
+        menu.addAction("Collapse all", self.objects.collapseAll)
+        menu.exec(self.objects.viewport().mapToGlobal(pos))
 
     def set_info(self, name, details_html, materials, blank_icon):
         """Fill the panel; returns the texture Assets that need thumbnails."""
@@ -149,13 +355,26 @@ class MeshInfoPanel(QWidget):
         menu.addAction("Save texture (PNG)...", lambda: self.save_texture.emit(data))
         menu.exec(self.textures.viewport().mapToGlobal(pos))
 
+def tool_button(icon_name, tip, checkable=True, checked=False):
+    """Icon-only toolbar button (theme line icon, accent-coloured while checked)."""
+    btn = QToolButton(checkable=checkable, checked=checked, toolTip=tip)
+    role(btn, "icon")
+    btn.setIconSize(QSize(18, 18))
+    btn.setCursor(Qt.PointingHandCursor)
+    return theme.set_icon(btn, icon_name)
+
+
 class MeshView(QWidget):
     uv_layout_requested = Signal()
+
+    def _set_background(self):
+        self.plotter.set_background(theme.VIEWPORT_BOTTOM, top=theme.VIEWPORT_TOP)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.plotter = QtInteractor(self)
-        self.plotter.set_background("#2b2b2b")
+        self._set_background()
+        theme.on_change(self._set_background, self)
         # Handle the mouse wheel ourselves so zoom works regardless of focus/touchpad.
         self.plotter.interactor.installEventFilter(self)
         self.poly = None
@@ -166,43 +385,36 @@ class MeshView(QWidget):
         self.flat = False        # 2D content: straight-on view without perspective
         self.gizmos = {}         # kind -> (points, segments) line overlays
 
-        self.wire = QCheckBox("Wireframe")
-        self.edges = QCheckBox("Edges")
-        self.use_tex = QCheckBox("Texture")
-        self.use_tex.setChecked(True)
-        self.flip_v = QCheckBox("Flip texture V")
-        self.tex_alpha = QCheckBox("Texture alpha")
-        self.tex_alpha.setToolTip("Use the texture's alpha channel as transparency.\n"
-                                  "Off by default: many games store other data there.")
-        self.use_colors = QCheckBox("Vertex colors")
-        self.use_colors.setChecked(True)
-        self.show_gizmos = QCheckBox("Gizmos")
-        self.show_gizmos.setToolTip("Draw colliders (green, triggers yellow), light ranges (orange), camera views\n"
-                                    "(white) and sound sources (cyan) as wire shapes.")
+        self.wire = tool_button("wireframe", "Wireframe")
+        self.edges = tool_button("solid", "Edges: draw the triangle edges over the model")
+        self.use_tex = tool_button("texture", "Texture", checked=True)
+        self.flip_v = tool_button("flip", "Flip texture V (for upside-down textures)")
+        self.tex_alpha = tool_button("alpha", "Texture alpha: use the texture's alpha channel as transparency.\n"
+                                     "Off by default: many games store other data there.")
+        self.use_colors = tool_button("colors", "Vertex colors", checked=True)
+        self.show_gizmos = tool_button("gizmo", "Gizmos: draw colliders (green, triggers yellow), light ranges "
+                                       "(orange),\ncamera views (white) and sound sources (cyan) as wire shapes.")
         self.show_gizmos.setEnabled(False)
         for cb in (self.wire, self.edges, self.use_tex, self.flip_v, self.tex_alpha, self.use_colors,
                    self.show_gizmos):
             cb.toggled.connect(self.redraw)
-        zoom_in = QPushButton("+")
-        zoom_out = QPushButton("−")
+        zoom_in = tool_button("zoom_in", "Zoom in (or use the mouse wheel)", checkable=False)
+        zoom_out = tool_button("zoom_out", "Zoom out (or use the mouse wheel)", checkable=False)
         for btn, factor in ((zoom_in, 1.25), (zoom_out, 0.8)):
-            btn.setFixedWidth(32)
-            btn.setToolTip("Zoom (or use the mouse wheel)")
             btn.clicked.connect(lambda _=False, f=factor: self.zoom(f))
-        reset = QPushButton("Reset camera")
+        reset = tool_button("reset", "Reset camera", checkable=False)
         reset.clicked.connect(self.reset_camera)
-        self.fly = QCheckBox("Fly (F)")
-        self.fly.setToolTip("Walk/fly through the scene like a game camera:\n"
-                            "WASD move, Q/E down/up, drag to look around, Shift faster,\n"
-                            "mouse wheel changes speed, double-click a spot to jump there.\n"
-                            "F toggles it, Esc leaves it.")
+        self.fly = tool_button("fly", "Fly (F): walk/fly through the scene like a game camera.\n"
+                               "WASD move, Q/E down/up, drag to look around, Shift faster,\n"
+                               "mouse wheel changes speed, double-click a spot to jump there.\n"
+                               "F toggles it, Esc leaves it.")
         self.fly.toggled.connect(self.set_fly)
         self.uv_combo = QComboBox()
         self.uv_combo.setToolTip("Which UV set maps the texture.\n"
                                  "UV0 is the normal one; UV1 is often the baked-lighting (lightmap) layout.")
         self.uv_combo.currentTextChanged.connect(self.set_uv_channel)
-        uv_layout = QPushButton("UV layout")
-        uv_layout.setToolTip("Show the UV triangles drawn over the texture (Ctrl+U).")
+        uv_layout = tool_button("uv", "UV layout: show the UV triangles drawn over the texture (Ctrl+U).",
+                                checkable=False)
         uv_layout.clicked.connect(self.uv_layout_requested)
 
         self.info = QLabel()
@@ -217,7 +429,7 @@ class MeshView(QWidget):
         self._fly_timer = QTimer(self, interval=16)
         self._fly_timer.timeout.connect(self._fly_tick)
         self.fly_hint = QLabel()
-        self.fly_hint.setStyleSheet("color: #9ecbff;")
+        role(self.fly_hint, "accent")
         self.speed_slider = QSlider(Qt.Horizontal)
         self.speed_slider.setRange(0, self.SPEED_STEPS)
         self.speed_slider.setValue(self.SPEED_STEPS // 2)
@@ -265,10 +477,26 @@ class MeshView(QWidget):
         ab.addWidget(self.anim_label)
         ab.addWidget(anim_stop)
         self.anim_bar.hide()
-        bar = QHBoxLayout()
-        for w in (self.wire, self.edges, self.use_tex, self.flip_v, self.tex_alpha, self.use_colors,
-                  self.show_gizmos, zoom_in, zoom_out, reset, self.fly, QLabel("UV:"), self.uv_combo, uv_layout):
-            bar.addWidget(w)
+        role(self.info, "muted")
+        toolbar = QWidget(objectName="viewerBar")
+        toolbar.setAttribute(Qt.WA_StyledBackground, True)
+        bar = QHBoxLayout(toolbar)
+        bar.setContentsMargins(8, 6, 8, 6)
+        bar.setSpacing(4)
+        groups = ((self.use_tex, self.flip_v, self.tex_alpha, self.use_colors),
+                  (self.wire, self.edges, self.show_gizmos),
+                  (zoom_in, zoom_out, reset, self.fly),
+                  (role(QLabel("UV"), "muted"), self.uv_combo, uv_layout))
+        for i, group in enumerate(groups):
+            if i:
+                bar.addSpacing(8)
+                sep = QWidget(objectName="vsep")
+                sep.setAttribute(Qt.WA_StyledBackground, True)
+                sep.setFixedSize(1, 18)
+                bar.addWidget(sep)
+                bar.addSpacing(8)
+            for w in group:
+                bar.addWidget(w)
         bar.addStretch()
         bar.addWidget(self.info)
 
@@ -277,11 +505,12 @@ class MeshView(QWidget):
         split.addWidget(self.plotter.interactor)
         split.addWidget(self.panel)
         split.setStretchFactor(0, 1)
-        split.setSizes([800, 300])
+        split.setSizes([760, 360])
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.addLayout(bar)
+        lay.setSpacing(0)
+        lay.addWidget(toolbar)
         lay.addWidget(self.fly_bar)
         lay.addWidget(self.anim_bar)
         lay.addWidget(split, 1)

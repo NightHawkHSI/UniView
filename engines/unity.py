@@ -917,6 +917,38 @@ class ScriptReader:
                              "reader doesn't support yet); showing the common fields only."
         return tree, note
 
+    def layout(self, obj):
+        """Field layout (TypeTreeNode) that reads all of obj's data, or None. Writing the object back needs
+        one: a layout that stops early would cut off the fields after it."""
+        st = obj.serialized_type
+        candidates = []
+        if st is not None and st.node is not None:
+            candidates.append(st.node)
+        else:
+            node = self._embedded_layouts().get(script_class(obj))
+            if node is not None:
+                candidates.append(node)
+        for node in candidates:
+            try:
+                obj.read_typetree(nodes=node)
+                return node
+            except Exception:
+                pass
+        self._setup()
+        previous = self.env.typetree_generator
+        try:
+            for gen in self.generators:
+                self.env.typetree_generator = gen
+                try:
+                    node = obj._get_typetree_node()
+                    obj.read_typetree(nodes=node)
+                    return node
+                except Exception:
+                    continue
+        finally:
+            self.env.typetree_generator = previous
+        return None
+
 
 def find_strings(data, min_len=2):
     """Text stored the way Unity serializes strings (int32 length, UTF-8, aligned to 4) in undecoded bytes."""

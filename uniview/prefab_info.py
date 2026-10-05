@@ -63,10 +63,9 @@ def prop_value(entry, nodes, by_uid):
     return str(entry["v"])
 
 
-def node_text(nodes, index, by_uid, visible=None):
-    """Readable description of one GameObject and its components."""
+def node_state(nodes, index, visible=None):
+    """'inactive', tag and layer of a GameObject as short phrases."""
     n = nodes[index]
-    lines = [n["name"]]
     state = []
     if not n.get("active", True):
         state.append("inactive")
@@ -76,30 +75,61 @@ def node_text(nodes, index, by_uid, visible=None):
         state.append(f"tag {n['tag']}")
     if n.get("layer"):
         state.append(f"layer {n['layer']}")
+    return state
+
+
+def components(node, nodes, by_uid):
+    """A GameObject's components, Transform left out:
+    [{"title", "script" (bool: a MonoBehaviour), "rows": [(field, value text, referenced Asset or None)]}]."""
+    out = []
+    if node.get("mesh") or node.get("batch"):
+        uid = node.get("mesh") or node["batch"]["mesh"]
+        mesh = by_uid.get(uid)
+        name = "SkinnedMeshRenderer" if node.get("skinned") else "MeshRenderer"
+        out.append({"title": name + ("" if node.get("renderer_enabled", True) else " (disabled)"), "script": False,
+                    "rows": [("mesh", mesh.name if mesh is not None else uid, mesh)]})
+    if node.get("light"):
+        light = node["light"]
+        kinds = {0: "Spot", 1: "Directional", 2: "Point", 3: "Area"}
+        out.append({"title": f"Light ({kinds.get(light['type'], light['type'])})", "script": False,
+                    "rows": [("intensity", f"{light['intensity']:g}", None), ("range", f"{light['range']:g}", None)]})
+    for c in node.get("components") or []:
+        props = c.get("props") or []
+        rows = []
+        for entry in props[:MAX_PROPS]:
+            if entry["p"].endswith(".Array.size"):
+                continue
+            asset = by_uid.get(entry.get("asset")) if entry["t"] == "ref" else None
+            rows.append((_short_path(entry["p"]), prop_value(entry, nodes, by_uid), asset))
+        if len(props) > MAX_PROPS:
+            rows.append((f"... {len(props) - MAX_PROPS:,} more values", "", None))
+        out.append({"title": c.get("script") or c["type"], "script": c["type"] == "MonoBehaviour", "rows": rows})
+    return out
+
+
+def scripts(nodes):
+    """Script classes used anywhere in the prefab, each once, in order of first use."""
+    seen = {}
+    for n in nodes:
+        for c in n.get("components") or []:
+            if c["type"] == "MonoBehaviour" and c.get("script"):
+                seen.setdefault(c["script"], None)
+    return list(seen)
+
+
+def node_text(nodes, index, by_uid, visible=None):
+    """Readable description of one GameObject and its components."""
+    n = nodes[index]
+    lines = [n["name"]]
+    state = node_state(nodes, index, visible)
     if state:
         lines.append("  " + ", ".join(state))
     p, s = n.get("pos") or (0, 0, 0), n.get("scale") or (1, 1, 1)
     lines.append(f"  position ({p[0]:g}, {p[1]:g}, {p[2]:g})   scale ({s[0]:g}, {s[1]:g}, {s[2]:g})")
-    if n.get("mesh") or n.get("batch"):
-        uid = n.get("mesh") or n["batch"]["mesh"]
-        mesh = by_uid.get(uid)
-        lines += ["", "MeshRenderer" + ("" if n.get("renderer_enabled", True) else " (disabled)"),
-                  f"  mesh = {mesh.name if mesh is not None else uid}"]
-    if n.get("light"):
-        light = n["light"]
-        kinds = {0: "Spot", 1: "Directional", 2: "Point", 3: "Area"}
-        lines += ["", f"Light ({kinds.get(light['type'], light['type'])})",
-                  f"  intensity {light['intensity']:g}, range {light['range']:g}"]
-    for c in n.get("components") or []:
-        title = c.get("script") or c["type"]
-        lines += ["", title]
-        props = c.get("props") or []
-        for entry in props[:MAX_PROPS]:
-            if entry["p"].endswith(".Array.size"):
-                continue
-            lines.append(f"  {_short_path(entry['p'])} = {prop_value(entry, nodes, by_uid)}")
-        if len(props) > MAX_PROPS:
-            lines.append(f"  ... {len(props) - MAX_PROPS:,} more values")
+    for comp in components(n, nodes, by_uid):
+        lines += ["", comp["title"]]
+        for field, value, _asset in comp["rows"]:
+            lines.append(f"  {field} = {value}" if value else f"  {field}")
     return "\n".join(lines)
 
 
