@@ -7,7 +7,7 @@ import time
 
 import numpy as np
 
-from .sdk import ALBEDO, NORMAL, OTHER, Material, MeshData, TextureRef, view_option
+from .sdk import ALBEDO, Material, MeshData, TextureRef, view_option
 from .unity_skin import trs
 
 log = logging.getLogger("viewer.unity")
@@ -393,6 +393,13 @@ class SceneBuilder:
         self.sprites = {}     # sprite key -> (type tree, texture size, texture Asset) or None
         self.sprite_count = 0
         self.effects = 0      # particle systems and lines drawn
+        self.emitters = []    # unity_particles.Emitter per particle system, for playback
+        self.effect_ranges = []  # (first, end) vertices of the still particle puffs (hidden during playback)
+        self.lm_uvs = []      # per placed piece: lightmap UVs (or None)
+        self.lightmapped = 0  # renderers drawn with their baked lightmap
+        self.render_settings = None  # RenderSettings of the first scene file visited (sky, ambient, fog)
+        self.node_pos = {}    # transform key -> (position in UniView space, parent transform key, name)
+        self.skin_bones = []  # bone transform keys of each skinned mesh renderer drawn
         self.gizmos = {}      # kind -> [(points in UniView space, segments)]
         self.gizmo_segments = 0
         self.show_effects = view_option("show_effects")
@@ -415,22 +422,18 @@ class SceneBuilder:
             return None
         key, reader = found
         if key not in self.material_index:
-            from .unity import ALBEDO_PROPS, NORMAL_PROPS, read_material
+            from .unity import make_material, read_material
             try:
-                mat = read_material(reader.read())
+                material = make_material(read_material(reader.read()), self.session._texture_asset)
             except Exception:
                 return None
-            refs = []
-            for prop, tex_name, tex_reader in mat["textures"]:
-                role = ALBEDO if prop in ALBEDO_PROPS else NORMAL if prop in NORMAL_PROPS else OTHER
-                refs.append(TextureRef(prop, tex_name, self.session._asset_for(tex_reader, "Texture2D", tex_name), role))
             self.material_index[key] = len(self.material_list)
-            self.material_list.append(Material(mat["name"], refs, color=mat["color"], properties=mat["properties"],
-                                               alpha_mode=mat["alpha_mode"], alpha_cutoff=mat["alpha_cutoff"]))
+            self.material_list.append(material)
         return self.material_index[key]
 
-    def _add(self, md, matrix, materials, submesh_filter=None):
-        """Place a mesh: matrix is Unity-space local-to-world; materials are indices into material_list."""
+    def _add(self, md, matrix, materials, submesh_filter=None, lightmap_uv=None):
+        """Place a mesh: matrix is Unity-space local-to-world; materials are indices into material_list.
+        lightmap_uv: (N, 2) baked-light texture coordinates of md's vertices, or None."""
         m = FLIP @ matrix @ FLIP
         rot, pos = m[:3, :3], m[:3, 3]
         mirrored = np.linalg.det(rot) < 0
@@ -456,6 +459,7 @@ class SceneBuilder:
             remap[used] = np.arange(len(used))
             points = points[used]
             uv = uv[used] if uv is not None else None
+            lightmap_uv = lightmap_uv[used] if lightmap_uv is not None else None
             picked = [(remap[t], s) for t, s in picked]
         pts = (points.astype(np.float64) @ rot.T + pos).astype(np.float32)
         for tris, slot in picked:
@@ -467,6 +471,7 @@ class SceneBuilder:
         self.owner_uids.append(self.owner)
         self.points.append(pts)
         self.uvs.append(uv if uv is not None else np.zeros((len(pts), 2), np.float32))
+        self.lm_uvs.append(lightmap_uv)
         self.count += len(pts)
         return True
 
@@ -565,6 +570,41 @@ class SceneBuilder:
         target = self.session.finder._file(reader.assets_file, ptr.get("m_FileID", 0))
         return target.objects.get(ptr["m_PathID"]) if target is not None else None
 
+    def _lightmapped(self, reader, renderer, md, materials):
+        """(lightmap UVs or None, materials) of a MeshRenderer baked into one of its scene's lightmaps: the
+        mesh's second UV set (else its first) x the renderer's lightmap tiling/offset, and lightmapped
+        variants of its materials."""
+        try:
+            index = int(getattr(renderer, "m_LightmapIndex", 0xFFFF))
+            if index >= 0xFFFE:
+                return None, materials
+            _render, lightmaps = self.session.scene_settings(reader.assets_file)
+            if index >= len(lightmaps) or lightmaps[index][0] is None:
+                return None, materials
+            uv = md.uvs.get("UV1", next(iter(md.uvs.values()), None))
+            if uv is None:
+                return None, materials
+            st = renderer.m_LightmapTilingOffset
+            lightmap_uv = (uv * np.array([st.x, st.y], np.float32) + np.array([st.z, st.w], np.float32))
+        except Exception as e:
+            log.debug("Scene lightmap: %s", e)
+            return None, materials
+        asset, mode = lightmaps[index]
+        out = []
+        for m in materials:
+            base = m if m is not None else self._default_material()
+            key = ("lightmap", base, index, id(reader.assets_file))
+            if key not in self.material_index:
+                src = self.material_list[base]
+                copy = Material(src.name, src.textures, src.color, src.properties, alpha_mode=src.alpha_mode,
+                                alpha_cutoff=src.alpha_cutoff)
+                copy.lightmap, copy.lightmap_mode = asset, mode
+                self.material_index[key] = len(self.material_list)
+                self.material_list.append(copy)
+            out.append(self.material_index[key])
+        self.lightmapped += 1
+        return lightmap_uv.astype(np.float32), out
+
     def _tinted(self, material_reader, color):
         """Index of a material (ObjectReader or None) multiplied by a color (cached)."""
         index = None
@@ -602,19 +642,24 @@ class SceneBuilder:
             ps = ps_reader.read_typetree()
             centres, size = particle_puffs(ps, ps_reader.path_id)
             mats = renderer.get("m_Materials") or []
-            material = self._tinted(self._ref(renderer_reader, mats[0]) if mats else None,
-                                    gradient_color((ps.get("InitialModule") or {}).get("startColor")))
+            mat_reader = self._ref(renderer_reader, mats[0]) if mats else None
+            material = self._tinted(mat_reader, gradient_color((ps.get("InitialModule") or {}).get("startColor")))
             mesh = self._ref(renderer_reader, renderer.get("m_Mesh"))
+            md = None
             if int(renderer.get("m_RenderMode", 0) or 0) == 4 and mesh is not None:
                 md = self._mesh((id(mesh.assets_file), mesh.path_id), mesh)
-                if md is not None:
-                    for c in centres:
-                        place = np.eye(4)
-                        place[:3, :3] *= size
-                        place[:3, 3] = c
-                        self._add(md, matrix @ place, [material])
-                    self.effects += 1
-                    return
+            self._renderer_reader = renderer_reader
+            self._emitter(ps, renderer, matrix, ps_reader.path_id, mat_reader, md)
+            first = self.count
+            if md is not None:
+                for c in centres:
+                    place = np.eye(4)
+                    place[:3, :3] *= size
+                    place[:3, 3] = c
+                    self._add(md, matrix @ place, [material])
+                self.effect_ranges.append((first, self.count))
+                self.effects += 1
+                return
             uv = (0.0, 0.0, 1.0, 1.0)
             sheet = ps.get("UVModule") or {}
             tx, ty = int(sheet.get("tilesX", 1) or 1), int(sheet.get("tilesY", 1) or 1)
@@ -624,8 +669,29 @@ class SceneBuilder:
         except Exception as e:
             log.debug("Scene particles: %s", e)
             return
+        first = self.count
         if self._add_local(points, uvs, tris, matrix, material):
+            self.effect_ranges.append((first, self.count))
             self.effects += 1
+
+    def _emitter(self, ps, renderer, matrix, seed, mat_reader, md):
+        """Keep what playback needs to move this particle system's particles (see unity_particles)."""
+        from .unity_particles import Emitter
+        try:
+            index = self._material(_Deref(mat_reader)) if mat_reader is not None else None
+            mesh = None
+            if md is not None:
+                mesh = (md.points, np.concatenate(md.submeshes), next(iter(md.uvs.values()), None))
+            trail = None
+            mats = renderer.get("m_Materials") or []  # Unity keeps the trail material second
+            trail_reader = self._ref(self._renderer_reader, renderer.get("m_TrailMaterial") or
+                                     (mats[1] if len(mats) > 1 else None))
+            if trail_reader is not None:
+                trail = self._material(_Deref(trail_reader))
+            self.emitters.append(Emitter(ps, renderer, matrix, seed,
+                                         index if index is not None else self._default_material(), mesh, trail))
+        except Exception as e:
+            log.debug("Scene particle playback: %s", e)
 
     def _line(self, reader, matrix):
         """A LineRenderer as crossed strips along its points."""
@@ -684,7 +750,7 @@ class SceneBuilder:
             self.material_list.append(Material("(no material)", []))
         return self.material_index[None]
 
-    def visit(self, transform_reader, parent_matrix, parent_active=True, depth=0):
+    def visit(self, transform_reader, parent_matrix, parent_active=True, depth=0, parent_key=None):
         """Walk a transform and its children (depth first)."""
         if depth > 200 or self.triangles >= MAX_TRIANGLES:
             return
@@ -697,6 +763,10 @@ class SceneBuilder:
         self.owner = f"go:{go_reader.assets_file.name}:{go_reader.path_id}"
         p, r, s = t.m_LocalPosition, t.m_LocalRotation, t.m_LocalScale
         matrix = parent_matrix @ trs((p.x, p.y, p.z), (r.x, r.y, r.z, r.w), (s.x, s.y, s.z))
+        key = (id(transform_reader.assets_file), transform_reader.path_id)
+        if self.render_settings is None and depth == 0 and is_scene_file(transform_reader.assets_file):
+            self.render_settings = self.session.scene_settings(transform_reader.assets_file)[0] or {}
+        self.node_pos[key] = ((-matrix[0, 3], matrix[1, 3], matrix[2, 3]), parent_key, getattr(go, "m_Name", ""))
         active = parent_active and (bool(getattr(go, "m_IsActive", True)) or not self.hide_inactive)
         self.objects += 1
         if active:
@@ -758,20 +828,71 @@ class SceneBuilder:
                 if md is None:
                     continue
                 materials = [self._material(ptr) for ptr in (renderer.m_Materials or [])]
+                lightmap_uv = None
+                if name == "MeshRenderer":
+                    lightmap_uv, materials = self._lightmapped(reader, renderer, md, materials)
                 batch = getattr(renderer, "m_StaticBatchInfo", None)
                 first = getattr(batch, "firstSubMesh", 0) if batch is not None else 0
                 count = getattr(batch, "subMeshCount", 0) if batch is not None else 0
                 if count:
                     # Static batching: the combined mesh is already in world space.
-                    self._add(md, np.eye(4), materials, (first, count))
+                    self._add(md, np.eye(4), materials, (first, count), lightmap_uv)
                 else:
-                    self._add(md, matrix, materials)
+                    self._add(md, matrix, materials, lightmap_uv=lightmap_uv)
                 self.renderers += 1
+                if name == "SkinnedMeshRenderer":
+                    self.skin_bones.append([f[0] for f in map(_ptr_key, renderer.m_Bones or []) if f])
         for child in t.m_Children or []:
             try:
-                self.visit(child.deref(), matrix, active, depth + 1)
+                self.visit(child.deref(), matrix, active, depth + 1, key)
             except Exception:
                 continue
+
+    def _environment(self):
+        """Sky colors, ambient light and fog of the scene (from its RenderSettings), or None."""
+        render = self.render_settings
+        if not render:
+            return None
+
+        def rgb(d, default=None):
+            return tuple(float(d.get(k, 0.0)) for k in "rgb") if isinstance(d, dict) else default
+        ambient = rgb(render.get("m_AmbientSkyColor"), (0.5, 0.5, 0.5))
+        sky = sky_colors(self.session, render)
+        if sky is None:
+            ground = rgb(render.get("m_AmbientGroundColor"), ambient)
+            horizon = rgb(render.get("m_AmbientEquatorColor"), ambient)
+            sky = (ambient, horizon, ground) if int(render.get("m_AmbientMode", 0) or 0) == 1 else None
+        fog = None
+        if render.get("m_Fog"):
+            mode = {1: "linear", 2: "exponential", 3: "exponential squared"}.get(int(render.get("m_FogMode", 3)), "")
+            c = rgb(render.get("m_FogColor"), (0.5, 0.5, 0.5))
+            fog = (f"{mode}, color #{''.join(f'{int(max(0, min(1, v)) * 255):02x}' for v in c)}" +
+                   (f", {float(render.get('m_LinearFogStart', 0)):g}-{float(render.get('m_LinearFogEnd', 0)):g} units"
+                    if mode == "linear" else f", density {float(render.get('m_FogDensity', 0)):g}"))
+        name = ""
+        try:
+            ptr = render["_reader"].read().m_SkyboxMaterial
+            if ptr.path_id:
+                name = ptr.deref().peek_name() or ""
+        except Exception:
+            pass
+        return {"sky": sky, "ambient": ambient, "fog": fog, "sky_name": name,
+                "sky_texture": sky_texture(self.session, render)}
+
+    def _bones(self):
+        """Bones of the skinned meshes drawn, where the scene/prefab puts their transforms (or None)."""
+        from .sdk import Bones
+        keys = list(dict.fromkeys(k for bones in self.skin_bones for k in bones if k in self.node_pos))
+        if not keys:
+            return None
+        index = {k: i for i, k in enumerate(keys)}
+        parents = []
+        for k in keys:
+            p, hops = self.node_pos[k][1], 0
+            while p is not None and p not in index and p in self.node_pos and hops < 64:
+                p, hops = self.node_pos[p][1], hops + 1
+            parents.append(index.get(p, -1))
+        return Bones([self.node_pos[k][0] for k in keys], parents, [self.node_pos[k][2] for k in keys])
 
     def result(self, name):
         gizmos = {}
@@ -790,13 +911,108 @@ class SceneBuilder:
             self.uvs.append(np.zeros((6, 2), np.float32))
             self.subs.append(np.array([[0, 1, 2], [3, 4, 5]], np.int64))
             self.slots.append(self._default_material())
-        md = MeshData(np.concatenate(self.points), self.subs, uvs={"UV0": np.concatenate(self.uvs)},
-                      material_slots=self.slots, name=name)
+        uvs = {"UV0": np.concatenate(self.uvs)}
+        if any(lm is not None for lm in self.lm_uvs):
+            uvs["lightmap"] = np.concatenate([lm if lm is not None else np.zeros((len(p), 2), np.float32)
+                                              for lm, p in zip(self.lm_uvs, self.points)])
+        md = MeshData(np.concatenate(self.points), self.subs, uvs=uvs, material_slots=self.slots, name=name)
         md.gizmos = gizmos
         md.owners = (np.array(self.owner_starts, np.int64), self.owner_uids)
         md.gizmos_only = self.renderers == 0 and self.effects == 0 and bool(gizmos)
+        md.emitters = self.emitters
+        md.environment = self._environment()
+        md.bones = self._bones()
+        if self.effect_ranges:
+            md.effect_mask = np.zeros(self.count, bool)
+            for first, end in self.effect_ranges:
+                md.effect_mask[first:end] = True
         md.view_2d = self.sprite_count > 0 and self.sprite_count * 2 >= self.renderers
         return md, self.material_list
+
+
+SKY_TOP = ("_skytint", "_skycolor", "_topcolor", "_skytopcolor", "_zenithcolor", "_upcolor", "_color1", "_tint")
+SKY_HORIZON = ("_horizoncolor", "_skymiddlecolor", "_middlecolor", "_equatorcolor", "_color2")
+SKY_GROUND = ("_groundcolor", "_bottomcolor", "_skybottomcolor", "_downcolor", "_color3")
+
+
+def sky_colors(session, render):
+    """(top, horizon, bottom) colors of a scene's skybox material, from its color properties (procedural skies and
+    most gradient sky shaders), or None. Textured skies (cubemaps, panoramas) aren't drawn."""
+    try:
+        ptr = render["_reader"].read().m_SkyboxMaterial
+        if not ptr.path_id:
+            return None
+        mat = ptr.deref().read()
+        colors = {}
+        for prop, c in mat.m_SavedProperties.m_Colors or []:
+            prop = prop if isinstance(prop, str) else getattr(prop, "name", str(prop))
+            colors[prop.lower()] = (float(c.r), float(c.g), float(c.b))
+        floats = {}
+        for prop, v in mat.m_SavedProperties.m_Floats or []:
+            prop = prop if isinstance(prop, str) else getattr(prop, "name", str(prop))
+            floats[prop.lower()] = float(v)
+    except Exception as e:
+        log.debug("Sky colors: %s", e)
+        return None
+
+    def pick(names):
+        return next((colors[n] for n in names if n in colors), None)
+    top, horizon, bottom = pick(SKY_TOP), pick(SKY_HORIZON), pick(SKY_GROUND)
+    if "_skytint" in colors and "_atmospherethickness" in floats:
+        # Unity's procedural sky: the tint (0.5 gray = default) scales a blue scattering color
+        top = tuple(2.0 * t * b for t, b in zip(colors["_skytint"], (0.36, 0.56, 0.92)))
+    if top is None and horizon is None:
+        return None
+    exposure = min(max(floats.get("_exposure", 1.0), 0.3), 2.0)
+    top = tuple(min(1.0, c * exposure) for c in (top or horizon))
+    horizon = horizon or tuple(min(1.0, 0.5 * t + 0.5) for t in top)  # procedural skies are pale at the horizon
+    bottom = bottom or tuple(0.5 * c for c in horizon)
+    return top, horizon, bottom
+
+
+SIX_SIDED = ("_LeftTex", "_RightTex", "_UpTex", "_DownTex", "_FrontTex", "_BackTex")  # +X -X +Y -Y +Z -Z (Unity docs)
+
+
+def sky_texture(session, render):
+    """A scene's textured skybox: {"kind": "cube" (a Cubemap asset) / "six" (6 Texture2D assets, Unity's face
+    order) / "pano" (an equirectangular Texture2D), "assets": [...], "tint": (r, g, b) (1 = unchanged),
+    "rotation": degrees around y} from Skybox/Cubemap, 6 Sided and Panoramic style materials, or None."""
+    try:
+        ptr = render["_reader"].read().m_SkyboxMaterial
+        if not ptr.path_id:
+            return None
+        mat = ptr.deref().read()
+        shader = (shader_name_of(mat) or "").lower()
+        saved = mat.m_SavedProperties
+        texs = {}
+        for prop, env in saved.m_TexEnvs or []:
+            prop = prop if isinstance(prop, str) else getattr(prop, "name", str(prop))
+            if env.m_Texture.path_id:
+                reader = env.m_Texture.deref()
+                texs[prop] = reader
+        colors = {(p if isinstance(p, str) else getattr(p, "name", str(p))): c for p, c in saved.m_Colors or []}
+        floats = {(p if isinstance(p, str) else getattr(p, "name", str(p))): float(v) for p, v in saved.m_Floats or []}
+    except Exception as e:
+        log.debug("Sky texture: %s", e)
+        return None
+    tint = colors.get("_Tint")
+    exposure = floats.get("_Exposure", 1.0)
+    scale = (tuple(min(2.0, 2.0 * float(getattr(tint, k)) * exposure) for k in "rgb") if tint is not None
+             else (exposure,) * 3)
+    out = {"tint": scale, "rotation": floats.get("_Rotation", 0.0)}
+    cube = next((r for r in texs.values() if r.type.name == "Cubemap"), None)
+    if cube is not None:
+        return {**out, "kind": "cube", "assets": [session._asset_for(cube, "Cubemap")]}
+    if all(k in texs for k in SIX_SIDED):
+        return {**out, "kind": "six", "assets": [session._asset_for(texs[k]) for k in SIX_SIDED]}
+    if "panoram" in shader and texs.get("_MainTex") is not None and texs["_MainTex"].type.name == "Texture2D":
+        return {**out, "kind": "pano", "assets": [session._asset_for(texs["_MainTex"])]}
+    return None
+
+
+def shader_name_of(mat):
+    from .unity import shader_name
+    return shader_name(mat.m_Shader)
 
 
 def build(session, roots, name):
@@ -817,8 +1033,17 @@ def build(session, roots, name):
     if builder.gizmos:
         info.append(("Gizmos", ", ".join(f"{sum(len(s) for _p, s in parts):,} {kind}"
                                            for kind, parts in builder.gizmos.items()) + " lines"))
+    if md.bones is not None:
+        info.append(("Bones", f"{len(md.bones):,}"))
     if builder.effects:
         info.append(("Effects", f"{builder.effects:,} particle systems / lines (still, approximate)"))
+    if builder.lightmapped:
+        info.append(("Lightmaps", f"{builder.lightmapped:,} renderers with baked lighting"))
+    env = md.environment
+    if env and env.get("sky_name"):
+        info.append(("Skybox", env["sky_name"]))
+    if env and env.get("fog"):
+        info.append(("Fog", env["fog"] + " (not drawn)"))
     if builder.skipped:
         info.append(("Skipped", f"{builder.skipped:,} lower-detail LOD renderers"))
     if builder.triangles >= MAX_TRIANGLES:

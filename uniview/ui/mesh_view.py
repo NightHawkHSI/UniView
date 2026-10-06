@@ -32,6 +32,7 @@ from pyvistaqt import QtInteractor
 
 from uniview import prefab_info
 from uniview.constants import log
+from uniview.particle_view import camera_axes, frame_geometry, nearest
 from uniview.util import fmt_distance, wheel_steps
 from uniview.ui import theme
 from uniview.ui.theme import role
@@ -352,9 +353,12 @@ class MeshInfoPanel(QWidget):
                 none.setFlags(Qt.NoItemFlags)
                 self.textures.addItem(none)
             for tex in mat.textures:
-                item = QListWidgetItem(blank_icon, f"{tex.name}\n{tex.slot}")
+                label = getattr(tex, "label", "")
+                tiling = (f"  (tiling {tex.uv_scale[0]:g} x {tex.uv_scale[1]:g}, offset {tex.uv_offset[0]:g}, "
+                          f"{tex.uv_offset[1]:g})" if getattr(tex, "tiled", False) else "")
+                item = QListWidgetItem(blank_icon, f"{tex.name}\n{label or tex.slot}{tiling}")
                 item.setData(Qt.UserRole, tex.asset)
-                item.setToolTip(f"{tex.asset.name}\nslot: {tex.slot}"
+                item.setToolTip(f"{tex.asset.name}\nslot: {tex.slot}" + (f" ({label})" if label else "")
                                 + (f"\nfile: {tex.asset.source}" if tex.asset.source else ""))
                 self.textures.addItem(item)
                 self._items.setdefault(tex.asset.key, []).append(item)
@@ -408,11 +412,22 @@ class MeshView(QWidget):
     SELECT_COLOR = "#ffb020"  # outline of the object clicked in a scene/prefab (like Unity's orange)
 
     def _set_background(self):
-        self.plotter.set_background(theme.VIEWPORT_BOTTOM, top=theme.VIEWPORT_TOP)
+        env = getattr(self, "environment", None)
+        sky = env.get("sky") if env else None
+        if sky and self.show_lighting.isChecked():
+            top, horizon, _ground = sky
+            self.plotter.set_background(horizon, top=top)  # the scene's sky
+        else:
+            self.plotter.set_background(theme.VIEWPORT_BOTTOM, top=theme.VIEWPORT_TOP)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.plotter = QtInteractor(self)
+        self.environment = None   # the shown scene's sky / ambient (MeshData.environment)
+        self.show_lighting = tool_button("sun", "Lighting: the scene's baked lightmaps (shadows and light painted\n"
+                                         "into the level), its sky colors and ambient light.", checked=True)
+        self.show_lighting.setEnabled(False)
+        self.show_lighting.toggled.connect(self._lighting_toggled)
         self._set_background()
         theme.on_change(self._set_background, self)
         # Handle the mouse wheel ourselves so zoom works regardless of focus/touchpad.
@@ -440,6 +455,19 @@ class MeshView(QWidget):
         self.show_gizmos = tool_button("gizmo", "Gizmos: draw colliders (green, triggers yellow), light ranges "
                                        "(orange),\ncamera views (white) and sound sources (cyan) as wire shapes.")
         self.show_gizmos.setEnabled(False)
+        self.play_fx = tool_button("sparkle", "Play effects: move the particle systems' particles (simulated, "
+                                   "approximate)\ninstead of showing still puffs. Needs View > Show particle "
+                                   "effects.\nBig scenes play the effects nearest the camera.")
+        self.play_fx.setEnabled(False)
+        self.play_fx.toggled.connect(self.set_effects_playing)
+        self.show_bones = tool_button("bone", "Bones: draw the skeleton of skinned models on top (joints as dots,\n"
+                                      "lines to their parent bone). Click a joint to see its name.\n"
+                                      "It moves with a playing animation.")
+        self.show_bones.setEnabled(False)
+        self.show_bones.toggled.connect(lambda _on: self._draw_bones())
+        self.bones = None         # engines.sdk.Bones of the shown model / scene, or None
+        self._bone_points = None  # current joint positions (posed while an animation plays)
+        self._overlay = None      # renderer layer drawn over the model (bones stay visible inside it)
         for cb in (self.wire, self.edges, self.use_tex, self.flip_v, self.tex_alpha, self.use_colors,
                    self.show_gizmos):
             cb.toggled.connect(self.redraw)
@@ -522,6 +550,38 @@ class MeshView(QWidget):
         ab.addWidget(self.anim_label)
         ab.addWidget(anim_stop)
         self.anim_bar.hide()
+
+        # Particle playback (Play effects button)
+        self.emitters = []        # [(emitter, texture image or None, tint or None, alpha)] of the shown scene
+        self.effect_parts = set()  # indices into self.parts of the still puffs playback replaces
+        self._fx_look_of, self._fx_trail_of, self._fx_look = [], [], {}
+        self._part_actors = []
+        self._fx_actors = {}      # look index -> actor of the moving particles drawn with that look
+        self._fx_time = 0.0
+        self._fx_last = 0.0
+        self._fx_timer = QTimer(self, interval=33)
+        self._fx_timer.timeout.connect(self._fx_tick)
+        self.fx_pause = QPushButton("\u23f8 Pause")
+        self.fx_pause.clicked.connect(self._fx_toggle_pause)
+        fx_restart = QPushButton("\u21ba Restart")
+        fx_restart.clicked.connect(self._fx_restart)
+        self.fx_speed = QComboBox()
+        self.fx_speed.addItems(["0.1x", "0.25x", "0.5x", "1x", "2x"])
+        self.fx_speed.setCurrentText("1x")
+        self.fx_speed.setToolTip("Playback speed")
+        self.fx_label = QLabel()
+        role(self.fx_label, "muted")
+        fx_stop = QPushButton("Stop effects")
+        fx_stop.clicked.connect(lambda: self.play_fx.setChecked(False))
+        self.fx_bar = QWidget()
+        fxb = QHBoxLayout(self.fx_bar)
+        fxb.setContentsMargins(8, 2, 8, 2)
+        fxb.addWidget(self.fx_pause)
+        fxb.addWidget(fx_restart)
+        fxb.addWidget(self.fx_speed)
+        fxb.addWidget(self.fx_label, 1)
+        fxb.addWidget(fx_stop)
+        self.fx_bar.hide()
         role(self.info, "muted")
         toolbar = QWidget(objectName="viewerBar")
         toolbar.setAttribute(Qt.WA_StyledBackground, True)
@@ -529,7 +589,7 @@ class MeshView(QWidget):
         bar.setContentsMargins(8, 6, 8, 6)
         bar.setSpacing(4)
         groups = ((self.use_tex, self.flip_v, self.tex_alpha, self.use_colors),
-                  (self.wire, self.edges, self.show_gizmos),
+                  (self.wire, self.edges, self.show_lighting, self.show_gizmos, self.show_bones, self.play_fx),
                   (zoom_in, zoom_out, reset, self.fly),
                   (role(QLabel("UV"), "muted"), self.uv_combo, uv_layout))
         for i, group in enumerate(groups):
@@ -559,6 +619,7 @@ class MeshView(QWidget):
         lay.addWidget(toolbar)
         lay.addWidget(self.fly_bar)
         lay.addWidget(self.anim_bar)
+        lay.addWidget(self.fx_bar)
         lay.addWidget(split, 1)
 
     def eventFilter(self, obj, event):
@@ -762,6 +823,8 @@ class MeshView(QWidget):
 
     def _pick(self, point):
         """A click in a scene/prefab: select the object under the mouse (in the view and the Objects tab)."""
+        if self._pick_bone(point):
+            return
         if self.owners is None or self.poly is None or self.animator is not None:
             return
         from vtkmodules.vtkRenderingCore import vtkCellPicker
@@ -796,6 +859,75 @@ class MeshView(QWidget):
                 go = uids[max(0, int(np.searchsorted(starts, vertex, side="right")) - 1)]
         name = self.panel.select_object(go)
         self.highlight(go if name else None, name)
+
+    BONE_COLOR = "#c792ff"
+    JOINT_COLOR = "#f3e8ff"
+    BONE_PICK_PIXELS = 8
+
+    def _overlay_renderer(self):
+        """A renderer layered over the main one, sharing its camera: what's in it is never hidden by the model."""
+        if self._overlay is None:
+            from vtkmodules.vtkRenderingCore import vtkRenderer
+            self._overlay = vtkRenderer()
+            self._overlay.SetLayer(1)
+            self._overlay.InteractiveOff()
+            window = self.plotter.ren_win
+            window.SetNumberOfLayers(max(2, window.GetNumberOfLayers()))
+            window.AddRenderer(self._overlay)
+        self._overlay.SetActiveCamera(self.plotter.renderer.GetActiveCamera())
+        return self._overlay
+
+    def _draw_bones(self, render=True):
+        """(Re)draw the skeleton overlay: joints as dots, a line from each to its parent."""
+        if self._overlay is None and not (self.show_bones.isChecked() and self.bones is not None):
+            return
+        overlay = self._overlay_renderer()
+        overlay.RemoveAllViewProps()
+        if self.show_bones.isChecked() and self.bones is not None and self._bone_points is not None:
+            pts = np.asarray(self._bone_points, np.float32)
+            parents = self.bones.parents[:len(pts)]
+            child = np.flatnonzero((parents >= 0) & (parents < len(pts)))
+            lines = np.hstack([np.full((len(child), 1), 2, np.int64), np.stack([parents[child], child], 1)]).ravel()
+            for mesh, color, style in ((pv.PolyData(pts, lines=lines) if len(child) else None, self.BONE_COLOR, 2.5),
+                                       (pv.PolyData(pts), self.JOINT_COLOR, 7.0)):
+                if mesh is None:
+                    continue
+                actor = pv.Actor(mapper=pv.DataSetMapper(mesh))
+                prop = actor.GetProperty()
+                prop.SetColor(QColor(color).redF(), QColor(color).greenF(), QColor(color).blueF())
+                prop.LightingOff()
+                if mesh.n_lines:
+                    prop.SetLineWidth(style)
+                else:
+                    prop.SetRepresentationToPoints()
+                    prop.SetPointSize(style)
+                    prop.SetRenderPointsAsSpheres(True)
+                overlay.AddActor(actor)
+        if render:
+            self.plotter.render()
+
+    def _pick_bone(self, point):
+        """A click near a shown joint: name it in the toolbar. True if one was hit."""
+        if not (self.show_bones.isChecked() and self.bones is not None and self._bone_points is not None):
+            return False
+        widget = self.plotter.interactor
+        ratio = widget.devicePixelRatioF()
+        x, y = point.x() * ratio, (widget.height() - point.y()) * ratio
+        renderer = self.plotter.renderer
+        best, best_d = None, (self.BONE_PICK_PIXELS * ratio) ** 2
+        for i, p in enumerate(np.asarray(self._bone_points, float)):
+            renderer.SetWorldPoint(p[0], p[1], p[2], 1.0)
+            renderer.WorldToDisplay()
+            dx, dy, _z = renderer.GetDisplayPoint()
+            d = (dx - x) ** 2 + (dy - y) ** 2
+            if d < best_d:
+                best, best_d = i, d
+        if best is None:
+            return False
+        names, parent = self.bones.names, int(self.bones.parents[best])
+        parent_name = names[parent] if 0 <= parent < len(names) else "none (root)"
+        self.info.setText(f"{getattr(self, '_info_text', '')}   ·   bone: {names[best]}  (parent: {parent_name})")
+        return True
 
     def _tree_selected(self, go):
         item = self.panel.objects.currentItem()
@@ -873,8 +1005,11 @@ class MeshView(QWidget):
     def set_uv_channel(self, name):
         if self.poly is None or name not in self.poly.point_data:
             return
-        for mesh in [self.poly] + [part for part, *_ in self.parts]:
-            mesh.active_texture_coordinates = mesh.point_data[name]
+        self.poly.active_texture_coordinates = self.poly.point_data[name]
+        for (part, *_), uv in zip(self.parts, getattr(self, "_part_uv", [])):
+            tc = np.asarray(part.point_data[name])
+            part.active_texture_coordinates = (tc * np.asarray(uv[0], np.float32) + np.asarray(uv[1], np.float32)
+                                               if uv is not None else tc)
         self.redraw()
 
     # ---- animation
@@ -904,6 +1039,9 @@ class MeshView(QWidget):
             self.plotter.render()
         self.animator = None
         self.anim_bar.hide()
+        if self.bones is not None:
+            self._bone_points = self.bones.points
+            self._draw_bones(render=False)
         self.redraw()
 
     def _set_points(self, pts):
@@ -923,6 +1061,11 @@ class MeshView(QWidget):
             return
         try:
             self._set_points(self.animator.points_at(self.anim_time))
+            if self.bones is not None and hasattr(self.animator, "bones_at"):
+                posed = self.animator.bones_at(self.anim_time)
+                if len(posed) == len(self.bones):
+                    self._bone_points = posed
+                    self._draw_bones(render=False)
         except Exception:
             log.exception("Animation frame failed")
             self.stop_animation()
@@ -950,11 +1093,18 @@ class MeshView(QWidget):
             self.anim_time = value / 1000.0 * self.animator.length
             self._anim_apply()
 
-    def show_mesh(self, poly, texture_img, parts=None, flat=False, gizmos=None, gizmos_only=False, owners=None):
+    def show_mesh(self, poly, texture_img, parts=None, flat=False, gizmos=None, gizmos_only=False, owners=None,
+                  emitters=None, effect_parts=None, bones=None, environment=None):
         """parts: [(faces array (M, 3), texture image or None, color or None, alpha)] - each submesh with its own
-        look; alpha: None (opaque), ("mask", cutoff) or ("blend", opacity), see model_display.material_alpha.
+        look; color: the plain color, or the texture's tint. alpha: None (opaque), ("mask", cutoff),
+        ("blend", opacity) or ("add", opacity), see model_display.material_alpha.
         flat: 2D content (sprites facing -Z) - looked at straight on, without perspective.
-        owners: MeshData.owners of a scene/prefab, so clicking selects objects."""
+        owners: MeshData.owners of a scene/prefab, so clicking selects objects.
+        emitters: [(emitter, texture image, tint, alpha)] particle systems Play effects can move (MeshData.emitters);
+        effect_parts: indices of the parts that are their still stand-ins (hidden while playing).
+        bones: engines.sdk.Bones skeleton for the Bones button, or None.
+        environment: MeshData.environment of a scene (sky, ambient) for the Lighting button, or None.
+        Parts may carry a 6th item: (lightmap image, mode) of baked light multiplied on (model_display)."""
         self.flat = flat
         self.owners = owners
         self.selected = None
@@ -974,11 +1124,46 @@ class MeshView(QWidget):
         self.override = None
         self._textures = {}
         self.parts = []
-        looks = {(id(img) if img is not None else None, color, alpha) for _f, img, color, alpha in parts or []}
-        if parts and (len(looks) > 1 or any((color is not None and img is None) or alpha
-                                            for _f, img, color, alpha in parts)):
+        parts = [tuple(p) + (None,) * (6 - len(p)) for p in parts or []]  # (faces, img, color, alpha, uv, lightmap)
+        looks = {(id(img) if img is not None else None, color, alpha) for _f, img, color, alpha, _uv, _lm in parts}
+        self.environment = environment
+        self._sky = None
+        self._part_uv, self._part_lightmap = [], []
+        has_lightmaps = any(lm is not None for *_rest, lm in parts)
+        self.show_lighting.setEnabled(bool(environment) or has_lightmaps)
+        self._set_background()
+        self.bones = bones if bones is not None and len(bones) else None
+        self._bone_points = self.bones.points if self.bones is not None else None
+        self.show_bones.setEnabled(self.bones is not None)
+        self._draw_bones(render=False)
+        self.emitters = [tuple(e) + (None,) * (5 - len(e)) for e in emitters or []]  # (emitter, img, tint, alpha, trail)
+        self.effect_parts = set(effect_parts or ()) if parts else set()
+        fx_looks = {}
+        self._fx_look_of = [fx_looks.setdefault((id(img), color, alpha), len(fx_looks))
+                            for _e, img, color, alpha, _t in self.emitters]
+        self._fx_trail_of = [fx_looks.setdefault(("trail", id(t[0]), t[1], t[2]), len(fx_looks)) if t else None
+                             for *_rest, t in self.emitters]
+        self._fx_look = {}
+        for (_e, img, color, alpha, trail), i, ti in zip(self.emitters, self._fx_look_of, self._fx_trail_of):
+            self._fx_look[i] = (img, color, alpha)
+            if ti is not None:
+                self._fx_look[ti] = (trail[0], trail[1], trail[2] or ("blend", 1.0))
+        self.play_fx.setEnabled(bool(self.emitters))
+        if not self.emitters and self.play_fx.isChecked():
+            with QSignalBlocker(self.play_fx):
+                self.play_fx.setChecked(False)
+            self._fx_timer.stop()
+            self.fx_bar.hide()
+        elif self.play_fx.isChecked():
+            self._fx_time = 0.0
+            self._fx_last = time.monotonic()
+            self._fx_timer.start()
+        if parts and (len(looks) > 1 or self.effect_parts
+                      or any(color is not None or alpha or uv or lm for _f, _img, color, alpha, uv, lm in parts)):
             self._part_vertices = []
-            for tris, img, color, alpha in parts:
+            self._part_uv = []  # each part's (scale, offset) tiling or None
+            self._part_lightmap = []  # each part's (lightmap image, mode) or None
+            for tris, img, color, alpha, uv, lm in parts:
                 # Each part keeps only its own vertices (big maps have hundreds of parts).
                 used, local = np.unique(tris, return_inverse=True)
                 faces = np.hstack([np.full((len(tris), 1), 3, dtype=np.int64),
@@ -987,9 +1172,14 @@ class MeshView(QWidget):
                 for key in poly.point_data.keys():
                     part.point_data[key] = poly.point_data[key][used]
                 if poly.active_texture_coordinates is not None:
-                    part.active_texture_coordinates = np.asarray(poly.active_texture_coordinates)[used]
+                    tc = np.asarray(poly.active_texture_coordinates)[used]
+                    if uv is not None:  # the material's tiling / offset (the texture repeats)
+                        tc = tc * np.asarray(uv[0], np.float32) + np.asarray(uv[1], np.float32)
+                    part.active_texture_coordinates = tc
                 self.parts.append((part, img, color, alpha))
                 self._part_vertices.append(used)
+                self._part_uv.append(uv)
+                self._part_lightmap.append(lm)
         with QSignalBlocker(self.uv_combo):
             self.uv_combo.clear()
             channels = self.uv_channels()
@@ -1005,18 +1195,30 @@ class MeshView(QWidget):
         self.override = self.texture_img = img
         self.redraw()
 
-    def _texture(self, img, alpha=None):
-        """alpha: the material's (see show_mesh); the toolbar's alpha button uses the texture alpha everywhere."""
-        if self.tex_alpha.isChecked():
+    def _texture(self, img, alpha=None, tint=None):
+        """alpha: the material's (see show_mesh); the toolbar's alpha button uses the texture alpha everywhere.
+        tint: (r, g, b) the texture is multiplied with (material color, particle start color)."""
+        if self.tex_alpha.isChecked() and not (alpha and alpha[0] == "add"):
             alpha = ("blend", 1.0)
         flip = self.flip_v.isChecked()
-        mode = alpha[0] if alpha and "A" in img.getbands() else None
-        key = (id(img), mode, alpha[1] if mode == "mask" else None, flip)
+        mode = alpha[0] if alpha and ("A" in img.getbands() or alpha[0] == "add") else None
+        key = (id(img), mode, alpha[1] if mode else None, tint, flip)
         if key not in self._textures:
             arr = np.array(img.convert("RGBA" if mode else "RGB"))
+            if tint is not None:
+                arr[..., :3] = (arr[..., :3] * np.asarray(tint, np.float32)).astype(np.uint8)
             if mode == "mask":
                 # Cutout: fully in or out, like the game's alpha test (no half-see-through edges to sort).
                 arr[..., 3] = np.where(arr[..., 3] >= alpha[1] * 255, 255, 0)
+            elif mode == "add":
+                # Additive (glows, sparks): black adds nothing. Drawn as brightness-as-alpha over the full color,
+                # which looks the same over a dark background.
+                rgb = arr[..., :3].astype(np.float32)
+                peak = rgb.max(axis=2)
+                arr[..., 3] = (peak * (arr[..., 3] / 255.0) * alpha[1]).astype(np.uint8)
+                arr[..., :3] = (rgb * (255.0 / np.maximum(peak, 1.0))[..., None]).astype(np.uint8)
+            elif mode == "blend" and alpha[1] < 1:
+                arr[..., 3] = (arr[..., 3] * alpha[1]).astype(np.uint8)
             if flip:
                 arr = arr[::-1]
             self._textures[key] = pv.Texture(np.ascontiguousarray(arr))
@@ -1044,9 +1246,166 @@ class MeshView(QWidget):
             self.plotter.add_mesh(pv.PolyData(np.asarray(pts, np.float32), lines=lines),
                                   color=self.GIZMO_COLORS.get(kind, "#ff00ff"), line_width=2, lighting=False)
 
+    # ---- scene lighting
+    def _lighting_toggled(self, _on):
+        self._set_background()
+        self.redraw()
+
+    def _sky_actor(self):
+        """The scene's textured sky as a VTK skybox (built once per scene), or None."""
+        env = self.environment or {}
+        if "sky_images" not in env:
+            return None
+        if getattr(self, "_sky", None) is None or self._sky[0] is not env:
+            from vtkmodules.vtkRenderingCore import vtkSkybox
+            from uniview.model_display import sky_faces, vtk_cube_faces
+            kind, images = env["sky_images"]
+            sky = env.get("sky_texture") or {}
+            tint = np.asarray(sky.get("tint", (1.0, 1.0, 1.0)), np.float32)
+            faces = sky_faces(kind, images, float(sky.get("rotation", 0.0) or 0.0))
+            texture = pv.Texture()
+            texture.mipmap = True
+            texture.interpolate = True
+            texture.color_mode = "direct"
+            texture.cube_map = True
+            keep = []
+            for slot, face in enumerate(vtk_cube_faces(faces)):
+                face = np.clip(face.astype(np.float32) * tint, 0, 255).astype(np.uint8)
+                image = pv.Texture(np.ascontiguousarray(face[::-1])).to_image()
+                keep.append(image)
+                texture.SetInputDataObject(slot, image)
+            skybox = vtkSkybox()
+            skybox.SetTexture(texture)
+            self._sky = (env, skybox, texture, keep)
+        return self._sky[1]
+
+    def _lightmap_texture(self, img, mode):
+        key = ("lightmap", id(img), mode, self.flip_v.isChecked())
+        if key not in self._textures:
+            from uniview.model_display import lightmap_image
+            arr = np.array(lightmap_image(img, mode))
+            if self.flip_v.isChecked():
+                arr = arr[::-1]
+            self._textures[key] = pv.Texture(np.ascontiguousarray(arr))
+        return self._textures[key]
+
+    def _light_part(self, actor, index, ambient):
+        """Lighting button: multiply a part's baked lightmap onto it (it then needs no live lights), or give lit
+        parts the scene's ambient color in their shadows."""
+        if not self.show_lighting.isChecked():
+            return
+        lm = self._part_lightmap[index] if index < len(getattr(self, "_part_lightmap", [])) else None
+        if lm is not None and lm[0] is not None and self.use_tex.isChecked():
+            from vtkmodules.vtkCommonDataModel import vtkDataObject
+            from vtkmodules.vtkRenderingCore import vtkPolyDataMapper
+            data = actor.GetMapper().GetInput()
+            if data is None or data.GetPointData().GetArray("lightmap") is None:
+                return
+            mapper = vtkPolyDataMapper()
+            mapper.SetInputData(data)
+            mapper.ScalarVisibilityOff()
+            mapper.MapDataArrayToMultiTextureAttribute("lightmap", "lightmap", vtkDataObject.FIELD_ASSOCIATION_POINTS)
+            actor.SetMapper(mapper)
+            prop = actor.GetProperty()
+            prop.SetTexture("lightmap", self._lightmap_texture(*lm))
+            prop.LightingOff()
+        elif ambient is not None:
+            prop = actor.GetProperty()
+            prop.SetAmbientColor(*[float(c) for c in ambient[:3]])
+            prop.SetAmbient(0.35)
+
+    # ---- particle playback
+    def _fx_playing(self):
+        return self.play_fx.isChecked() and bool(self.emitters)
+
+    def set_effects_playing(self, on):
+        """Play effects: swap the still puffs for moving particles (or back)."""
+        on = on and bool(self.emitters)
+        for i in self.effect_parts:
+            if i < len(self._part_actors):
+                self._part_actors[i].SetVisibility(not on)
+        if on:
+            self.fx_bar.show()
+            self._depth_peeling(True)
+            self._fx_restart()
+        else:
+            self._fx_timer.stop()
+            self.fx_bar.hide()
+            for actor in self._fx_actors.values():
+                self.plotter.remove_actor(actor, render=False)
+            self._fx_actors = {}
+        self.plotter.render()
+
+    def _fx_restart(self):
+        self._fx_time = 0.0
+        self._fx_last = time.monotonic()
+        self.fx_pause.setText("\u23f8 Pause")
+        if self._fx_playing():
+            self._fx_timer.start()
+            self._fx_draw()
+            self.plotter.render()
+
+    def _fx_toggle_pause(self):
+        if self._fx_timer.isActive():
+            self._fx_timer.stop()
+            self.fx_pause.setText("\u25b6 Play")
+        else:
+            self._fx_last = time.monotonic()
+            self._fx_timer.start()
+            self.fx_pause.setText("\u23f8 Pause")
+
+    def _fx_tick(self):
+        if not self._fx_playing() or not self.isVisible():
+            return
+        now = time.monotonic()
+        speed = float(self.fx_speed.currentText().rstrip("x"))
+        self._fx_time += min(now - self._fx_last, 0.1) * speed
+        self._fx_last = now
+        self._fx_draw()
+        self.plotter.render()
+
+    def _fx_draw(self):
+        """Draw the particles at the current playback time (one mesh per look, reused frame to frame)."""
+        cam = self.plotter.camera
+        axes = camera_axes(cam.position, cam.focal_point, cam.up)
+        emitters = [e for e, *_ in self.emitters]
+        indices = nearest(emitters, np.asarray(cam.position, float))
+        try:
+            geometry, total = frame_geometry(emitters, indices, self._fx_time, axes, self._fx_look_of.__getitem__,
+                                             self._fx_trail_of.__getitem__)
+        except Exception:
+            log.exception("Particle playback failed")
+            self.play_fx.setChecked(False)
+            return
+        for key, actor in self._fx_actors.items():
+            actor.SetVisibility(key in geometry)
+        for key, (pts, uvs, colors, tris) in geometry.items():
+            img, tint, alpha = self._fx_look[key]
+            if (img is None or not self.use_tex.isChecked()) and tint is not None:
+                colors[:, :3] = (colors[:, :3] * np.asarray(tint, np.float32)).astype(np.uint8)
+            faces = np.hstack([np.full((len(tris), 1), 3, np.int64), tris]).ravel()
+            poly = pv.PolyData(pts, faces)
+            poly.active_texture_coordinates = uvs
+            poly.point_data["fx_rgba"] = colors
+            actor = self._fx_actors.get(key)
+            if actor is not None:
+                actor.GetMapper().SetInputData(poly)
+                continue
+            kwargs = dict(scalars="fx_rgba", rgba=True, lighting=False, pickable=False, render=False,
+                          reset_camera=False)
+            if img is not None and self.use_tex.isChecked():
+                kwargs["texture"] = self._texture(img, alpha or ("blend", 1.0), tint)
+            self._fx_actors[key] = self.plotter.add_mesh(poly, **kwargs)
+        shown = (f"{len(indices)} of {len(emitters)} effects (nearest the camera)" if len(indices) < len(emitters)
+                 else f"{len(emitters)} effect{'s' if len(emitters) != 1 else ''}")
+        self.fx_label.setText(f"{self._fx_time:6.2f} s   \u00b7   {total:,} particles   \u00b7   {shown}")
+
     def redraw(self, *_, reset_camera=False):
         self.plotter.clear_actors()  # clear() would also drop the lights
         self._blended = []
+        sky = self._sky_actor() if self.show_lighting.isChecked() and not self.flat else None
+        if sky is not None:
+            self.plotter.renderer.AddActor(sky)
         if not self.plotter.renderer.lights:
             self.plotter.enable_lightkit()
         if self.poly is None:
@@ -1064,14 +1423,17 @@ class MeshView(QWidget):
             # Each part with its own material's texture.
             see_through = False
             self._blended = []  # actors of blended parts (smoke, glass): clicks go through them first
-            for part, img, color, alpha in self.parts:
+            self._part_actors = []
+            playing = self._fx_playing()
+            env_ambient = (self.environment or {}).get("ambient") if self.show_lighting.isChecked() else None
+            for i, (part, img, color, alpha) in enumerate(self.parts):
                 part_kwargs = dict(kwargs)
                 if img is not None:
-                    part_kwargs["texture"] = self._texture(img, alpha)
+                    part_kwargs["texture"] = self._texture(img, alpha, color)
                     see_through |= bool(alpha) or self.tex_alpha.isChecked()
                 elif color is not None:
                     part_kwargs["color"] = color[:3]
-                    if alpha and alpha[0] == "blend" and alpha[1] < 1:
+                    if alpha and alpha[0] in ("blend", "add") and alpha[1] < 1:
                         part_kwargs["opacity"] = alpha[1]
                         see_through = True
                 elif self.use_colors.isChecked() and "vertex_colors" in part.point_data:
@@ -1079,9 +1441,16 @@ class MeshView(QWidget):
                 else:
                     part_kwargs["color"] = "#c8c8c8"
                 actor = self.plotter.add_mesh(part, **part_kwargs)
-                if alpha and alpha[0] == "blend":
+                self._light_part(actor, i, env_ambient)
+                if alpha and alpha[0] in ("blend", "add"):
                     self._blended.append(actor)
-            self._depth_peeling(see_through)
+                if playing and i in self.effect_parts:
+                    actor.VisibilityOff()
+                self._part_actors.append(actor)
+            self._depth_peeling(see_through or playing)
+            self._fx_actors = {}
+            if playing:
+                self._fx_draw()
             self._draw_highlight()
             if reset_camera:
                 self._home_camera()

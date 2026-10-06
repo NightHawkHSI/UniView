@@ -18,7 +18,7 @@ log = logging.getLogger("viewer.unity")
 
 TYPE_KINDS = {"Mesh": "model", "Texture2D": "texture", "Sprite": "sprite", "TextAsset": "text", "AudioClip": "audio",
               "AnimationClip": "animation",
-              "Font": "font", "VideoClip": "video", "MonoBehaviour": "data"}
+              "Font": "font", "VideoClip": "video", "MonoBehaviour": "data", "Cubemap": "texture"}
 ALBEDO_PROPS = ("_MainTex", "_BaseMap", "_BaseColorMap", "_Albedo", "_BaseColorTexture")
 NORMAL_PROPS = ("_BumpMap", "_NormalMap")
 
@@ -269,6 +269,44 @@ def asset_image(asset):
     return asset.image
 
 
+CUBE_FACES = ("+X", "-X", "+Y", "-Y", "+Z", "-Z")  # Unity's face order
+
+
+def cubemap_faces(cube, max_side=1024):
+    """The 6 faces of a parsed Cubemap as PIL images in Unity's order (+X, -X, +Y, -Y, +Z, -Z), at most
+    max_side pixels wide. Unity stores the faces one after another (each with its mipmaps)."""
+    from UnityPy.enums import BuildTarget
+    from UnityPy.export.Texture2DConverter import parse_image_data
+    data = cube.get_image_data() if hasattr(cube, "get_image_data") else cube.image_data
+    w, h = int(cube.m_Width), int(cube.m_Height)
+    if not w or not h or not data:
+        raise ValueError("Empty cubemap - it's made while the game runs (e.g. a reflection probe).")
+    size = int(getattr(cube, "m_CompleteImageSize", 0) or 0) or len(data) // 6
+    reader = getattr(cube, "object_reader", None)
+    faces = []
+    for i in range(6):
+        chunk = bytes(data[i * size:(i + 1) * size])
+        if len(chunk) < size:
+            raise ValueError("This cubemap has fewer than 6 faces.")
+        img = parse_image_data(chunk, w, h, cube.m_TextureFormat, getattr(reader, "version", (0, 0, 0, 0)),
+                               getattr(reader, "platform", BuildTarget.UnknownPlatform),
+                               getattr(cube, "m_PlatformBlob", None), False)
+        if max(img.size) > max_side:
+            img = img.resize((max_side, max_side * img.height // img.width))
+        faces.append(img.convert("RGB"))
+    return faces
+
+
+def cubemap_cross(faces):
+    """6 cube faces (Unity order) laid out as a horizontal cross: +Y on top, -X +Z +X -Z, -Y below."""
+    from PIL import Image
+    s = faces[0].width
+    out = Image.new("RGB", (4 * s, 3 * s), (0, 0, 0))
+    for face, (col, row) in zip(faces, ((2, 1), (0, 1), (1, 0), (1, 2), (1, 1), (3, 1))):
+        out.paste(face.resize((s, s)), (col * s, row * s))
+    return out
+
+
 def obj_key(assets_file, path_id):
     return (id(assets_file), path_id)
 
@@ -351,10 +389,108 @@ def read_material_details(mat):
             "keywords": list(keywords), "queue": int(getattr(mat, "m_CustomRenderQueue", -1)), "tags": tags}
 
 
+_CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+ROLE_NORMAL_WORDS = ("normal", "bump", "nrm")
+ROLE_OTHER_WORDS = ("mask", "ao", "occlusion", "metal", "metallic", "rough", "roughness", "smooth", "smoothness",
+                    "gloss", "emission", "emissive", "height", "displacement", "parallax", "detail", "noise",
+                    "distortion", "distort", "flow", "cubemap", "cube", "reflection", "lightmap", "lightmaps",
+                    "screen", "spec", "specular", "ramp", "lut", "dissolve", "matcap", "depth", "shadow")
+ROLE_ALBEDO_WORDS = ("albedo", "diffuse", "basecolor", "basecolour", "maintex", "maintexture", "color", "colour",
+                     "basemap", "basetex", "albedomap", "diffusemap", "colormap", "colourmap")
+SECONDARY_WORDS = ("overlay", "secondary", "layer2", "second", "top", "decal")
+
+
+def _words(text):
+    """'Texture2D_5238b8' / 'Triplanar_Base_Colour' / 'BaseColorMap' -> ['base', 'color', 'map'] (lower case)."""
+    text = _CAMEL.sub(" ", str(text or "")).lower()
+    return [w for w in re.split(r"[^a-z0-9]+", text) if w and not re.fullmatch(r"[0-9a-f]{8,}|\d+|texture2d", w)]
+
+
+def texture_role(prop, label=""):
+    """(role, rank) of a material texture slot from its property name and the shader's display name for it:
+    the engine's albedo/normal slots, else words ("Base Color Map", "Triplanar_Base_Colour", "Mesh_AO").
+    rank orders albedo candidates: 0 the standard slots, 1 named like a base color, 2 an overlay/secondary one."""
+    if prop in ALBEDO_PROPS:
+        return ALBEDO, 0
+    if prop in NORMAL_PROPS:
+        return NORMAL, 0
+    for text in (label, prop):
+        words = _words(text)
+        if not words:
+            continue
+        joined = "".join(words)
+        if any(w in words for w in ROLE_NORMAL_WORDS) or "normal" in joined:
+            return NORMAL, 9
+        if any(w in words for w in ROLE_OTHER_WORDS):
+            return OTHER, 9
+        pairs = {a + b for a, b in zip(words, words[1:])}
+        if any(w in ROLE_ALBEDO_WORDS for w in set(words) | pairs) or joined in ("main", "maintexture", "tex"):
+            return ALBEDO, 2 if any(w in words for w in SECONDARY_WORDS) else 1
+    return OTHER, 9
+
+
+def shader_labels(shader_ptr):
+    """{texture property: the shader's display name for it} (e.g. Shader Graph's "Texture2D_<guid>" ->
+    "Base Color Map"), read from the compiled Shader once per shader; {} if it can't be read."""
+    try:
+        if not shader_ptr.path_id:
+            return {}
+        reader = shader_ptr.deref()
+    except Exception:
+        return {}
+    cache = _LABELS.setdefault(id(reader.assets_file), {})
+    if reader.path_id not in cache:
+        labels = {}
+        try:
+            form = reader.read_typetree().get("m_ParsedForm") or {}
+            for prop in (form.get("m_PropInfo") or {}).get("m_Props") or []:
+                if prop.get("m_Type") == 4 and prop.get("m_Description") and prop.get("m_Name"):
+                    labels[prop["m_Name"]] = str(prop["m_Description"])
+        except Exception as e:
+            log.debug("Shader labels: %s", e)
+        cache[reader.path_id] = labels
+    return cache[reader.path_id]
+
+
+_LABELS = {}  # id(assets file) -> {shader path id: {property: display name}}
+
+
+def _loose(text):
+    """Lower case letters and digits only, for matching names written differently ("MAT_Wing Delta")."""
+    return re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+
+
+WORLD_MAPPED_WORDS = ("triplanar", "trilinear", "worldspace", "world space", "worldaligned", "world aligned")
+
+
+def world_mapped(shader, floats):
+    """True if a material projects its textures from world space (triplanar rocks, terrain-like pieces) instead of
+    the mesh's UVs: by the shader's name, or a triplanar switch that is on (Valheim's _TriplanarMap)."""
+    name = (shader or "").lower()
+    if any(w in name for w in WORLD_MAPPED_WORDS):
+        return True
+    return any("triplanar" in prop.lower() and not prop.lower().endswith(("scale", "sharpness", "blend", "pos"))
+               and value >= 0.5 for prop, value in (floats or {}).items())
+
+
+def make_material(mat, asset_for):
+    """read_material() dict -> sdk Material. asset_for(texture reader, name) -> the texture's Asset."""
+    refs = []
+    for prop, tex_name, tex_reader in mat["textures"]:
+        scale, offset = mat["st"].get(prop, ((1.0, 1.0), (0.0, 0.0)))
+        refs.append(TextureRef(prop, tex_name, asset_for(tex_reader, tex_name), mat["roles"].get(prop, OTHER),
+                               mat["labels"].get(prop, ""), scale, offset))
+    return Material(mat["name"], refs, color=mat.get("color"), properties=mat.get("properties"),
+                    alpha_mode=mat.get("alpha_mode", "opaque"), alpha_cutoff=mat.get("alpha_cutoff", 0.5))
+
+
 def read_material(mat):
-    """A parsed Material -> {"name", "textures": [(property, texture name, ObjectReader)], "color", "properties"}."""
+    """A parsed Material -> {"name", "textures": [(property, texture name, ObjectReader)], "color", "properties",
+    "roles": {property: ALBEDO/NORMAL/OTHER}, "labels": {property: shader display name}, "st": {property:
+    ((scale x, y), (offset x, y))}, "alpha_mode", "alpha_cutoff"}. Textures are sorted best albedo first."""
     saved = mat.m_SavedProperties
-    textures = []
+    labels = shader_labels(mat.m_Shader)
+    textures, roles, ranks, st = [], {}, {}, {}
     for prop, tex_env in saved.m_TexEnvs:
         prop = _prop_name(prop)
         tptr = tex_env.m_Texture
@@ -365,9 +501,15 @@ def read_material(mat):
             if reader.type.name != "Texture2D":
                 continue
             textures.append((prop, reader.peek_name() or prop, reader))
+            roles[prop], ranks[prop] = texture_role(prop, labels.get(prop, ""))
+            try:
+                sc, off = tex_env.m_Scale, tex_env.m_Offset
+                st[prop] = ((float(sc.x), float(sc.y)), (float(off.x), float(off.y)))
+            except (AttributeError, TypeError, ValueError):
+                pass
         except Exception:
             continue
-    textures.sort(key=lambda t: t[0] not in ALBEDO_PROPS)
+    textures.sort(key=lambda t: (roles[t[0]] != ALBEDO, ranks[t[0]]))
     colors, properties = {}, []
     for prop, c in getattr(saved, "m_Colors", None) or []:
         prop = _prop_name(prop)
@@ -383,8 +525,11 @@ def read_material(mat):
             properties.append((_prop_name(prop), f"{float(value):.3g}"))
         except (TypeError, ValueError):
             continue
-    color = next((colors[p] for p in COLOR_PROPS if p in colors), None)
+    color_prop = next((p for p in COLOR_PROPS if p in colors), None)
+    color = colors[color_prop] if color_prop else None
     shader = shader_name(mat.m_Shader)
+    if color_prop == "_TintColor" and "particle" in (shader or "").lower():
+        color = tuple(min(1.0, 2.0 * v) for v in color)  # legacy particle shaders draw 2 x _TintColor
     if shader:
         properties.insert(0, ("Shader", shader))
     floats = {}
@@ -404,8 +549,14 @@ def read_material(mat):
         except (TypeError, ValueError, AttributeError):
             continue
     alpha_mode, cutoff = material_alpha(shader, floats, keywords, int(getattr(mat, "m_CustomRenderQueue", -1)), tags)
+    if world_mapped(shader, floats):
+        st = {}  # its tiling is per world unit, not for the mesh's UVs
+    for prop, label in labels.items():
+        if prop in roles:
+            properties.append((f"{prop} (shader name)", label))
     return {"name": mat.m_Name, "textures": textures, "color": color, "properties": properties,
-            "alpha_mode": alpha_mode, "alpha_cutoff": cutoff}
+            "alpha_mode": alpha_mode, "alpha_cutoff": cutoff, "roles": roles,
+            "labels": {k: v for k, v in labels.items() if k in roles}, "st": st}
 
 
 MASK_KEYWORDS = {"_ALPHATEST_ON", "_ALPHA_CLIP", "_ALPHACLIP_ON"}
@@ -416,14 +567,44 @@ BLEND_WORDS = ("transparent", "translucent", "fade", "glass", "alpha blend", "sh
                "force field", "water", "particle", "additive")
 
 
-def material_alpha(shader, floats, keywords, queue=-1, tags=None):
-    """("opaque" | "mask" | "blend", cutoff) of a Unity material: what its shader does with the albedo alpha
-    (the 3D view draws it see-through, Unity project export picks a matching shader). The material's own
-    switches (keywords, URP _Surface/_AlphaClip, HDRP flags, Standard _Mode) win; then the RenderType tag,
-    the render queue and finally words in the shader's name."""
+def is_additive(shader, floats):
+    """True if a material adds its color onto what's behind it (black = invisible): glows, sparks, flashes.
+    Legacy/mobile "Additive" shaders, URP _Blend 2, HDRP _BlendMode 1, Standard Particles _Mode 4, or
+    One/SrcAlpha + One blending."""
     floats = floats or {}
-    cutoff = next((floats[p] for p in CUTOFF_PROPS if p in floats), 0.5)
-    cutoff = min(max(cutoff, 0.01), 0.99)
+    if "additive" in (shader or "").lower():
+        return True
+    if floats.get("_Surface") == 1 and floats.get("_Blend") == 2:  # URP transparent, Additive
+        return True
+    if floats.get("_SurfaceType") == 1 and floats.get("_BlendMode") == 1:  # HDRP transparent, Additive
+        return True
+    if "particle" in (shader or "").lower() and floats.get("_Mode") == 4:  # Standard Particles, Additive
+        return True
+    return floats.get("_SrcBlend") in (1, 5) and floats.get("_DstBlend") == 1
+
+
+def material_alpha(shader, floats, keywords, queue=-1, tags=None):
+    """("opaque" | "mask" | "blend" | "add", cutoff) of a Unity material: what its shader does with the albedo
+    alpha (the 3D view draws it see-through, Unity project export picks a matching shader). "add" is a
+    blended material whose shader adds it on top (is_additive). The material's own switches (keywords,
+    URP _Surface/_AlphaClip, HDRP flags, Standard _Mode) win; then the RenderType tag, the render queue and
+    finally words in the shader's name."""
+    if "additive" in (shader or "").lower():
+        return "add", _cutoff(floats)  # legacy additive shaders ignore any leftover surface switches
+    mode, cutoff = _surface_alpha(shader, floats, keywords, queue, tags)
+    if mode == "blend" and is_additive(shader, floats):
+        return "add", cutoff
+    return mode, cutoff
+
+
+def _cutoff(floats):
+    cutoff = next((floats[p] for p in CUTOFF_PROPS if p in floats), 0.5) if floats else 0.5
+    return min(max(cutoff, 0.01), 0.99)
+
+
+def _surface_alpha(shader, floats, keywords, queue, tags):
+    floats = floats or {}
+    cutoff = _cutoff(floats)
     keywords = {str(k).upper() for k in keywords or ()}
     if keywords & BLEND_KEYWORDS:
         return "blend", cutoff
@@ -447,27 +628,44 @@ def material_alpha(shader, floats, keywords, queue=-1, tags=None):
         return "blend", cutoff
     if any(w in name for w in MASK_WORDS):
         return "mask", cutoff
-    return "opaque", cutoff  # URP / HDRP opaque (a leftover Standard _Mode doesn't count)
-    if "_Mode" in floats and floats["_Mode"] in (1, 2, 3):  # Standard: Opaque, Cutout, Fade, Transparent
-        return ("mask" if floats["_Mode"] == 1 else "blend"), cutoff
-    render_type = ((tags or {}).get("RenderType") or "").lower()
-    if render_type == "transparentcutout":
-        return "mask", cutoff
-    if render_type == "transparent":
-        return "blend", cutoff
-    if 2450 <= queue < 3000:
-        return "mask", cutoff
-    if queue >= 3000:
-        return "blend", cutoff
-    name = (shader or "").lower()
-    if any(w in name for w in ("cutout", "alphatest", "alpha test", "foliage", "leaves", "leaf", "grass")):
-        return "mask", cutoff
-    if any(w in name for w in ("transparent", "fade", "particle", "additive", "glass", "alpha blend")):
-        return "blend", cutoff
     return "opaque", cutoff
 
 
 # --------------------------------------------------------------------------- material index
+
+def bind_matrices(bind):
+    """A mesh's m_BindPose (Matrix4x4f list) as a (B, 4, 4) array."""
+    out = []
+    for m in bind or []:
+        if hasattr(m, "e00"):
+            out.append([[getattr(m, f"e{r}{c}") for c in range(4)] for r in range(4)])
+        else:
+            out.append(list(m) if len(m) == 4 else [m[i * 4:(i + 1) * 4] for i in range(4)])
+    return np.asarray(out, float).reshape(-1, 4, 4)
+
+
+def bones_from_bind(bone_keys, bind, nodes):
+    """Bones of a skinned mesh in its bind pose (UniView space): a bone sits at its inverse bind pose's origin;
+    its parent is the nearest ancestor transform (from nodes, see UnitySession.transforms) that is a bone too."""
+    from .sdk import Bones
+    n = min(len(bone_keys), len(bind))
+    if not n:
+        return None
+    keys = list(bone_keys[:n])
+    points = np.array([np.linalg.inv(b)[:3, 3] if abs(np.linalg.det(b)) > 1e-12 else np.zeros(3)
+                       for b in bind[:n]], float)
+    points[:, 0] *= -1  # UniView meshes are x-flipped
+    index = {k: i for i, k in enumerate(keys) if k is not None}
+    parents, names = [], []
+    for k in keys:
+        node = nodes.get(k) if k is not None else None
+        names.append(node["name"] if node else "?")
+        p, hops = (node or {}).get("parent"), 0
+        while p is not None and p not in index and hops < 64:
+            p, hops = (nodes.get(p) or {}).get("parent"), hops + 1
+        parents.append(index.get(p, -1) if p is not None else -1)
+    return Bones(points, parents, names)
+
 
 class TextureFinder:
     """Finds what uses a mesh and which materials/textures it has (renderer -> material).
@@ -1109,6 +1307,10 @@ class UnitySession(GameSession):
         self._skins = {}
         self._terrains = {}
         self._rigs = None        # humanoid Avatars (unity_humanoid.HumanRig)
+        self._scene_settings = {}  # id(scene file) -> (RenderSettings tree, lightmaps)
+        self._container_scripts = None  # container -> its MonoBehaviours (for _data_materials)
+        self._material_names = {}        # material name -> reader
+        self._material_keys = []         # (loose name, loose .mat file name, name length, reader)
         self._model_rigs = {}    # mesh key -> the HumanRig that fits its skeleton, or None
         self._humanoid = {}      # (clip key, rig) -> clip converted to bone curves
         self._material_readers = {}  # "material:<file>:<id>" -> ObjectReader (filled by hierarchy())
@@ -1189,7 +1391,14 @@ class UnitySession(GameSession):
         if asset.kind == "font":
             from .sdk import font_preview
             return font_preview(self.raw(asset), asset.name)
+        if getattr(asset.ref, "type", None) is not None and asset.ref.type.name == "Cubemap":
+            return cubemap_cross(self.cube_faces(asset, 512))
         return asset_image(asset.ref.read())
+
+    def cube_faces(self, asset, max_side=1024):
+        """The 6 faces of a Cubemap asset (Unity order +X, -X, +Y, -Y, +Z, -Z)."""
+        with self.lock:
+            return cubemap_faces(asset.ref.read(), max_side)
 
     def float_texture(self, asset):
         """(pixels H x W x C float32, settings dict) of a half/float Texture2D, else None. Settings: the
@@ -1373,12 +1582,7 @@ class UnitySession(GameSession):
                     continue
                 if key not in material_cache:
                     try:
-                        mat = read_material(reader.read())
-                        refs = [TextureRef(prop, name, self._asset_for(tex, "Texture2D", name),
-                                           ALBEDO if prop in ALBEDO_PROPS else NORMAL if prop in NORMAL_PROPS else OTHER)
-                                for prop, name, tex in mat["textures"]]
-                        material_cache[key] = Material(mat["name"], refs, color=mat["color"], properties=mat["properties"],
-                                                        alpha_mode=mat["alpha_mode"], alpha_cutoff=mat["alpha_cutoff"])
+                        material_cache[key] = make_material(read_material(reader.read()), self._texture_asset)
                     except Exception:
                         material_cache[key] = None
                 out.append(material_cache[key])
@@ -1966,18 +2170,43 @@ class UnitySession(GameSession):
             handler.process()
         if not handler.m_BoneWeights or not handler.m_BoneIndices:
             raise ValueError("This model has no bone weights.")
-        bind = getattr(handler, "m_BindPose", None) or mesh.m_BindPose
-        bind_poses = []
-        for m in bind:
-            if hasattr(m, "e00"):
-                bind_poses.append([[getattr(m, f"e{r}{c}") for c in range(4)] for r in range(4)])
-            else:
-                bind_poses.append(list(m) if len(m) == 4 else [m[i * 4:(i + 1) * 4] for i in range(4)])
-        bind_poses = np.asarray(bind_poses, float).reshape(-1, 4, 4)
+        bind_poses = bind_matrices(getattr(handler, "m_BindPose", None) or mesh.m_BindPose)
         n = len(bones)
         if len(bind_poses) < n:
             bind_poses = np.concatenate([bind_poses, np.tile(np.eye(4), (n - len(bind_poses), 1, 1))])
         return handler, bones, mesh_node, bind_poses[:n]
+
+    def bones(self, asset):
+        """Skeleton of a skinned mesh in its bind pose (where the shown mesh's bones are), or None.
+        Reads only the bone transforms (not every transform in the game), so it's quick."""
+        if asset.kind != "model" or self._is_terrain(asset) or not self.finder.indexed:
+            return None
+        smrs = self.finder._skinned.get(asset.key)
+        if not smrs:
+            return None
+        with self.lock:
+            readers = []
+            for ptr in smrs[0].read().m_Bones or []:
+                try:
+                    readers.append(ptr.deref())
+                except Exception:
+                    readers.append(None)
+            nodes = {}  # just the bones and their ancestors, like transforms() has them
+            for reader in readers:
+                hops = 0
+                while reader is not None and obj_key(reader.assets_file, reader.path_id) not in nodes and hops < 64:
+                    try:
+                        t = reader.read()
+                        father = t.m_Father.deref() if t.m_Father.path_id else None
+                        name = t.m_GameObject.deref().peek_name() or "?"
+                    except Exception:
+                        break
+                    nodes[obj_key(reader.assets_file, reader.path_id)] = {
+                        "name": name, "parent": obj_key(father.assets_file, father.path_id) if father else None}
+                    reader, hops = father, hops + 1
+            keys = [obj_key(r.assets_file, r.path_id) if r is not None else None for r in readers]
+            bind = bind_matrices(asset.ref.read().m_BindPose)
+        return bones_from_bind(keys, bind, nodes)
 
     def animate(self, model, clip_asset):
         from .unity_skin import Animator
@@ -2380,15 +2609,127 @@ class UnitySession(GameSession):
         if asset.kind == "scene":
             return list(self._scene(asset)[1])
         _names, mats, _n = self._info(asset)
+        if not mats and asset.kind == "model":
+            try:
+                mats = self._data_materials(asset)
+            except Exception:
+                log.exception("Looking for the materials of '%s' in game data failed", asset.name)
+        return [make_material(mat, self._texture_asset) for mat in mats]
+
+    LIGHTMAP_HDR_FORMATS = (15, 16, 17, 18, 19, 20, 24, 25)  # half/float formats and BC6H
+
+    def scene_settings(self, assets_file):
+        """(RenderSettings type tree or None, [(lightmap texture Asset or None, mode)]) of a scene file (cached)."""
+        key = id(assets_file)
+        if key not in self._scene_settings:
+            render, lightmaps = None, []
+            for obj in assets_file.objects.values():
+                name = obj.type.name
+                try:
+                    if name == "RenderSettings" and render is None:
+                        render = obj.read_typetree()
+                        render["_reader"] = obj
+                    elif name == "LightmapSettings" and not lightmaps:
+                        for entry in obj.read().m_Lightmaps or []:
+                            ptr = getattr(entry, "m_Lightmap", None) or getattr(entry, "lightmap", None)
+                            reader = ptr.deref() if ptr is not None and ptr.path_id else None
+                            if reader is None or reader.type.name != "Texture2D":
+                                lightmaps.append((None, ""))
+                                continue
+                            fmt = int(reader.read().m_TextureFormat)
+                            mode = ("hdr" if fmt in self.LIGHTMAP_HDR_FORMATS else
+                                    "rgbm" if fmt in (4, 5, 12, 13, 47, 48, 49, 50) else "dldr")
+                            lightmaps.append((self._asset_for(reader, "Texture2D", reader.peek_name()), mode))
+                except Exception as e:
+                    log.debug("Scene settings of %s: %s", assets_file.name, e)
+            self._scene_settings[key] = (render, lightmaps)
+        return self._scene_settings[key]
+
+    def _data_materials(self, asset):
+        """Materials for a mesh no renderer uses, from a game data asset (ScriptableObject) in the same container
+        that lists the mesh: a Material reference, or a material's name, next to it (games that put meshes on
+        objects from code, e.g. Procelio's "MeshInfo" assets: {"defaultMaterial": "RailgunPart", "lods": [...]})."""
+        if not asset.path:
+            return []
+        if self._container_scripts is None:
+            self._container_scripts, self._material_names = {}, {}
+            with self.lock:
+                for obj in self.env.objects:
+                    name = obj.type.name
+                    if name == "MonoBehaviour" and getattr(obj, "container", None):
+                        self._container_scripts.setdefault(obj.container, []).append(obj)
+                    elif name == "Material":
+                        try:
+                            mat_name = obj.peek_name() or ""
+                        except Exception:
+                            continue
+                        self._material_names.setdefault(mat_name, obj)
+                        stem = os.path.splitext(os.path.basename(getattr(obj, "container", None) or ""))[0]
+                        self._material_keys.append((_loose(mat_name), _loose(stem), len(mat_name), obj))
+        target = (id(asset.ref.assets_file), asset.ref.path_id)
+        for mb in self._container_scripts.get(asset.path, [])[:20]:
+            with self.lock:
+                tree, _note = self._scripts().read(mb)
+            chain = self._path_to(tree, mb, target)
+            # Only the entry that lists the mesh itself: higher up are other parts' and effects' materials.
+            readers = self._materials_in(chain[-1], mb) if chain else []
+            if readers:
+                with self.lock:
+                    return [read_material(r.read()) for r in readers]
+        return []
+
+    def _material_like(self, key):
+        """The material a game's own name for it most likely means ("WING_DELTA" -> MAT_MOV_WING_DELTA): its
+        name or .mat file name ends with the key (shortest wins), else contains it; None if nothing does."""
+        k = _loose(key)
+        k = k[3:] if k.startswith("mat") and len(k) > 8 else k
+        if len(k) < 5:
+            return None
+        ends = [(n, r) for name, stem, n, r in self._material_keys if name.endswith(k) or stem.endswith(k)]
+        if not ends and len(k) >= 6:
+            ends = [(n, r) for name, stem, n, r in self._material_keys if k in name or k in stem]
+        return min(ends, key=lambda e: e[0])[1] if ends else None
+
+    def _ptr_target(self, ptr, owner):
+        f = self.finder._file(owner.assets_file, ptr.get("m_FileID", 0))
+        return f.objects.get(ptr["m_PathID"]) if f is not None else None
+
+    def _path_to(self, node, owner, target, depth=0):
+        """Dicts from `node` down to the one holding a PPtr to `target` ((id(file), path id)), or None."""
+        if depth > 12:
+            return None
+        if isinstance(node, dict):
+            if node.get("m_PathID"):
+                f = self.finder._file(owner.assets_file, node.get("m_FileID", 0))
+                return [] if f is not None and (id(f), node["m_PathID"]) == target else None
+            for value in node.values():
+                found = self._path_to(value, owner, target, depth + 1)
+                if found is not None:
+                    return [node] + found
+        elif isinstance(node, list):
+            for value in node[:4096]:
+                found = self._path_to(value, owner, target, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    def _materials_in(self, node, owner):
+        """Material readers a data dict names directly (PPtrs or names, also in lists of them)."""
         out = []
-        for mat in mats:
-            refs = []
-            for prop, tex_name, reader in mat["textures"]:
-                role = ALBEDO if prop in ALBEDO_PROPS else NORMAL if prop in NORMAL_PROPS else OTHER
-                refs.append(TextureRef(prop, tex_name, self._asset_for(reader, "Texture2D", tex_name), role))
-            out.append(Material(mat["name"], refs, color=mat.get("color"), properties=mat.get("properties"),
-                                alpha_mode=mat.get("alpha_mode", "opaque"), alpha_cutoff=mat.get("alpha_cutoff", 0.5)))
+        for value in node.values():
+            for v in (value if isinstance(value, list) else [value])[:16]:
+                reader = None
+                if isinstance(v, dict) and v.get("m_PathID"):
+                    reader = self._ptr_target(v, owner)
+                    reader = reader if reader is not None and reader.type.name == "Material" else None
+                elif isinstance(v, str) and v:
+                    reader = self._material_names.get(v) or self._material_like(v)
+                if reader is not None and reader not in out:
+                    out.append(reader)
         return out
+
+    def _texture_asset(self, reader, name):
+        return self._asset_for(reader, "Texture2D", name)
 
     def describe(self, asset):
         if self._is_terrain(asset):

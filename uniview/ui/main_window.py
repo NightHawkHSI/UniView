@@ -68,7 +68,7 @@ from uniview.export import (
     write_animated_glb,
     write_asset,
 )
-from uniview.model_display import is_place, model_info_rows, texture_groups, texture_loader
+from uniview.model_display import emitter_looks, is_place, model_info_rows, texture_groups, texture_loader
 from uniview.projects import ProjectStore, detect_project_engine, engine_info_text, project_options
 from uniview.search import FILTER_HELP, AssetFilter, is_unreadable
 from uniview.textdecode import inspect_bytes
@@ -1101,6 +1101,22 @@ class MainWindow(QMainWindow):
     def _materials(self, asset):
         return session_materials(self.session, asset)
 
+    def _sky_images(self, env):
+        """The scene environment with its textured sky's images loaded ("sky_images": (kind, [PIL images])) -
+        a copy; the environment unchanged if it has none or they fail to load."""
+        sky = (env or {}).get("sky_texture")
+        if not sky:
+            return env
+        try:
+            if sky["kind"] == "cube":
+                images = self.session.cube_faces(sky["assets"][0])
+            else:
+                images = [self.session.image(a) for a in sky["assets"]]
+        except Exception as e:
+            log.info("Sky texture not shown: %s", e)
+            return env
+        return {**env, "sky_images": (sky["kind"], images)}
+
     def show_mesh(self, asset):
         session = self.session
         md = session.mesh(asset)
@@ -1115,12 +1131,29 @@ class MainWindow(QMainWindow):
         groups = texture_groups(md, materials)
         image_of = texture_loader(session, len(groups))
         tex = image_of(display_texture(md, materials))
-        parts = [(tris, image_of(tex_asset), color, alpha) for tex_asset, color, tris, alpha in groups]
+        lightmap_of = texture_loader(session, 1)  # full size: baked shadows are sharp
+        parts = [(tris, image_of(tex_asset), color, alpha, uv,
+                  (lightmap_of(lm[0]), lm[1]) if lm is not None else None)
+                 for tex_asset, color, tris, alpha, _fx, uv, lm in groups]
+        effect_parts = {i for i, g in enumerate(groups) if g[4]}
+        bones = getattr(md, "bones", None)
+        if bones is None and session.materials_ready():
+            try:
+                bones = session.bones(asset)
+            except Exception:
+                log.exception("Reading the bones of '%s' failed", asset.name)
+        emitters = [(e, image_of(tex_asset), color, alpha,
+                     (image_of(trail[0]), trail[1], trail[2]) if trail is not None else None)
+                    for e, (tex_asset, color, alpha), trail
+                    in zip(getattr(md, "emitters", None) or [], emitter_looks(md, materials),
+                           emitter_looks(md, materials, trails=True))]
         self.stack.setCurrentWidget(self.mesh_view)
         flat = bool(getattr(md, "view_2d", False))
+        environment = self._sky_images(getattr(md, "environment", None))
         self.mesh_view.show_mesh(poly, tex, parts, flat=flat, gizmos=getattr(md, "gizmos", None),
                                  gizmos_only=bool(getattr(md, "gizmos_only", False)),
-                                 owners=getattr(md, "owners", None))
+                                 owners=getattr(md, "owners", None), emitters=emitters, effect_parts=effect_parts,
+                                 bones=bones, environment=environment)
         self.mesh_view.set_fly(is_place(asset) and not flat)
         n_tex = sum(len(m.textures) for m in materials)
         log.info("Model '%s': %s verts, %s tris, %d material(s), %d texture(s)%s", asset.name,

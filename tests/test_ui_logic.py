@@ -45,6 +45,18 @@ def test_texture_groups_split_by_alpha():
     assert all(g[2].shape == (1, 3) for g in groups)  # same texture, but cutout and opaque stay apart
 
 
+def test_texture_groups_tint_textures():
+    m = mesh(4)
+    mats = [Material("white", [tex("t1")], color=(1, 1, 1, 1)), Material("unset", [tex("t1")], color=(0, 0, 0, 0)),
+            Material("teal", [tex("t1")], color=(0.1, 0.9, 0.7, 0.5), alpha_mode="blend"),
+            Material("glow", [tex("t1")], color=(1, 1, 1, 1), alpha_mode="add")]
+    groups = md_.texture_groups(m, mats)
+    plain = next(g for g in groups if g[1] is None and g[3] is None)
+    assert plain[2].shape == (2, 3)  # white and unset colors don't tint
+    assert any(g[1] == (0.1, 0.9, 0.7) and g[3] == ("blend", 0.5) for g in groups)
+    assert any(g[1] is None and g[3] == ("add", 1.0) for g in groups)
+
+
 def test_texture_groups_without_materials():
     assert md_.texture_groups(mesh(2), []) == []
 

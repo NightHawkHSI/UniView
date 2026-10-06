@@ -8,7 +8,7 @@ import struct
 import numpy as np
 from PIL import Image, ImageDraw
 
-from engines.sdk import IMAGE_KINDS, KIND_LABELS, MODEL_KINDS, main_texture
+from engines.sdk import IMAGE_KINDS, KIND_LABELS, MODEL_KINDS
 from uniview import __version__, pbr
 from uniview.constants import APP_SHORT, log
 from uniview.util import safe_filename
@@ -35,11 +35,10 @@ def material_for(materials, md, index):
 def display_texture(md, materials):
     """Texture Asset to show on the model: the base texture of the material covering the most triangles."""
     for j in sorted(range(len(md.submeshes)), key=lambda j: -len(md.submeshes[j])):
-        mat = material_for(materials, md, j)
-        tex = mat.main_texture() if mat is not None else None
+        tex = pbr.base_texture(material_for(materials, md, j))
         if tex is not None:
             return tex.asset
-    return main_texture(materials)
+    return next((t.asset for t in map(pbr.base_texture, materials) if t is not None), None)
 
 GLOSS_SCALE = ("_GlossMapScale", "_Smoothness", "_SmoothnessRemapMax")
 GLOSS = ("_Glossiness", "_Smoothness")
@@ -53,10 +52,7 @@ def _normal_image(session, tex):
 
 def base_texture(mat, maps):
     """The albedo TextureRef, else the material's main texture unless it's known to be another map."""
-    if pbr.ALBEDO in maps:
-        return maps[pbr.ALBEDO]
-    tex = mat.main_texture()
-    return tex if tex is not None and tex not in maps.values() else None
+    return maps[pbr.ALBEDO] if pbr.ALBEDO in maps else pbr.base_texture(mat)
 
 
 def metal_rough_sources(maps):

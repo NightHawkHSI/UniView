@@ -33,6 +33,7 @@ def guid(asset):
     (details("Nature/Tree Cutout"), "cutout"),
     (details("Universal Render Pipeline/Lit", floats={"_AlphaClip": 1}), "cutout"),
     (details("Anything", queue=2000), "opaque"),
+    (details("Mobile/Particles/Additive"), "transparent"),
 ])
 def test_surface(d, expected):
     assert um.surface(d) == expected
@@ -45,7 +46,15 @@ def test_surface(d, expected):
     # URP opaque with a leftover Standard _Mode from an upgraded material
     (details("Universal Render Pipeline/Lit", floats={"_Surface": 0, "_Mode": 2}), ("opaque", 0.5)),
     (details("", floats={"_Mode": 2, "_Cutoff": 0.065}), ("blend", 0.065)),
-    (details("Legacy Shaders/Particles/Additive"), ("blend", 0.5)),
+    # Legacy additive: leftover HDRP/Standard floats don't count (Procelio LightningParticle 2)
+    (details("Legacy Shaders/Particles/Additive", floats={"_SurfaceType": 0, "_SrcBlend": 1, "_DstBlend": 10}),
+     ("add", 0.5)),
+    (details("Universal Render Pipeline/Particles/Unlit", floats={"_Surface": 1, "_Blend": 2}), ("add", 0.5)),
+    (details("HDRP/Unlit", floats={"_SurfaceType": 1, "_BlendMode": 1}), ("add", 0.5)),
+    (details("FX/Glow", floats={"_SrcBlend": 5, "_DstBlend": 1}, queue=3000), ("add", 0.5)),
+    # HDRP transparent alpha blend, premultiplied One/OneMinusSrcAlpha (Procelio OSC_eye)
+    (details("HDRP/Unlit", floats={"_SurfaceType": 1, "_BlendMode": 0, "_SrcBlend": 1, "_DstBlend": 10},
+             keywords=["_SURFACE_TYPE_TRANSPARENT"]), ("blend", 0.5)),
     (details("Custom/Grass Wind", floats={"_Cutoff": 0}), ("mask", 0.01)),
 ])
 def test_material_alpha(d, expected):

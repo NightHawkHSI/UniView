@@ -52,7 +52,7 @@ def surface(details):
     (engines.unity.material_alpha, which the 3D view uses too)."""
     mode, _cutoff = material_alpha(details.get("shader"), details.get("floats"), details.get("keywords"),
                                    details.get("queue", -1), details.get("tags"))
-    return {"mask": "cutout", "blend": "transparent"}.get(mode, "opaque")
+    return {"mask": "cutout", "blend": "transparent", "add": "transparent"}.get(mode, "opaque")
 
 
 def pick_shader(details):

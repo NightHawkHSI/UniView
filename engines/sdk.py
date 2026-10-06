@@ -112,6 +112,21 @@ class Joint(TypedDict):
     scale: Sequence[float]
 
 
+class Bones:
+    """A skeleton to draw over a model: joint positions in UniView's space (the one mesh() uses), each joint's
+    parent (index, -1 for a root) and name."""
+
+    __slots__ = ("points", "parents", "names")
+
+    def __init__(self, points: ArrayLike, parents: Sequence[int], names: Sequence[str]) -> None:
+        self.points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+        self.parents = np.asarray(parents, dtype=np.int64).reshape(-1)
+        self.names = list(names)
+
+    def __len__(self) -> int:
+        return len(self.points)
+
+
 class Rig(TypedDict):
     """GameSession.skeleton(): a skinned model's skeleton, in UniView's space (the one mesh() uses)."""
     joints: list[Joint]
@@ -140,6 +155,9 @@ class Animated(Protocol):
     def points_at(self, t: float) -> NDArray[np.float32]:
         """(N, 3) vertex positions at time t, same order as mesh(model)."""
         ...
+
+    # Optional: bones_at(t) -> (B, 3) joint positions at time t, same order as GameSession.bones(model),
+    # so the bone overlay moves with the animation.
 
 
 class Asset:
@@ -200,6 +218,17 @@ class MeshData:
     owners      scenes/prefabs: (first vertex of each placed piece (K,) int64, [object id or None] * K) - which
                 object a vertex belongs to, so a click in the view can select it (object ids are the "go" of the
                 plugin's hierarchy() nodes); None for single models
+    emitters    particle systems that can play: objects with simulate(t) -> particles alive at t (pos, vel,
+                size, rot, color, frame - see engines.unity_particles), material (index), render_mode, tiles,
+                mesh and center
+    effect_mask (N,) bool: vertices of still effect stand-ins that playback replaces, or None
+    bones       skinned meshes' skeletons as a Bones (positions, parents, names) for the bone overlay, or None
+    environment scenes: {"sky": (top, horizon, bottom) colors, "ambient": color, "fog": text or None,
+                "sky_name": text, "sky_texture": {"kind": "cube" / "six" / "pano", "assets": [texture
+                Assets], "tint", "rotation"} or None} from the scene's lighting settings, or None (colors are
+                (r, g, b) 0..1; a "cube" asset's faces come from GameSession.cube_faces())
+    Lightmapped scenes also have a "lightmap" entry in uvs (the baked-light texture coordinates; see
+    Material.lightmap).
     """
 
     points: NDArray[np.float32]
@@ -214,6 +243,10 @@ class MeshData:
     gizmos: dict[str, tuple[NDArray[np.float32], NDArray[np.int64]]]
     gizmos_only: bool
     owners: tuple[NDArray[np.int64], list[str | None]] | None
+    emitters: list[Any]
+    effect_mask: NDArray[np.bool_] | None
+    bones: "Bones | None"
+    environment: dict[str, Any] | None
 
     def __init__(self, points: ArrayLike, submeshes: Iterable[ArrayLike], normals: ArrayLike | None = None,
                  uvs: Mapping[str, ArrayLike] | None = None, colors: ArrayLike | None = None,
@@ -232,6 +265,10 @@ class MeshData:
         self.owners = None
         self.gizmos = {}
         self.gizmos_only = False
+        self.emitters = []
+        self.effect_mask = None
+        self.bones = None
+        self.environment = None
         if not n:
             raise ValueError("Mesh has no vertices.")
         if not any(len(s) for s in self.submeshes):
@@ -276,17 +313,31 @@ def orient_to_normals(points: ArrayLike, tris: NDArray[Any], normals: ArrayLike 
 
 
 class TextureRef:
-    """A texture used by a material: slot/property name, display name, the texture Asset, role."""
+    """A texture used by a material: slot/property name, display name, the texture Asset, role.
 
-    __slots__ = ("slot", "name", "asset", "role")
+    label: the shader's name for the slot when the slot itself is cryptic (Shader Graph "Texture2D_<guid>" ->
+    "Base Color Map"), else "". uv_scale / uv_offset: the material's tiling and offset for this texture
+    (uv * scale + offset)."""
+
+    __slots__ = ("slot", "name", "asset", "role", "label", "uv_scale", "uv_offset")
 
     slot: str
     name: str
     asset: Asset
     role: str
+    label: str
+    uv_scale: tuple[float, float]
+    uv_offset: tuple[float, float]
 
-    def __init__(self, slot: str, name: str, asset: Asset, role: str = OTHER) -> None:
-        self.slot, self.name, self.asset, self.role = slot, name, asset, role
+    def __init__(self, slot: str, name: str, asset: Asset, role: str = OTHER, label: str = "",
+                 uv_scale: Sequence[float] = (1.0, 1.0), uv_offset: Sequence[float] = (0.0, 0.0)) -> None:
+        self.slot, self.name, self.asset, self.role, self.label = slot, name, asset, role, label
+        self.uv_scale = (float(uv_scale[0]), float(uv_scale[1]))
+        self.uv_offset = (float(uv_offset[0]), float(uv_offset[1]))
+
+    @property
+    def tiled(self) -> bool:
+        return self.uv_scale != (1.0, 1.0) or self.uv_offset != (0.0, 0.0)
 
 
 class Material:
@@ -295,8 +346,15 @@ class Material:
     color: main color (r, g, b, a) in 0..1 - shown when there's no texture, and multiplied with the
     texture in GLB exports. properties: [(name, value text)] shown in the info panel.
     alpha_mode: how the albedo texture's alpha is used - "opaque" (ignored: many games keep other data there),
-    "mask" (cut out below alpha_cutoff: leaves, grass, fences) or "blend" (see-through: glass, decals, effects).
+    "mask" (cut out below alpha_cutoff: leaves, grass, fences), "blend" (see-through: glass, decals, effects) or
+    "add" (added on top, black = invisible: glows, sparks, flashes).
+    lightmap: texture Asset of the baked light multiplied onto this material in a scene (with the mesh's
+    "lightmap" UVs), or None; lightmap_mode: how it's stored - "hdr" (float), "rgbm" (rgb x 5 x alpha) or
+    "dldr" (rgb x 2).
     """
+
+    lightmap: Asset | None = None
+    lightmap_mode: str = ""
 
     def __init__(self, name: str, textures: Iterable[TextureRef] = (), color: Sequence[float] | None = None,
                  properties: Iterable[tuple[str, str]] | None = None, alpha_mode: str = "opaque",
@@ -475,6 +533,15 @@ class GameSession:
         """An object with .length (seconds) and .points_at(t) -> (N, 3) vertex positions of `model`
         (same order as mesh(model)) posed by `clip` at time t."""
         raise NotImplementedError("This engine plugin can't play animations yet.")
+
+    def cube_faces(self, asset: Asset, max_side: int = 1024) -> list[Any]:
+        """The 6 faces (PIL images: +X, -X, +Y, -Y, +Z, -Z in the engine's own handedness) of a cube texture."""
+        raise NotImplementedError("This engine plugin has no cube textures.")
+
+    def bones(self, model: Asset) -> Bones | None:
+        """Skeleton of a skinned single model for the bone overlay, or None. (Scenes and prefabs put theirs
+        in MeshData.bones.)"""
+        return None
 
     def skeleton(self, model: Asset, clip: Asset | None = None) -> tuple[Rig, AnimationData | None]:
         """Rig of a skinned `model` for rigged glTF exports: (rig, animation or None).

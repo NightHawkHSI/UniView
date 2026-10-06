@@ -143,15 +143,29 @@ class Animator:
         cache[key] = world
         return world
 
+    def _display(self, t, cache):
+        """Skin in the mesh's space, then place it relative to the animated character's root so it
+        stands the way it does in the game: (display matrix, world -> mesh matrix)."""
+        mesh_world = self._world(self.mesh_node, t, cache) if self.mesh_node in self.nodes else np.eye(4)
+        display = (np.linalg.inv(self._world(self.root_node, t, cache)) @ mesh_world
+                   if self.root_node in self.nodes else np.eye(4))
+        return display, np.linalg.inv(mesh_world)
+
+    def bones_at(self, t):
+        """(B, 3) bone positions at time t in UniView's space, in bone_keys order (rest pose for unknown ones)."""
+        t = t % self.length
+        cache = {}
+        display, to_mesh = self._display(t, cache)
+        out = np.array([(display @ to_mesh @ self._world(k, t, cache))[:3, 3] if k in self.nodes
+                        else np.linalg.inv(b)[:3, 3] for k, b in zip(self.bone_keys, self.bind)], np.float32)
+        out = out.reshape(-1, 3)
+        out[:, 0] *= -1
+        return out
+
     def points_at(self, t):
         t = t % self.length
         cache = {}
-        # Skin in the mesh's space, then place it relative to the animated character's root so it
-        # stands the way it does in the game.
-        mesh_world = self._world(self.mesh_node, t, cache) if self.mesh_node in self.nodes else np.eye(4)
-        to_mesh = np.linalg.inv(mesh_world)
-        display = (np.linalg.inv(self._world(self.root_node, t, cache)) @ mesh_world
-                   if self.root_node in self.nodes else np.eye(4))
+        display, to_mesh = self._display(t, cache)
         mats = np.stack([display @ to_mesh @ self._world(k, t, cache) @ b if k in self.nodes else display
                          for k, b in zip(self.bone_keys, self.bind)])
         blended = np.einsum("nk,nkij->nij", self.weights, mats[np.clip(self.indices, 0, len(mats) - 1)])

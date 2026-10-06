@@ -79,9 +79,11 @@ def name_channel(name):
 
 def assign(textures):
     """{channel: TextureRef} for a Material's textures. The engine's albedo/normal roles and known slots
-    first; then texture names fill channels that are still empty."""
+    first; then the slot's own words ("Mesh_AO", the shader's "Emission Mask"), then texture names fill channels
+    that are still empty."""
     def known(t):
-        return {ALBEDO_ROLE: ALBEDO, NORMAL_ROLE: NORMAL}.get(t.role) or slot_channel(t.slot)
+        return ({ALBEDO_ROLE: ALBEDO, NORMAL_ROLE: NORMAL}.get(t.role) or slot_channel(t.slot)
+                or slot_channel(getattr(t, "label", "")))
 
     out = {}
     for t in textures:
@@ -91,10 +93,36 @@ def assign(textures):
     for t in textures:
         if known(t):
             continue
-        channel = name_channel(t.name) or name_channel(getattr(t.asset, "name", ""))
+        channel = (name_channel(t.slot) or name_channel(getattr(t, "label", "")) or name_channel(t.name)
+                   or name_channel(getattr(t.asset, "name", "")))
         if channel and channel not in out:
             out[channel] = t
     return out
+
+
+# Words in a slot / shader label / texture name that mean "not a picture to show": data maps for the shader.
+DATA_WORDS = ("mask", "masks", "noise", "flow", "distortion", "distort", "dissolve", "ramp", "lut", "cubemap",
+              "reflection", "matcap", "lightmap", "lightmaps", "shadowmask", "depth", "screen", "material")
+
+
+def _slot_words(t):
+    return set(re.split(r"[^a-z0-9]+", " ".join((t.slot, getattr(t, "label", ""))).lower()))
+
+
+def base_texture(mat):
+    """The TextureRef to draw a material with: its albedo (known slot, shader name or texture name), else its
+    first texture that isn't known to be another map (normal, AO, mask, metallic, ...); None if all are."""
+    if mat is None or not mat.textures:
+        return None
+    maps = assign(mat.textures)
+    if ALBEDO in maps:
+        return maps[ALBEDO]
+    taken = {id(t) for t in maps.values()}
+    for t in mat.textures:
+        if t.role == NORMAL_ROLE or id(t) in taken or _slot_words(t) & set(DATA_WORDS):
+            continue
+        return t
+    return None
 
 
 def property_float(material, names):

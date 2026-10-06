@@ -10,6 +10,7 @@ Anything built from the tokens once (a 3D background, an icon) re-runs on a them
 on_change(callback) / set_icon(button, name).
 """
 
+import math
 import os
 import tempfile
 
@@ -317,6 +318,20 @@ def _draw(name, p, color):
         p.drawEllipse(QPointF(32, 32), 10, 10)
         for dx, dy in ((0, 1), (1, 0), (0, -1), (-1, 0), (0.7, 0.7), (-0.7, 0.7), (0.7, -0.7), (-0.7, -0.7)):
             p.drawLine(QPointF(32 + dx * 17, 32 + dy * 17), QPointF(32 + dx * 24, 32 + dy * 24))
+    elif name == "bone":
+        p.drawLine(QPointF(22, 42), QPointF(42, 22))
+        for cx, cy in ((14, 44), (20, 50), (44, 14), (50, 20)):
+            p.drawEllipse(QPointF(cx, cy), 6.5, 6.5)
+    elif name == "sparkle":
+        star = []
+        for i in range(8):
+            r = 22 if i % 2 == 0 else 7
+            a = i * 3.14159265 / 4
+            star.append(QPointF(28 + r * math.sin(a), 34 - r * math.cos(a)))
+        p.drawPolygon(star)
+        p.setPen(_pen(color, 3))
+        p.drawLine(QPointF(50, 8), QPointF(50, 18))
+        p.drawLine(QPointF(45, 13), QPointF(55, 13))
     else:
         raise KeyError(f"No icon called {name!r}")
 
