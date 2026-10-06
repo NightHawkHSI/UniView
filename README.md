@@ -204,7 +204,7 @@ The version number is `__version__` in `uniview/__init__.py`.
 Not every model can be traced back to a material. Right-click any texture in the list and choose **Apply as texture to current model**.
 
 **A model looks see-through or odd.**
-Leave **Texture alpha** off. Many games store other data in the alpha channel. If the texture is upside down, try **Flip texture V**.
+Leave **Texture alpha** off. Materials the game marks as cutout (leaves, grass, fences) or transparent (glass, smoke) already use their alpha; the button forces it on every texture, and many games store other data in the alpha channel. If the texture is upside down, try **Flip texture V**.
 
 **Something crashed or didn't load.**
 Check the **Console**, or open `crash.log` / `viewer.log` next to `UniView.exe`. Please attach them when you [open an issue](https://github.com/NightHawkHSI/UniView/issues).
@@ -221,13 +221,25 @@ Loaded games stay in memory so they reopen instantly. Right-click a game → **U
 
 To add or update a game, right-click it in UniView → **Report compatibility...**. That opens a GitHub issue already filled in with the game's details. You can also send a pull request that edits `compat.json`. The key is the game's install folder name (e.g. `steamapps/common/Robocraft` → `"Robocraft"`).
 
-## Notes
+## Privacy
 
-- Extracted assets are still owned by the game's creators. Viewing them for personal use is fine, but check before sharing them.
+UniView has no telemetry, accounts or ads. It only goes online for:
+
+- the compatibility list (`compat.json` from this GitHub repository) at startup - turn it off under **Help**;
+- optional tools you choose to install: vgmstream and Cpp2IL from their GitHub releases, ILSpy (`ilspycmd`) from NuGet and, if needed, the .NET runtime from Microsoft;
+- Unity packages (e.g. glTFast) from Unity's package registry when you export a Unity project;
+- **Report compatibility...**, which opens a *public* GitHub issue in your browser with the game's name, install folder name (not the full path), engine, file counts and your UniView version. Nothing is sent until you submit it.
 
 ## Legal Disclaimers
 
-- UniView is licensed under the [GNU General Public License v3.0](LICENSE).
+- UniView is free software under the [GNU General Public License v3.0](LICENSE). It is free and non-commercial. The source code of every release is in this repository, under the tag of that version.
+- **No warranty.** UniView is provided "as is", without warranty of any kind (see sections 15 and 16 of the GPL). You use it at your own risk.
+- **Game content belongs to its owners.** UniView contains no game assets, code or keys. Everything it shows comes from games you have installed yourself, and that content stays the property of its creators. Extract and use assets only for personal, educational, research or interoperability purposes, or with the rights holder's permission. Don't redistribute them, and don't publish Unity projects exported from a game: they contain the game's assets and code.
+- **Game licenses and online games.** Extracting, decompiling or modding a game may be against its End User License Agreement or Terms of Service. Check them first. **Don't use Mod Maker on online or multiplayer games**: anti-cheat systems can detect changed files and ban accounts. Mod Maker keeps a backup when it installs a mod; you can also use your launcher's "verify game files" option to restore the original files.
+- **Encryption.** UniView does not include, find or crack encryption keys and does not remove copy protection. Encrypted Unreal games only open with an AES key you supply, and you are responsible for having the right to use it. The laws on decrypting and decompiling software (for example the DMCA in the U.S. and the EU Software Directive) differ between countries; make sure your use is allowed where you live.
+- **Decompiling.** The optional decompilers (ILSpy, Cpp2IL) are there so you can understand how game data is used, for interoperability and research. What you do with decompiled code is your responsibility.
+- **Screenshots** in this README show game assets © their respective owners, for illustration only.
+- **Rights holders:** if you believe UniView or something in this repository infringes your rights, [open an issue](https://github.com/NightHawkHSI/UniView/issues) and it will be looked at promptly.
 - UniView is not sponsored by or affiliated with Unity Technologies, Epic Games, Valve Corporation, ZeniMax Media / Bethesda Softworks, Epic Games Tools (RAD Game Tools), or any game developer or publisher, or their affiliates.
 - "Unity" is a registered trademark of Unity Technologies or its affiliates in the U.S. and elsewhere.
 - "Unreal" and "Unreal Engine" are trademarks or registered trademarks of Epic Games, Inc. in the U.S. and elsewhere.

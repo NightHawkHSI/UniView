@@ -382,6 +382,8 @@ class SceneBuilder:
         self.meshes = {}      # mesh key -> MeshData (or None)
         self.materials = {}   # material key -> Material
         self.points, self.uvs, self.subs, self.slots = [], [], [], []
+        self.owner = None     # "go:<file>:<path id>" of the object being visited (hierarchy() node "go")
+        self.owner_starts, self.owner_uids = [], []  # first vertex of each placed piece -> its GameObject
         self.material_list, self.material_index = [], {}
         self.count = 0
         self.triangles = 0
@@ -423,7 +425,8 @@ class SceneBuilder:
                 role = ALBEDO if prop in ALBEDO_PROPS else NORMAL if prop in NORMAL_PROPS else OTHER
                 refs.append(TextureRef(prop, tex_name, self.session._asset_for(tex_reader, "Texture2D", tex_name), role))
             self.material_index[key] = len(self.material_list)
-            self.material_list.append(Material(mat["name"], refs, color=mat["color"], properties=mat["properties"]))
+            self.material_list.append(Material(mat["name"], refs, color=mat["color"], properties=mat["properties"],
+                                               alpha_mode=mat["alpha_mode"], alpha_cutoff=mat["alpha_cutoff"]))
         return self.material_index[key]
 
     def _add(self, md, matrix, materials, submesh_filter=None):
@@ -460,6 +463,8 @@ class SceneBuilder:
             mat = materials[min(slot, len(materials) - 1)] if materials else None
             self.slots.append(mat if mat is not None else self._default_material())
         self.triangles += n_tris
+        self.owner_starts.append(self.count)
+        self.owner_uids.append(self.owner)
         self.points.append(pts)
         self.uvs.append(uv if uv is not None else np.zeros((len(pts), 2), np.float32))
         self.count += len(pts)
@@ -530,7 +535,7 @@ class SceneBuilder:
         if mkey not in self.material_index:
             self.material_index[mkey] = len(self.material_list)
             refs = [TextureRef("_MainTex", tex_asset.name, tex_asset, ALBEDO)] if tex_asset is not None else []
-            self.material_list.append(Material(st.get("m_Name") or "sprite", refs, color=color))
+            self.material_list.append(Material(st.get("m_Name") or "sprite", refs, color=color, alpha_mode="blend"))
         points[:, 0] *= -1  # UniView meshes are x-flipped (see FLIP)
         md = MeshData(points, [tris], uvs={"UV0": uvs})
         if self._add(md, matrix, [self.material_index[mkey]]):
@@ -576,7 +581,8 @@ class SceneBuilder:
             own = base.color or (1.0, 1.0, 1.0, 1.0)
             self.material_index[key] = len(self.material_list)
             self.material_list.append(Material(base.name, base.textures,
-                                               tuple(a * b for a, b in zip(own, color)), base.properties))
+                                               tuple(a * b for a, b in zip(own, color)), base.properties,
+                                               alpha_mode=base.alpha_mode, alpha_cutoff=base.alpha_cutoff))
         return self.material_index[key]
 
     def _add_local(self, points, uvs, tris, matrix, material):
@@ -684,9 +690,11 @@ class SceneBuilder:
             return
         try:
             t = transform_reader.read()
-            go = t.m_GameObject.deref().read()
+            go_reader = t.m_GameObject.deref()
+            go = go_reader.read()
         except Exception:
             return
+        self.owner = f"go:{go_reader.assets_file.name}:{go_reader.path_id}"
         p, r, s = t.m_LocalPosition, t.m_LocalRotation, t.m_LocalScale
         matrix = parent_matrix @ trs((p.x, p.y, p.z), (r.x, r.y, r.z, r.w), (s.x, s.y, s.z))
         active = parent_active and (bool(getattr(go, "m_IsActive", True)) or not self.hide_inactive)
@@ -774,6 +782,8 @@ class SceneBuilder:
             raise ValueError("Nothing visible here (no active mesh or sprite renderers, colliders or lights).")
         if not self.subs:
             # Only colliders / lights...: two invisible (flat) triangles at the corners give the view its size.
+            self.owner_starts.append(self.count)
+            self.owner_uids.append(None)
             allpts = np.concatenate([p for p, _s in gizmos.values()])
             lo, hi = allpts.min(0), allpts.max(0)
             self.points.append(np.array([lo, lo, lo, hi, hi, hi], np.float32))
@@ -783,6 +793,7 @@ class SceneBuilder:
         md = MeshData(np.concatenate(self.points), self.subs, uvs={"UV0": np.concatenate(self.uvs)},
                       material_slots=self.slots, name=name)
         md.gizmos = gizmos
+        md.owners = (np.array(self.owner_starts, np.int64), self.owner_uids)
         md.gizmos_only = self.renderers == 0 and self.effects == 0 and bool(gizmos)
         md.view_2d = self.sprite_count > 0 and self.sprite_count * 2 >= self.renderers
         return md, self.material_list

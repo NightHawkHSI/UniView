@@ -132,7 +132,8 @@ Material("metal_crate", [TextureRef("$basetexture", "crate_color", tex_asset, AL
 ```
 
 The viewer puts the first `ALBEDO` texture of the material with the most triangles on the model.
-Exports include all the textures.
+Exports include all the textures. Pass `alpha_mode="mask"` (with `alpha_cutoff`) or `alpha_mode="blend"` for
+materials whose albedo alpha is a cutout or transparency; the 3D view then draws them see-through.
 
 ## Helpers in `engines.sdk` and friends
 

@@ -8,6 +8,7 @@ color and surface properties carried over under the names that shader uses.
 
 import re
 
+from engines.unity import material_alpha
 from uniview import pbr
 
 BUILTIN_GUID = "0000000000000000f000000000000000"  # Unity's built-in extra resources
@@ -40,8 +41,6 @@ EMISSION_COLOR = ("_EmissionColor", "_EmissiveColor", "_GlowColor")
 METALLIC_MAP = ("_MetallicGlossMap", "_MaskMap")
 OCCLUSION = ("_OcclusionMap", "_AOMap", "_AmbientOcclusionMap")
 GLOSS = ("_Glossiness", "_Smoothness")
-TRANSPARENT_WORDS = ("transparent", "translucent", "fade", "glass", "alpha blend", "shield", "hologram",
-                     "forcefield", "force field", "water")
 
 
 def _first(mapping, names):
@@ -49,21 +48,11 @@ def _first(mapping, names):
 
 
 def surface(details):
-    """'opaque', 'cutout' or 'transparent', from the queue, tags, keywords, floats and shader name."""
-    name = (details.get("shader") or "").lower()
-    kw = set(details.get("keywords") or ())
-    floats = details.get("floats") or {}
-    queue = details.get("queue", -1)
-    render_type = (details.get("tags") or {}).get("RenderType", "")
-    if (render_type == "Transparent" or queue >= 2750
-            or kw & {"_ALPHABLEND_ON", "_ALPHAPREMULTIPLY_ON", "_SURFACE_TYPE_TRANSPARENT"}
-            or floats.get("_Surface") == 1 or floats.get("_Mode") in (2, 3)
-            or any(w in name for w in TRANSPARENT_WORDS)):
-        return "transparent"
-    if (render_type == "TransparentCutout" or 2400 <= queue < 2750 or "_ALPHATEST_ON" in kw
-            or floats.get("_AlphaClip") == 1 or floats.get("_Mode") == 1 or "cutout" in name):
-        return "cutout"
-    return "opaque"
+    """'opaque', 'cutout' or 'transparent', from the queue, tags, keywords, floats and shader name
+    (engines.unity.material_alpha, which the 3D view uses too)."""
+    mode, _cutoff = material_alpha(details.get("shader"), details.get("floats"), details.get("keywords"),
+                                   details.get("queue", -1), details.get("tags"))
+    return {"mask": "cutout", "blend": "transparent"}.get(mode, "opaque")
 
 
 def pick_shader(details):

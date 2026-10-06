@@ -1115,11 +1115,12 @@ class MainWindow(QMainWindow):
         groups = texture_groups(md, materials)
         image_of = texture_loader(session, len(groups))
         tex = image_of(display_texture(md, materials))
-        parts = [(tris, image_of(tex_asset), color) for tex_asset, color, tris in groups]
+        parts = [(tris, image_of(tex_asset), color, alpha) for tex_asset, color, tris, alpha in groups]
         self.stack.setCurrentWidget(self.mesh_view)
         flat = bool(getattr(md, "view_2d", False))
         self.mesh_view.show_mesh(poly, tex, parts, flat=flat, gizmos=getattr(md, "gizmos", None),
-                                 gizmos_only=bool(getattr(md, "gizmos_only", False)))
+                                 gizmos_only=bool(getattr(md, "gizmos_only", False)),
+                                 owners=getattr(md, "owners", None))
         self.mesh_view.set_fly(is_place(asset) and not flat)
         n_tex = sum(len(m.textures) for m in materials)
         log.info("Model '%s': %s verts, %s tris, %d material(s), %d texture(s)%s", asset.name,

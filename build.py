@@ -38,7 +38,7 @@ UNITYPY_PACKAGES = [
 SOURCE_FILES = [
     "unity_viewer.py", "uniview", "requirements.txt", "run.bat", "build.bat", "build.py",
     "Icon.png", "README.md", "LICENSE", "CREDITS.md", ".gitignore", "ScreenShots", "compat.json",
-    "engines", "plugins", "PLUGINS.md", "tests",
+    "engines", "plugins", "PLUGINS.md", "tests", "third_party_licenses",
     ".github", "ruff.toml", "requirements-dev.txt",
 ]
 
@@ -139,6 +139,68 @@ def make_splash(png_path, out_path, version):
     img.save(out_path)
 
 
+LICENSE_FILE = re.compile(r"(LICEN[CS]E|COPYING|NOTICE|AUTHORS)", re.I)
+# Licence texts the bundled pieces need but don't ship themselves (third_party_licenses/<file> -> licenses/<folder>).
+EXTRA_LICENSES = {
+    "LGPL-3.0.txt": "PySide6 (Qt for Python, Qt, Shiboken6)",  # the wheels only carry the Qt commercial notice
+    "capstone.txt": "Capstone (capstone.dll in TypeTreeGeneratorAPI)",
+}
+
+
+def collect_licenses(out_dir, pyz_toc=None):
+    """licenses/ next to the exe: the licence files of every installed package that PyInstaller put in
+    _internal, Python's own LICENSE.txt (which also covers OpenSSL, libffi, Tcl/Tk, bzip2 and the VC++
+    runtime of the Windows build) and the texts in third_party_licenses/. pyz_toc: PyInstaller's PYZ-00.toc,
+    which lists the pure-Python modules packed inside the exe. Returns the folder names."""
+    import ast
+    import importlib.metadata
+    internal = os.path.join(out_dir, "_internal")
+    bundled = {os.path.splitext(n)[0].lower() for n in os.listdir(internal)}
+    if pyz_toc and os.path.isfile(pyz_toc):
+        with open(pyz_toc, encoding="utf-8") as f:
+            bundled |= {entry[0].split(".")[0].lower() for entry in ast.literal_eval(f.read())[1]}
+    dest_root = os.path.join(out_dir, "licenses")
+    if os.path.exists(dest_root):
+        shutil.rmtree(dest_root)
+    made = []
+
+    def copy(src, folder, name):
+        target = os.path.join(dest_root, folder)
+        os.makedirs(target, exist_ok=True)
+        shutil.copy2(src, os.path.join(target, name))
+        if folder not in made:
+            made.append(folder)
+
+    for dist in importlib.metadata.distributions():
+        files = dist.files or []
+        tops = (dist.read_text("top_level.txt") or "").split()
+        tops += [f.parts[0] for f in files if len(f.parts) > 1 and not f.parts[0].endswith(
+            (".dist-info", ".egg-info", ".data")) and f.parts[0] != ".."]
+        if not any(t.lower() in bundled for t in tops):
+            continue
+        folder = f"{dist.metadata['Name']} {dist.version}"
+        for f in files:
+            if LICENSE_FILE.search(f.name):
+                parts = list(f.parts)
+                if "licenses" in parts:  # keep the paths numpy & co. use to tell their vendored licences apart
+                    parts = parts[parts.index("licenses") + 1:]
+                elif parts[0].endswith(".dist-info"):
+                    parts = parts[1:]
+                copy(dist.locate_file(f), folder, "__".join(parts))
+    python_license = os.path.join(sys.base_prefix, "LICENSE.txt")
+    if os.path.isfile(python_license):
+        copy(python_license, f"Python {sys.version.split()[0]}", "LICENSE.txt")
+    for name, folder in EXTRA_LICENSES.items():
+        src = os.path.join(ROOT, "third_party_licenses", name)
+        if os.path.isfile(src):
+            copy(src, folder, name)
+    with open(os.path.join(dest_root, "README.txt"), "w", encoding="utf-8") as f:
+        f.write("Licences of the third-party software bundled with UniView (see CREDITS.md for what each one does).\n"
+                "FMOD (fmod.dll) is proprietary and used under the FMOD End User License Agreement:\n"
+                "https://www.fmod.com/legal\n\n" + "\n".join(sorted(made, key=str.lower)) + "\n")
+    return made
+
+
 def ensure_pyinstaller():
     import importlib.util
     if importlib.util.find_spec("PyInstaller") is None:
@@ -202,6 +264,9 @@ def build_release(version, test_game=None):
         src = os.path.join(ROOT, name)
         if os.path.isfile(src):
             shutil.copy2(src, out_dir)
+    step("Collecting third-party licences")
+    made = collect_licenses(out_dir, os.path.join(WORK, "build", APP_NAME, "PYZ-00.toc"))
+    print(f"  {len(made)} packages -> licenses/")
     # User plugins live next to the exe: ship the template and the guide.
     os.makedirs(os.path.join(out_dir, "plugins"), exist_ok=True)
     for name, target in (("plugins/_template.py", "plugins/_template.py"), ("PLUGINS.md", "PLUGINS.md")):

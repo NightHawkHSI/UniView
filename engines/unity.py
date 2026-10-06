@@ -384,14 +384,87 @@ def read_material(mat):
         except (TypeError, ValueError):
             continue
     color = next((colors[p] for p in COLOR_PROPS if p in colors), None)
-    shader = ""
-    try:
-        shader = mat.m_Shader.deref().peek_name() or ""
-    except Exception:
-        pass
+    shader = shader_name(mat.m_Shader)
     if shader:
         properties.insert(0, ("Shader", shader))
-    return {"name": mat.m_Name, "textures": textures, "color": color, "properties": properties}
+    floats = {}
+    for prop, value in getattr(saved, "m_Floats", None) or []:
+        try:
+            floats[_prop_name(prop)] = float(value)
+        except (TypeError, ValueError):
+            continue
+    keywords = getattr(mat, "m_ValidKeywords", None)
+    if keywords is None:
+        keywords = (getattr(mat, "m_ShaderKeywords", "") or "").split()
+    tags = {}
+    for entry in getattr(mat, "stringTagMap", None) or []:
+        try:
+            k, v = entry if isinstance(entry, (tuple, list)) else (entry.first, entry.second)
+            tags[str(k)] = str(v)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    alpha_mode, cutoff = material_alpha(shader, floats, keywords, int(getattr(mat, "m_CustomRenderQueue", -1)), tags)
+    return {"name": mat.m_Name, "textures": textures, "color": color, "properties": properties,
+            "alpha_mode": alpha_mode, "alpha_cutoff": cutoff}
+
+
+MASK_KEYWORDS = {"_ALPHATEST_ON", "_ALPHA_CLIP", "_ALPHACLIP_ON"}
+BLEND_KEYWORDS = {"_ALPHABLEND_ON", "_ALPHAPREMULTIPLY_ON", "_SURFACE_TYPE_TRANSPARENT", "_BLENDMODE_ALPHA"}
+CUTOFF_PROPS = ("_Cutoff", "_AlphaClipThreshold", "_AlphaCutoff")
+MASK_WORDS = ("cutout", "alphatest", "alpha test", "foliage", "leaves", "leaf", "grass")
+BLEND_WORDS = ("transparent", "translucent", "fade", "glass", "alpha blend", "shield", "hologram", "forcefield",
+               "force field", "water", "particle", "additive")
+
+
+def material_alpha(shader, floats, keywords, queue=-1, tags=None):
+    """("opaque" | "mask" | "blend", cutoff) of a Unity material: what its shader does with the albedo alpha
+    (the 3D view draws it see-through, Unity project export picks a matching shader). The material's own
+    switches (keywords, URP _Surface/_AlphaClip, HDRP flags, Standard _Mode) win; then the RenderType tag,
+    the render queue and finally words in the shader's name."""
+    floats = floats or {}
+    cutoff = next((floats[p] for p in CUTOFF_PROPS if p in floats), 0.5)
+    cutoff = min(max(cutoff, 0.01), 0.99)
+    keywords = {str(k).upper() for k in keywords or ()}
+    if keywords & BLEND_KEYWORDS:
+        return "blend", cutoff
+    if keywords & MASK_KEYWORDS:
+        return "mask", cutoff
+    if floats.get("_Surface") == 1 or floats.get("_SurfaceType") == 1:  # URP / HDRP transparent surface
+        return "blend", cutoff
+    if floats.get("_AlphaClip") == 1 or floats.get("_AlphaCutoffEnable") == 1:  # URP / HDRP alpha clipping
+        return "mask", cutoff
+    if "_Surface" in floats or "_SurfaceType" in floats:
+        return "opaque", cutoff  # URP / HDRP opaque (a leftover Standard _Mode doesn't count)
+    if floats.get("_Mode") in (1, 2, 3):  # Standard: Opaque, Cutout, Fade, Transparent
+        return ("mask" if floats["_Mode"] == 1 else "blend"), cutoff
+    render_type = ((tags or {}).get("RenderType") or "").lower()
+    if render_type == "transparent" or queue >= 2750:
+        return "blend", cutoff
+    if render_type == "transparentcutout" or 2400 <= queue < 2750:
+        return "mask", cutoff
+    name = (shader or "").lower()
+    if any(w in name for w in BLEND_WORDS):
+        return "blend", cutoff
+    if any(w in name for w in MASK_WORDS):
+        return "mask", cutoff
+    return "opaque", cutoff  # URP / HDRP opaque (a leftover Standard _Mode doesn't count)
+    if "_Mode" in floats and floats["_Mode"] in (1, 2, 3):  # Standard: Opaque, Cutout, Fade, Transparent
+        return ("mask" if floats["_Mode"] == 1 else "blend"), cutoff
+    render_type = ((tags or {}).get("RenderType") or "").lower()
+    if render_type == "transparentcutout":
+        return "mask", cutoff
+    if render_type == "transparent":
+        return "blend", cutoff
+    if 2450 <= queue < 3000:
+        return "mask", cutoff
+    if queue >= 3000:
+        return "blend", cutoff
+    name = (shader or "").lower()
+    if any(w in name for w in ("cutout", "alphatest", "alpha test", "foliage", "leaves", "leaf", "grass")):
+        return "mask", cutoff
+    if any(w in name for w in ("transparent", "fade", "particle", "additive", "glass", "alpha blend")):
+        return "blend", cutoff
+    return "opaque", cutoff
 
 
 # --------------------------------------------------------------------------- material index
@@ -1304,7 +1377,8 @@ class UnitySession(GameSession):
                         refs = [TextureRef(prop, name, self._asset_for(tex, "Texture2D", name),
                                            ALBEDO if prop in ALBEDO_PROPS else NORMAL if prop in NORMAL_PROPS else OTHER)
                                 for prop, name, tex in mat["textures"]]
-                        material_cache[key] = Material(mat["name"], refs, color=mat["color"], properties=mat["properties"])
+                        material_cache[key] = Material(mat["name"], refs, color=mat["color"], properties=mat["properties"],
+                                                        alpha_mode=mat["alpha_mode"], alpha_cutoff=mat["alpha_cutoff"])
                     except Exception:
                         material_cache[key] = None
                 out.append(material_cache[key])
@@ -2312,7 +2386,8 @@ class UnitySession(GameSession):
             for prop, tex_name, reader in mat["textures"]:
                 role = ALBEDO if prop in ALBEDO_PROPS else NORMAL if prop in NORMAL_PROPS else OTHER
                 refs.append(TextureRef(prop, tex_name, self._asset_for(reader, "Texture2D", tex_name), role))
-            out.append(Material(mat["name"], refs, color=mat.get("color"), properties=mat.get("properties")))
+            out.append(Material(mat["name"], refs, color=mat.get("color"), properties=mat.get("properties"),
+                                alpha_mode=mat.get("alpha_mode", "opaque"), alpha_cutoff=mat.get("alpha_cutoff", 0.5)))
         return out
 
     def describe(self, asset):
@@ -2460,24 +2535,24 @@ class UnityPlugin(EnginePlugin):
                                         path=scene_path(assets_file, scene_paths), source=assets_file.name,
                                         ref={"type": "scene", "transforms": transforms}))
             added += 1
-        # Only prefabs with something to see (skip audio/logic/UI prefabs): a MeshFilter or
-        # SkinnedMeshRenderer inside the same bundle entry.
-        visible = {getattr(r, "container", None) for r in renderer_readers}
+        # Every bundle prefab: ones with nothing to draw in 3D (UI, sound, logic) open as a 2D picture or
+        # structure view.
         for container, gos in prefab_containers.items():
-            if container not in visible:
-                continue
             label = container[7:] if container.lower().startswith("assets/") else container
             label = label[:-7] if label.lower().endswith(".prefab") else label
             session.assets.append(Asset("scene", f"Prefab: {label}", ("prefab", container), uid=f"prefab:{container}",
                                         size=None, path=container, source=gos[0].assets_file.name,
                                         ref={"type": "prefab", "gameobjects": gos}))
             added += 1
-        if not prefab_containers:
-            added += self._classic_prefabs(session, transforms_by_file, renderer_readers)
+        # Also prefabs outside bundle .prefab entries: builds without bundles, and games that mix bundles with
+        # sharedassets/resources prefabs or keep prefabs as dependencies of other bundle entries.
+        covered = {obj_key(g.assets_file, g.path_id) for gos in prefab_containers.values() for g in gos}
+        added += self._classic_prefabs(session, transforms_by_file, renderer_readers, covered)
         log.info("Found %d scene(s)/prefab(s)", added)
 
-    def _classic_prefabs(self, session, transforms_by_file, renderer_readers):
-        """Builds without bundles: root objects outside the scene files that have a mesh under them."""
+    def _classic_prefabs(self, session, transforms_by_file, renderer_readers, covered=()):
+        """Root objects outside the scene files that have a mesh under them (GameObjects in `covered` are
+        already listed as bundle prefabs)."""
         from .unity_scene import is_scene_file
         files = [(f, ts) for f, ts in transforms_by_file.values() if not is_scene_file(f)]
         if sum(len(ts) for _f, ts in files) > self.MAX_PREFAB_SCAN:
@@ -2498,7 +2573,7 @@ class UnityPlugin(EnginePlugin):
                     continue
         roots = set()
         for r in renderer_readers:
-            if is_scene_file(r.assets_file):
+            if is_scene_file(r.assets_file) or (getattr(r, "container", None) or "").lower().endswith(".prefab"):
                 continue
             try:
                 go = r.read().m_GameObject
@@ -2512,6 +2587,8 @@ class UnityPlugin(EnginePlugin):
                     roots.add(k)
                     break
                 k = father[k]
+        if covered:
+            roots -= {t for g, t in go_of.items() if g in covered}
         added = 0
         res_paths = getattr(session, "resource_paths", None) or {}
         for k in roots:

@@ -38,6 +38,22 @@ def test_surface(d, expected):
     assert um.surface(d) == expected
 
 
+@pytest.mark.parametrize("d, expected", [
+    # HDRP shader graph with alpha clipping on (Procelio robot parts)
+    (details("Shader Graphs/TexturedMaterialShaderMain", floats={"_AlphaCutoffEnable": 1, "_AlphaCutoff": 0.3},
+             queue=2475), ("mask", 0.3)),
+    # URP opaque with a leftover Standard _Mode from an upgraded material
+    (details("Universal Render Pipeline/Lit", floats={"_Surface": 0, "_Mode": 2}), ("opaque", 0.5)),
+    (details("", floats={"_Mode": 2, "_Cutoff": 0.065}), ("blend", 0.065)),
+    (details("Legacy Shaders/Particles/Additive"), ("blend", 0.5)),
+    (details("Custom/Grass Wind", floats={"_Cutoff": 0}), ("mask", 0.01)),
+])
+def test_material_alpha(d, expected):
+    from engines.unity import material_alpha
+    mode, cutoff = material_alpha(d["shader"], d["floats"], d["keywords"], d["queue"], d["tags"])
+    assert (mode, round(cutoff, 3)) == expected
+
+
 @pytest.mark.parametrize("shader, textures, expected", [
     ("Standard", (), ("Standard", True)),
     ("Legacy Shaders/Diffuse", (), ("Legacy Shaders/Diffuse", True)),

@@ -36,6 +36,15 @@ def test_texture_groups_merge_by_texture_and_color():
     assert next(g for g in groups if g[0] is None and g[1] is None)[2].shape == (1, 3)
 
 
+def test_texture_groups_split_by_alpha():
+    m = mesh(3)
+    mats = [Material("leaf", [tex("t1")], alpha_mode="mask", alpha_cutoff=0.3), Material("bark", [tex("t1")]),
+            Material("glass", color=(0.2, 0.4, 1.0, 0.25), alpha_mode="blend")]
+    groups = md_.texture_groups(m, mats)
+    assert sorted(str(g[3]) for g in groups) == ["('blend', 0.25)", "('mask', 0.3)", "None"]
+    assert all(g[2].shape == (1, 3) for g in groups)  # same texture, but cutout and opaque stay apart
+
+
 def test_texture_groups_without_materials():
     assert md_.texture_groups(mesh(2), []) == []
 

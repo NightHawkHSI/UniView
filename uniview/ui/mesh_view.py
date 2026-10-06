@@ -8,6 +8,7 @@ import pyvista as pv
 from PySide6.QtCore import QEvent, QSignalBlocker, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QComboBox,
     QHBoxLayout,
@@ -45,6 +46,7 @@ class MeshInfoPanel(QWidget):
     save_model = Signal()
     open_blender = Signal()
     show_code = Signal(object)      # a uniview.code_links link to decompile and show
+    object_selected = Signal(object)  # "go" id of the object picked in the Objects tree (None: not an object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -90,6 +92,8 @@ class MeshInfoPanel(QWidget):
                                 "Open a component to see its values; double-click a referenced asset to jump to it.")
         self.objects.itemExpanded.connect(self._fill_component)
         self.objects.itemDoubleClicked.connect(self._object_double_clicked)
+        self.objects.currentItemChanged.connect(
+            lambda item, _prev: self.object_selected.emit(item.data(0, Qt.UserRole + 3) if item else None))
         self.objects.setContextMenuPolicy(Qt.CustomContextMenu)
         self.objects.customContextMenuRequested.connect(self._objects_menu)
         self._structure = None  # (nodes, by_uid) shown in the objects tree
@@ -156,6 +160,7 @@ class MeshInfoPanel(QWidget):
         self.materials_label.setVisible(not has)
         self.objects.clear()
         self.objects_filter.clear()
+        self._go_items = {}  # node "go" id -> its tree item
         self._structure = (nodes, by_uid or {}) if has else None
         if not has:
             self.tabs.setCurrentIndex(0)
@@ -182,6 +187,9 @@ class MeshInfoPanel(QWidget):
                                                               f"scale ({s[0]:g}, {s[1]:g}, {s[2]:g})"]))
             if not visible[i]:
                 item.setForeground(0, muted)
+            if n.get("go"):
+                item.setData(0, Qt.UserRole + 3, n["go"])
+                self._go_items[n["go"]] = item
             for comp in prefab_info.components(n, nodes, by_uid or {}):
                 child = QTreeWidgetItem([comp["title"].rsplit(".", 1)[-1], "script" if comp["script"] else ""])
                 child.setToolTip(0, comp["title"])
@@ -204,6 +212,34 @@ class MeshInfoPanel(QWidget):
             self._add_game_data(game_entries, bold, muted, accent)
         if self._prefer_objects:
             self.tabs.setCurrentIndex(1)
+
+    RENDER_COMPONENTS = ("MeshFilter", "MeshRenderer", "SkinnedMeshRenderer", "SpriteRenderer")
+
+    def select_object(self, go):
+        """Show the object clicked in the 3D view: select it in the Objects tree with its mesh and material
+        components opened (their rows link to the mesh, materials and textures). Returns its name or None."""
+        item = getattr(self, "_go_items", {}).get(go) if go else None
+        if item is None:
+            with QSignalBlocker(self.objects):
+                self.objects.setCurrentItem(None)
+                self.objects.clearSelection()
+            return None
+        if item.isHidden():
+            self.objects_filter.clear()
+        self.tabs.setCurrentIndex(1)
+        parent = item.parent()
+        while parent is not None:
+            parent.setExpanded(True)
+            parent = parent.parent()
+        item.setExpanded(True)
+        for i in range(item.childCount()):
+            child = item.child(i)
+            if child.text(0) in self.RENDER_COMPONENTS:
+                child.setExpanded(True)
+        with QSignalBlocker(self.objects):
+            self.objects.setCurrentItem(item)
+        self.objects.scrollToItem(item, QAbstractItemView.PositionAtTop)
+        return item.text(0)
 
     def _add_game_data(self, entries, bold, muted, accent):
         group = QTreeWidgetItem(["Game data", f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'} name this"])
@@ -367,6 +403,10 @@ def tool_button(icon_name, tip, checkable=True, checked=False):
 class MeshView(QWidget):
     uv_layout_requested = Signal()
 
+    CLICK_PIXELS = 5      # a press and release closer than this (and quick) is a click, not a drag
+    CLICK_SECONDS = 0.5
+    SELECT_COLOR = "#ffb020"  # outline of the object clicked in a scene/prefab (like Unity's orange)
+
     def _set_background(self):
         self.plotter.set_background(theme.VIEWPORT_BOTTOM, top=theme.VIEWPORT_TOP)
 
@@ -381,16 +421,21 @@ class MeshView(QWidget):
         self.texture_img = None
         self.override = None     # texture the user put on the whole model
         self.parts = []          # [(PolyData of one submesh, its texture or None)]
-        self._textures = {}      # (id(img), alpha, flip) -> pv.Texture
+        self._textures = {}      # (id(img), alpha mode, cutoff, flip) -> pv.Texture
         self.flat = False        # 2D content: straight-on view without perspective
         self.gizmos = {}         # kind -> (points, segments) line overlays
+        self.owners = None       # scenes/prefabs: MeshData.owners (which object each vertex belongs to)
+        self.selected = None     # "go" id of the object clicked in the view (highlighted)
+        self._locator = None     # cell locator of self.poly for clicks (built on the first click)
+        self._press = None       # (position, time) of a left button press, to tell clicks from drags
 
         self.wire = tool_button("wireframe", "Wireframe")
         self.edges = tool_button("solid", "Edges: draw the triangle edges over the model")
         self.use_tex = tool_button("texture", "Texture", checked=True)
         self.flip_v = tool_button("flip", "Flip texture V (for upside-down textures)")
-        self.tex_alpha = tool_button("alpha", "Texture alpha: use the texture's alpha channel as transparency.\n"
-                                     "Off by default: many games store other data there.")
+        self.tex_alpha = tool_button("alpha", "Texture alpha: use every texture's alpha channel as transparency.\n"
+                                     "Off by default: many games store other data there. Materials the game marks\n"
+                                     "as cutout (leaves, grass, fences) or transparent use their alpha anyway.")
         self.use_colors = tool_button("colors", "Vertex colors", checked=True)
         self.show_gizmos = tool_button("gizmo", "Gizmos: draw colliders (green, triggers yellow), light ranges "
                                        "(orange),\ncamera views (white) and sound sources (cyan) as wire shapes.")
@@ -501,6 +546,7 @@ class MeshView(QWidget):
         bar.addWidget(self.info)
 
         self.panel = MeshInfoPanel()
+        self.panel.object_selected.connect(self._tree_selected)
         split = QSplitter()
         split.addWidget(self.plotter.interactor)
         split.addWidget(self.panel)
@@ -518,6 +564,14 @@ class MeshView(QWidget):
     def eventFilter(self, obj, event):
         if obj is self.plotter.interactor:
             kind = event.type()
+            if kind == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._press = (event.position(), time.perf_counter())
+            elif kind == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton and self._press:
+                (start, when), self._press = self._press, None
+                pos = event.position()
+                if (abs(pos.x() - start.x()) + abs(pos.y() - start.y()) <= self.CLICK_PIXELS
+                        and time.perf_counter() - when <= self.CLICK_SECONDS):
+                    QTimer.singleShot(0, lambda: self._pick(pos))
             if kind == QEvent.Wheel:
                 if self.fly.isChecked():
                     # One wheel notch = one slider step (x1.25 speed).
@@ -706,6 +760,77 @@ class MeshView(QWidget):
         camera.position = tuple(pos + d * dist * 0.8)
         self._fly_view()
 
+    def _pick(self, point):
+        """A click in a scene/prefab: select the object under the mouse (in the view and the Objects tab)."""
+        if self.owners is None or self.poly is None or self.animator is not None:
+            return
+        from vtkmodules.vtkRenderingCore import vtkCellPicker
+        widget = self.plotter.interactor
+        ratio = widget.devicePixelRatioF()
+        picker = vtkCellPicker()
+        picker.SetTolerance(0.0005)
+        go = None
+        x, y = point.x() * ratio, (widget.height() - point.y()) * ratio
+        blended = [a for a in getattr(self, "_blended", []) if a.GetPickable()]
+        for actor in blended:  # solid things first: a faint smoke puff in front shouldn't take the click
+            actor.PickableOff()
+        hit = picker.Pick(x, y, 0, self.plotter.renderer)
+        for actor in blended:
+            actor.PickableOn()
+        if not hit and blended:
+            hit = picker.Pick(x, y, 0, self.plotter.renderer)
+        if hit:
+            # The drawn parts are copies (split per texture, re-meshed for shading): find the triangle under
+            # the hit point in the whole model instead, whose vertices map to objects.
+            from vtkmodules.vtkCommonDataModel import vtkStaticCellLocator
+            from vtkmodules.vtkCommonCore import mutable
+            if self._locator is None:
+                self._locator = vtkStaticCellLocator()
+                self._locator.SetDataSet(self.poly)
+                self._locator.BuildLocator()
+            closest, cell, sub, dist2 = [0.0, 0.0, 0.0], mutable(0), mutable(0), mutable(0.0)
+            self._locator.FindClosestPoint(picker.GetPickPosition(), closest, cell, sub, dist2)
+            if int(cell) >= 0:
+                vertex = int(self.poly.faces[int(cell) * 4 + 1])
+                starts, uids = self.owners
+                go = uids[max(0, int(np.searchsorted(starts, vertex, side="right")) - 1)]
+        name = self.panel.select_object(go)
+        self.highlight(go if name else None, name)
+
+    def _tree_selected(self, go):
+        item = self.panel.objects.currentItem()
+        self.highlight(go, item.text(0) if item is not None and go else None)
+
+    def highlight(self, go, name=None):
+        """Outline one object's triangles (go: a "go" id from MeshData.owners; None clears it)."""
+        self.selected = go
+        self._draw_highlight(name)
+        self.plotter.render()
+
+    def _draw_highlight(self, name=None):
+        self.plotter.remove_actor("selected_object", render=False)
+        base = getattr(self, "_info_text", "")
+        if self.selected is None or self.owners is None or self.poly is None:
+            self.info.setText(base)
+            return
+        starts, uids = self.owners
+        ends = np.append(starts[1:], self.poly.n_points)
+        first = self.poly.faces.reshape(-1, 4)[:, 1]
+        keep = np.zeros(len(first), bool)
+        for i in (i for i, uid in enumerate(uids) if uid == self.selected):
+            keep |= (first >= starts[i]) & (first < ends[i])
+        if not keep.any():
+            self.info.setText(base)
+            return
+        faces = self.poly.faces.reshape(-1, 4)[keep]
+        outline = pv.PolyData(self.poly.points, faces.ravel())
+        self.plotter.add_mesh(outline, name="selected_object", style="wireframe", color=self.SELECT_COLOR,
+                              line_width=1.5, lighting=False, pickable=False, render=False)
+        if name:
+            self._selected_name = name
+        self.info.setText(f"{base}   ·   selected: {getattr(self, '_selected_name', '')} "
+                          f"({int(keep.sum()):,} tris)")
+
     def reset_camera(self):
         self._home_camera()
         self.plotter.render()
@@ -825,10 +950,15 @@ class MeshView(QWidget):
             self.anim_time = value / 1000.0 * self.animator.length
             self._anim_apply()
 
-    def show_mesh(self, poly, texture_img, parts=None, flat=False, gizmos=None, gizmos_only=False):
-        """parts: [(faces array (M, 3), texture image or None, color or None)] - each submesh with its own look.
-        flat: 2D content (sprites facing -Z) - looked at straight on, without perspective."""
+    def show_mesh(self, poly, texture_img, parts=None, flat=False, gizmos=None, gizmos_only=False, owners=None):
+        """parts: [(faces array (M, 3), texture image or None, color or None, alpha)] - each submesh with its own
+        look; alpha: None (opaque), ("mask", cutoff) or ("blend", opacity), see model_display.material_alpha.
+        flat: 2D content (sprites facing -Z) - looked at straight on, without perspective.
+        owners: MeshData.owners of a scene/prefab, so clicking selects objects."""
         self.flat = flat
+        self.owners = owners
+        self.selected = None
+        self._locator = None
         self.gizmos = gizmos or {}
         self.show_gizmos.setEnabled(bool(self.gizmos))
         if gizmos_only:
@@ -844,10 +974,11 @@ class MeshView(QWidget):
         self.override = None
         self._textures = {}
         self.parts = []
-        looks = {(id(img) if img is not None else None, color) for _f, img, color in parts or []}
-        if parts and (len(looks) > 1 or any(color is not None and img is None for _f, img, color in parts)):
+        looks = {(id(img) if img is not None else None, color, alpha) for _f, img, color, alpha in parts or []}
+        if parts and (len(looks) > 1 or any((color is not None and img is None) or alpha
+                                            for _f, img, color, alpha in parts)):
             self._part_vertices = []
-            for tris, img, color in parts:
+            for tris, img, color, alpha in parts:
                 # Each part keeps only its own vertices (big maps have hundreds of parts).
                 used, local = np.unique(tris, return_inverse=True)
                 faces = np.hstack([np.full((len(tris), 1), 3, dtype=np.int64),
@@ -857,7 +988,7 @@ class MeshView(QWidget):
                     part.point_data[key] = poly.point_data[key][used]
                 if poly.active_texture_coordinates is not None:
                     part.active_texture_coordinates = np.asarray(poly.active_texture_coordinates)[used]
-                self.parts.append((part, img, color))
+                self.parts.append((part, img, color, alpha))
                 self._part_vertices.append(used)
         with QSignalBlocker(self.uv_combo):
             self.uv_combo.clear()
@@ -866,22 +997,39 @@ class MeshView(QWidget):
             self.uv_combo.setEnabled(len(channels) > 1)
         tex_note = (f"{len(self.parts)} textured parts" if self.parts else
                     "textured" if texture_img is not None else "no texture found")
-        self.info.setText(f"{poly.n_points:,} verts  {poly.n_cells:,} tris  ({tex_note})")
+        self._info_text = f"{poly.n_points:,} verts  {poly.n_cells:,} tris  ({tex_note})"
+        self.info.setText(self._info_text)
         self.redraw(reset_camera=True)
 
     def set_texture(self, img):
         self.override = self.texture_img = img
         self.redraw()
 
-    def _texture(self, img):
-        alpha, flip = self.tex_alpha.isChecked(), self.flip_v.isChecked()
-        key = (id(img), alpha, flip)
+    def _texture(self, img, alpha=None):
+        """alpha: the material's (see show_mesh); the toolbar's alpha button uses the texture alpha everywhere."""
+        if self.tex_alpha.isChecked():
+            alpha = ("blend", 1.0)
+        flip = self.flip_v.isChecked()
+        mode = alpha[0] if alpha and "A" in img.getbands() else None
+        key = (id(img), mode, alpha[1] if mode == "mask" else None, flip)
         if key not in self._textures:
-            arr = np.asarray(img.convert("RGBA" if alpha else "RGB"))
+            arr = np.array(img.convert("RGBA" if mode else "RGB"))
+            if mode == "mask":
+                # Cutout: fully in or out, like the game's alpha test (no half-see-through edges to sort).
+                arr[..., 3] = np.where(arr[..., 3] >= alpha[1] * 255, 255, 0)
             if flip:
                 arr = arr[::-1]
             self._textures[key] = pv.Texture(np.ascontiguousarray(arr))
         return self._textures[key]
+
+    def _depth_peeling(self, on):
+        """See-through parts need depth peeling to overlap correctly; it costs frame time, so only then."""
+        if on != getattr(self, "_peeling", False):
+            self._peeling = on
+            if on:
+                self.plotter.enable_depth_peeling(number_of_peels=8)
+            else:
+                self.plotter.disable_depth_peeling()
 
     GIZMO_COLORS = {"collider": "#3ddc84", "trigger": "#e8d44d", "light": "#ff9f43", "camera": "#ffffff",
                     "audio": "#4dd0e1"}
@@ -898,6 +1046,7 @@ class MeshView(QWidget):
 
     def redraw(self, *_, reset_camera=False):
         self.plotter.clear_actors()  # clear() would also drop the lights
+        self._blended = []
         if not self.plotter.renderer.lights:
             self.plotter.enable_lightkit()
         if self.poly is None:
@@ -913,17 +1062,27 @@ class MeshView(QWidget):
         has_uv = self.poly.active_texture_coordinates is not None
         if self.use_tex.isChecked() and has_uv and self.parts and self.override is None:
             # Each part with its own material's texture.
-            for part, img, color in self.parts:
+            see_through = False
+            self._blended = []  # actors of blended parts (smoke, glass): clicks go through them first
+            for part, img, color, alpha in self.parts:
                 part_kwargs = dict(kwargs)
                 if img is not None:
-                    part_kwargs["texture"] = self._texture(img)
+                    part_kwargs["texture"] = self._texture(img, alpha)
+                    see_through |= bool(alpha) or self.tex_alpha.isChecked()
                 elif color is not None:
                     part_kwargs["color"] = color[:3]
+                    if alpha and alpha[0] == "blend" and alpha[1] < 1:
+                        part_kwargs["opacity"] = alpha[1]
+                        see_through = True
                 elif self.use_colors.isChecked() and "vertex_colors" in part.point_data:
                     part_kwargs.update(scalars="vertex_colors", rgba=True)
                 else:
                     part_kwargs["color"] = "#c8c8c8"
-                self.plotter.add_mesh(part, **part_kwargs)
+                actor = self.plotter.add_mesh(part, **part_kwargs)
+                if alpha and alpha[0] == "blend":
+                    self._blended.append(actor)
+            self._depth_peeling(see_through)
+            self._draw_highlight()
             if reset_camera:
                 self._home_camera()
             self.plotter.render()
@@ -935,6 +1094,8 @@ class MeshView(QWidget):
         else:
             kwargs["color"] = "#c8c8c8"
         self.plotter.add_mesh(self.poly, **kwargs)
+        self._depth_peeling("texture" in kwargs and self.tex_alpha.isChecked())
+        self._draw_highlight()
         if reset_camera:
             self._home_camera()
         self.plotter.render()

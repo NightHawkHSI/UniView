@@ -197,6 +197,9 @@ class MeshData:
     view_2d     mostly flat 2D content (sprites) facing -Z: shown straight on instead of from an angle
     gizmos      {kind: (points (N, 3), segments (M, 2))} wire overlays for things without a mesh (colliders,
                 lights, cameras, sound sources), shown on request; gizmos_only: that's all there is
+    owners      scenes/prefabs: (first vertex of each placed piece (K,) int64, [object id or None] * K) - which
+                object a vertex belongs to, so a click in the view can select it (object ids are the "go" of the
+                plugin's hierarchy() nodes); None for single models
     """
 
     points: NDArray[np.float32]
@@ -210,6 +213,7 @@ class MeshData:
     view_2d: bool
     gizmos: dict[str, tuple[NDArray[np.float32], NDArray[np.int64]]]
     gizmos_only: bool
+    owners: tuple[NDArray[np.int64], list[str | None]] | None
 
     def __init__(self, points: ArrayLike, submeshes: Iterable[ArrayLike], normals: ArrayLike | None = None,
                  uvs: Mapping[str, ArrayLike] | None = None, colors: ArrayLike | None = None,
@@ -225,6 +229,7 @@ class MeshData:
         self.name = name
         self.skipped = skipped
         self.view_2d = False
+        self.owners = None
         self.gizmos = {}
         self.gizmos_only = False
         if not n:
@@ -289,14 +294,19 @@ class Material:
 
     color: main color (r, g, b, a) in 0..1 - shown when there's no texture, and multiplied with the
     texture in GLB exports. properties: [(name, value text)] shown in the info panel.
+    alpha_mode: how the albedo texture's alpha is used - "opaque" (ignored: many games keep other data there),
+    "mask" (cut out below alpha_cutoff: leaves, grass, fences) or "blend" (see-through: glass, decals, effects).
     """
 
     def __init__(self, name: str, textures: Iterable[TextureRef] = (), color: Sequence[float] | None = None,
-                 properties: Iterable[tuple[str, str]] | None = None) -> None:
+                 properties: Iterable[tuple[str, str]] | None = None, alpha_mode: str = "opaque",
+                 alpha_cutoff: float = 0.5) -> None:
         self.name = name
         self.textures = list(textures)
         self.color = tuple(color) if color is not None else None
         self.properties = list(properties or [])
+        self.alpha_mode = alpha_mode
+        self.alpha_cutoff = alpha_cutoff
 
     def main_texture(self) -> TextureRef | None:
         for t in self.textures:

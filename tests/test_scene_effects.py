@@ -51,3 +51,22 @@ def test_crossed_quads_and_ribbon_shapes():
     assert ribbon([(0, 0, 0)], 1.0) is None
     loop = ribbon([(0, 0, 0), (1, 0, 0), (1, 1, 0)], 0.1, loop=True)
     assert len(loop[2]) == 3 * 2 * 4
+
+
+def test_scene_vertices_remember_their_object():
+    """A click in the 3D view finds the object under the mouse from MeshData.owners."""
+    from types import SimpleNamespace
+
+    from engines.sdk import Material, MeshData
+    from engines.unity_scene import SceneBuilder
+    builder = SceneBuilder(SimpleNamespace())
+    builder.material_list.append(Material("m"))
+    tri = MeshData([[0, 0, 0], [1, 0, 0], [0, 1, 0]], [[[0, 1, 2]]])
+    for go in ("go:level0:1", "go:level0:2", "go:level0:1"):
+        builder.owner = go
+        builder._add(tri, np.eye(4), [0])
+    md, _materials = builder.result("test")
+    starts, uids = md.owners
+    assert list(starts) == [0, 3, 6] and uids == ["go:level0:1", "go:level0:2", "go:level0:1"]
+    vertex = 4  # in the second triangle
+    assert uids[int(np.searchsorted(starts, vertex, side="right")) - 1] == "go:level0:2"

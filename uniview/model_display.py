@@ -9,21 +9,35 @@ from uniview.export import material_for
 
 
 def texture_groups(md, materials):
-    """Submeshes grouped by what they show: [(texture Asset or None, (r, g, b) or None, triangles)].
+    """Submeshes grouped by what they show: [(texture Asset or None, (r, g, b) or None, triangles, alpha)].
+    alpha: None (opaque), ("mask", cutoff) or ("blend", opacity) - see Material.alpha_mode.
 
     One entry per texture (or plain material color), so each can be drawn as one part."""
-    groups = {}  # (texture key, color) -> (texture Asset, color, [triangle arrays])
+    groups = {}  # (texture key, color, alpha) -> (texture Asset, color, [triangle arrays], alpha)
     if materials:
         for j, tris in enumerate(md.submeshes):
             mat = material_for(materials, md, j)
             main = mat.main_texture() if mat is not None else None
             color = mat.color if (mat is not None and main is None and mat.color is not None) else None
+            alpha = material_alpha(mat, color)
             if color is not None:
                 color = tuple(min(1.0, max(0.0, c)) for c in color[:3])
-            key = (main.asset.key if main is not None else None, color)
-            groups.setdefault(key, (main.asset if main is not None else None, color, []))[2].append(tris)
-    return [(tex_asset, color, np.concatenate(tris_list) if len(tris_list) > 1 else tris_list[0])
-            for tex_asset, color, tris_list in groups.values()]
+            key = (main.asset.key if main is not None else None, color, alpha)
+            groups.setdefault(key, (main.asset if main is not None else None, color, [], alpha))[2].append(tris)
+    return [(tex_asset, color, np.concatenate(tris_list) if len(tris_list) > 1 else tris_list[0], alpha)
+            for tex_asset, color, tris_list, alpha in groups.values()]
+
+
+def material_alpha(mat, color=None):
+    """How a part with this material is see-through: None, ("mask", cutoff) or ("blend", opacity). A plain
+    color (no texture) that blends takes its opacity from the color's alpha."""
+    mode = getattr(mat, "alpha_mode", "opaque") if mat is not None else "opaque"
+    if mode == "mask":
+        return "mask", round(float(mat.alpha_cutoff), 3)
+    if mode == "blend":
+        opacity = float(color[3]) if color is not None and len(color) > 3 else 1.0
+        return "blend", round(min(1.0, max(0.05, opacity)), 3)
+    return None
 
 
 def texture_loader(session, n_textures):
