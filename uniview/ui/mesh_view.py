@@ -406,6 +406,7 @@ def tool_button(icon_name, tip, checkable=True, checked=False):
 
 class MeshView(QWidget):
     uv_layout_requested = Signal()
+    lod_requested = Signal(int)  # the LOD picker changed (level)
 
     CLICK_PIXELS = 5      # a press and release closer than this (and quick) is a click, not a drag
     CLICK_SECONDS = 0.5
@@ -453,7 +454,8 @@ class MeshView(QWidget):
                                      "as cutout (leaves, grass, fences) or transparent use their alpha anyway.")
         self.use_colors = tool_button("colors", "Vertex colors", checked=True)
         self.show_gizmos = tool_button("gizmo", "Gizmos: draw colliders (green, triggers yellow), light ranges "
-                                       "(orange),\ncamera views (white) and sound sources (cyan) as wire shapes.")
+                                       "(orange),\ncamera views (white), sound sources (cyan) and physics joints (pink:\n"
+                                       "anchor to the connected body, e.g. a ragdoll) as wire shapes.")
         self.show_gizmos.setEnabled(False)
         self.play_fx = tool_button("sparkle", "Play effects: move the particle systems' particles (simulated, "
                                    "approximate)\ninstead of showing still puffs. Needs View > Show particle "
@@ -488,6 +490,11 @@ class MeshView(QWidget):
         self.uv_combo.currentTextChanged.connect(self.set_uv_channel)
         uv_layout = tool_button("uv", "UV layout: show the UV triangles drawn over the texture (Ctrl+U).",
                                 checkable=False)
+        self.lod_combo = QComboBox()
+        self.lod_combo.setToolTip("Level of detail: LOD0 is the most detailed. For a scene or prefab, which level of\n"
+                                  "every LOD group to draw; for a model, jump to its other LOD meshes.")
+        self.lod_combo.setEnabled(False)
+        self.lod_combo.currentIndexChanged.connect(self._lod_picked)
         uv_layout.clicked.connect(self.uv_layout_requested)
 
         self.info = QLabel()
@@ -591,7 +598,8 @@ class MeshView(QWidget):
         groups = ((self.use_tex, self.flip_v, self.tex_alpha, self.use_colors),
                   (self.wire, self.edges, self.show_lighting, self.show_gizmos, self.show_bones, self.play_fx),
                   (zoom_in, zoom_out, reset, self.fly),
-                  (role(QLabel("UV"), "muted"), self.uv_combo, uv_layout))
+                  (role(QLabel("UV"), "muted"), self.uv_combo, uv_layout),
+                  (role(QLabel("LOD"), "muted"), self.lod_combo))
         for i, group in enumerate(groups):
             if i:
                 bar.addSpacing(8)
@@ -1191,6 +1199,21 @@ class MeshView(QWidget):
         self.info.setText(self._info_text)
         self.redraw(reset_camera=True)
 
+    def set_lods(self, count, current=0):
+        """LOD picker: `count` levels (none / 1 = disabled), `current` selected."""
+        with QSignalBlocker(self.lod_combo):
+            self.lod_combo.clear()
+            if count > 1:
+                self.lod_combo.addItems([f"LOD{i}" for i in range(count)])
+                self.lod_combo.setCurrentIndex(min(max(current, 0), count - 1))
+            else:
+                self.lod_combo.addItem("-")
+        self.lod_combo.setEnabled(count > 1)
+
+    def _lod_picked(self, index):
+        if index >= 0 and self.lod_combo.isEnabled():
+            self.lod_requested.emit(index)
+
     def set_texture(self, img):
         self.override = self.texture_img = img
         self.redraw()
@@ -1234,7 +1257,7 @@ class MeshView(QWidget):
                 self.plotter.disable_depth_peeling()
 
     GIZMO_COLORS = {"collider": "#3ddc84", "trigger": "#e8d44d", "light": "#ff9f43", "camera": "#ffffff",
-                    "audio": "#4dd0e1"}
+                    "audio": "#4dd0e1", "joint": "#ff6ad5"}
 
     def _draw_gizmos(self):
         if not (self.show_gizmos.isChecked() and self.gizmos):

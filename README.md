@@ -126,6 +126,9 @@ Unreal notes:
 - **Model panel**: vertex/triangle counts, the source file, the prefab path, what uses the model, and its materials and textures.
 - **Fly camera** (F): walk through scenes and maps like a game camera: WASD to move, Q/E down/up, drag to look around, Shift for speed, the mouse wheel sets the speed, double-click a spot to jump there. Scenes, maps and terrains open in it; walls stay drawn right up to the camera, so you can go inside buildings.
 - **Animation playback**: play Unity animation clips (generic and humanoid) on their skinned models.
+- **LOD picker**: step through LOD0, LOD1... - a scene or prefab redraws every LOD group at that level; a model jumps to its sibling LOD meshes.
+- **Animators** (Unity): AnimatorControllers are listed with their state machine drawn like Unity's Animator window (default state, Any State, transitions), with every parameter, each state's clips or blend tree and the conditions of each transition. Double-click a state to open its clip.
+- **Physics**: the **Gizmos** switch also draws joints (pink: anchor to the connected body - ragdolls show their bone chain); physics materials are listed with their friction and bounciness; cloth is counted in the info panel.
 - **Bones**: the **Bones** button draws skinned models' skeletons on top (in models and prefabs), following a playing animation; click a joint to see its name.
 - **Materials done right**: textures go in the slot the shader really uses (Shader Graph slots are read by the shader's own names, so no more normal maps painted on as color), with the material's tiling/offset and color tint. Meshes that the game puts together in code get their material from the game's data when it names one. Cubemaps are listed with the textures and shown unfolded.
 - **Texture viewer**: zoom under the mouse, drag to pan, with a checkerboard background for transparency.

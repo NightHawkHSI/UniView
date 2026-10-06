@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 import engines
-from engines.sdk import IMAGE_KINDS, KIND_LABELS, KINDS, MODEL_KINDS, VIEW_OPTIONS
+from engines.sdk import IMAGE_KINDS, KIND_LABELS, KINDS, MODEL_KINDS, VIEW_LEVELS, VIEW_OPTIONS
 from uniview import __version__, code_links, game_data, modmaker, prefab_info
 from uniview.constants import (
     APP_DIR,
@@ -80,6 +80,7 @@ from uniview.ui.dialogs import ExportDialog, PluginsDialog, edit_project_notes, 
 from uniview.ui.home import HomePage
 from uniview.ui.media import AnimationView, AudioView, ImageView, ImageWindow, VideoView
 from uniview.ui import canvas_render
+from uniview.ui.controller_view import ControllerView
 from uniview.ui.mesh_view import MeshView
 from uniview.ui.prefab_view import PrefabView
 from uniview.ui.decompile_dialog import decompile_game_code
@@ -240,8 +241,11 @@ class MainWindow(QMainWindow):
         ll.addWidget(self.list_stack)
 
         # right: stacked previews
+        self.controller_view = ControllerView()
+        self.controller_view.clip_requested.connect(lambda clip: self.goto_asset(clip.key))
         self.mesh_view = MeshView()
         self.mesh_view.uv_layout_requested.connect(self.show_uv_layout)
+        self.mesh_view.lod_requested.connect(self._lod_requested)
         panel = self.mesh_view.panel
         panel.apply_texture.connect(self.apply_texture)
         panel.open_texture.connect(lambda asset: self.goto_asset(asset.key))
@@ -286,7 +290,7 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         for w in (self.placeholder_page, self.mesh_view, self.image_view, self.text_view, self.audio_view,
-                  self.anim_view, self.video_view, self.prefab_view):
+                  self.anim_view, self.video_view, self.prefab_view, self.controller_view):
             self.stack.addWidget(w)
 
         self.viewer = QSplitter()
@@ -653,7 +657,8 @@ class MainWindow(QMainWindow):
                       "video": self.style().standardIcon(QStyle.SP_MediaPlay),
                       "font": self.style().standardIcon(QStyle.SP_FileDialogDetailedView),
                       "data": self.style().standardIcon(QStyle.SP_FileDialogInfoView),
-                      "animation": self.style().standardIcon(QStyle.SP_BrowserReload)}
+                      "animation": self.style().standardIcon(QStyle.SP_BrowserReload),
+                      "controller": self.style().standardIcon(QStyle.SP_FileDialogListView)}
 
         by_kind = {}
         for asset in session.assets:
@@ -990,6 +995,9 @@ class MainWindow(QMainWindow):
                         frames = []
                     self.anim_view.show_clip(text, targets, flipbook=len(frames))
                     self.stack.setCurrentWidget(self.anim_view)
+                elif asset.kind == "controller":
+                    self.controller_view.show_controller(asset.name, session.controller(asset))
+                    self.stack.setCurrentWidget(self.controller_view)
                 elif asset.kind == "text":
                     self.show_text_file(asset)
                 else:
@@ -1101,6 +1109,19 @@ class MainWindow(QMainWindow):
     def _materials(self, asset):
         return session_materials(self.session, asset)
 
+    def _lod_requested(self, level):
+        """LOD picker: a scene/prefab rebuilds with that level of every LOD group; a model jumps to that LOD mesh."""
+        if self.current is None:
+            return
+        if self.current.kind == "scene":
+            if VIEW_LEVELS["lod_level"] != level:
+                VIEW_LEVELS["lod_level"] = level
+                self.show_asset(self.current)
+            return
+        models = getattr(self, "_lod_models", [])
+        if level < len(models) and models[level] is not None and models[level].key != self.current.key:
+            self.goto_asset(models[level].key)
+
     def _sky_images(self, env):
         """The scene environment with its textured sky's images loaded ("sky_images": (kind, [PIL images])) -
         a copy; the environment unchanged if it has none or they fail to load."""
@@ -1119,6 +1140,9 @@ class MainWindow(QMainWindow):
 
     def show_mesh(self, asset):
         session = self.session
+        if asset.kind == "scene" and asset.key != getattr(self, "_lod_scene", None):
+            VIEW_LEVELS["lod_level"] = 0  # another scene starts at the most detailed level
+            self._lod_scene = asset.key
         md = session.mesh(asset)
         poly = meshdata_to_polydata(md)
         materials = []
@@ -1155,6 +1179,16 @@ class MainWindow(QMainWindow):
                                  owners=getattr(md, "owners", None), emitters=emitters, effect_parts=effect_parts,
                                  bones=bones, environment=environment)
         self.mesh_view.set_fly(is_place(asset) and not flat)
+        self._lod_models = []
+        if asset.kind == "scene":
+            self.mesh_view.set_lods(getattr(md, "lod_count", 0), VIEW_LEVELS["lod_level"])
+        else:
+            try:
+                self._lod_models = session.lod_siblings(asset) if session.materials_ready() else []
+            except Exception:
+                log.exception("Finding the LOD levels of '%s' failed", asset.name)
+            here = next((i for i, m in enumerate(self._lod_models) if m is not None and m.key == asset.key), 0)
+            self.mesh_view.set_lods(len(self._lod_models), here)
         n_tex = sum(len(m.textures) for m in materials)
         log.info("Model '%s': %s verts, %s tris, %d material(s), %d texture(s)%s", asset.name,
                  f"{poly.n_points:,}", f"{poly.n_cells:,}", len(materials), n_tex,

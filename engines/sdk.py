@@ -48,15 +48,17 @@ log = logging.getLogger("viewer.sdk")
 API_VERSION = 1
 
 # Asset kinds the app knows how to show. Anything else should be "file" (raw export only).
-Kind = Literal["model", "scene", "texture", "sprite", "animation", "font", "video", "data", "text", "audio", "file"]
-KINDS: tuple[Kind, ...] = ("model", "scene", "texture", "sprite", "animation", "font", "video", "data", "text",
-                          "audio", "file")
+Kind = Literal["model", "scene", "texture", "sprite", "animation", "controller", "font", "video", "data", "text",
+               "audio", "file"]
+KINDS: tuple[Kind, ...] = ("model", "scene", "texture", "sprite", "animation", "controller", "font", "video", "data",
+                          "text", "audio", "file")
 KIND_LABELS: dict[str, str] = {
     "model": "Models",
     "scene": "Scenes & prefabs",
     "texture": "Textures",
     "sprite": "Sprites",
     "animation": "Animations",
+    "controller": "Animators",
     "font": "Fonts",
     "video": "Videos",
     "data": "Scripts & data",
@@ -223,6 +225,7 @@ class MeshData:
                 mesh and center
     effect_mask (N,) bool: vertices of still effect stand-ins that playback replaces, or None
     bones       skinned meshes' skeletons as a Bones (positions, parents, names) for the bone overlay, or None
+    lod_count   scenes: the most LOD levels any LODGroup in it has (the LOD picker offers that many), else 0
     environment scenes: {"sky": (top, horizon, bottom) colors, "ambient": color, "fog": text or None,
                 "sky_name": text, "sky_texture": {"kind": "cube" / "six" / "pano", "assets": [texture
                 Assets], "tint", "rotation"} or None} from the scene's lighting settings, or None (colors are
@@ -247,6 +250,7 @@ class MeshData:
     effect_mask: NDArray[np.bool_] | None
     bones: "Bones | None"
     environment: dict[str, Any] | None
+    lod_count: int
 
     def __init__(self, points: ArrayLike, submeshes: Iterable[ArrayLike], normals: ArrayLike | None = None,
                  uvs: Mapping[str, ArrayLike] | None = None, colors: ArrayLike | None = None,
@@ -269,6 +273,7 @@ class MeshData:
         self.effect_mask = None
         self.bones = None
         self.environment = None
+        self.lod_count = 0
         if not n:
             raise ValueError("Mesh has no vertices.")
         if not any(len(s) for s in self.submeshes):
@@ -421,6 +426,14 @@ def view_option(name: str) -> bool:
     return VIEW_OPTIONS.get(name, True)
 
 
+# Numeric view settings picked in the 3D view (not saved): "lod_level" = which LOD of each LODGroup scenes show.
+VIEW_LEVELS: dict[str, int] = {"lod_level": 0}
+
+
+def view_level(name: str) -> int:
+    return VIEW_LEVELS.get(name, 0)
+
+
 class GameSession:
     """A loaded game. Created by EnginePlugin.open(). Override what your engine supports."""
 
@@ -537,6 +550,19 @@ class GameSession:
     def cube_faces(self, asset: Asset, max_side: int = 1024) -> list[Any]:
         """The 6 faces (PIL images: +X, -X, +Y, -Y, +Z, -Z in the engine's own handedness) of a cube texture."""
         raise NotImplementedError("This engine plugin has no cube textures.")
+
+    def controller(self, asset: Asset) -> dict[str, Any]:
+        """An animation state machine ("controller" asset): {"name", "parameters": [{"name", "type", "default"}],
+        "layers": [{"name", "weight", "default_state", "states": [{"name", "tag", "speed", "motion": {"clip": Asset}
+        or {"tree": {"nodes": [{"type", "param", "clip", "children", ...}]}} or None, "transitions": [{"dest"
+        (state index or -1 = exit), "duration", "exit_time", "has_exit_time", "conditions": [{"mode", "param",
+        "threshold"}]}]}], "any_transitions": [...]}]} - see engines.unity_controller."""
+        raise NotImplementedError("This engine plugin can't read animation state machines.")
+
+    def lod_siblings(self, model: Asset) -> list[Asset | None]:
+        """A model's LOD group: the mesh Asset of each level (LOD0 first, None where unknown), or [] if it isn't
+        part of one."""
+        return []
 
     def bones(self, model: Asset) -> Bones | None:
         """Skeleton of a skinned single model for the bone overlay, or None. (Scenes and prefabs put theirs

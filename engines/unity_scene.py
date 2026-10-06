@@ -7,7 +7,7 @@ import time
 
 import numpy as np
 
-from .sdk import ALBEDO, Material, MeshData, TextureRef, view_option
+from .sdk import ALBEDO, Material, MeshData, TextureRef, view_level, view_option
 from .unity_skin import trs
 
 log = logging.getLogger("viewer.unity")
@@ -346,6 +346,7 @@ def component_gizmo(name, tree):
 
 GIZMO_COMPONENTS = {"BoxCollider", "SphereCollider", "CapsuleCollider", "CharacterController", "BoxCollider2D",
                     "CircleCollider2D", "MeshCollider", "Light", "Camera", "AudioSource"}
+JOINT_COMPONENTS = {"CharacterJoint", "ConfigurableJoint", "HingeJoint", "FixedJoint", "SpringJoint"}
 
 
 def _ptr_key(ptr):
@@ -398,12 +399,16 @@ class SceneBuilder:
         self.lm_uvs = []      # per placed piece: lightmap UVs (or None)
         self.lightmapped = 0  # renderers drawn with their baked lightmap
         self.render_settings = None  # RenderSettings of the first scene file visited (sky, ambient, fog)
+        self.joints = []      # (anchor (3,) UniView space, connected transform key or None, axis (3,) or None)
+        self.cloths = 0
         self.node_pos = {}    # transform key -> (position in UniView space, parent transform key, name)
         self.skin_bones = []  # bone transform keys of each skinned mesh renderer drawn
         self.gizmos = {}      # kind -> [(points in UniView space, segments)]
         self.gizmo_segments = 0
         self.show_effects = view_option("show_effects")
         self.hide_lods = view_option("hide_lods")
+        self.lod_level = view_level("lod_level")  # which level of each LODGroup (when hide_lods)
+        self.lod_count = 0
         self.hide_inactive = view_option("hide_inactive")
 
     def _mesh(self, key, reader):
@@ -744,6 +749,54 @@ class SceneBuilder:
         self.gizmos.setdefault(kind, []).append((world.astype(np.float32), np.asarray(segs, np.int64)))
         self.gizmo_segments += len(segs)
 
+    def _joint(self, reader, matrix):
+        """Remember a physics joint: its anchor, the body it's connected to and (hinges) its axis; drawn as gizmo
+        lines once every transform's position is known (see _joint_gizmos)."""
+        try:
+            tree = reader.read_typetree()
+            if not tree.get("m_Enabled", 1):
+                return
+            anchor = matrix[:3, :3] @ np.asarray(_v3(tree.get("m_Anchor")), float) + matrix[:3, 3]
+            anchor[0] *= -1
+            connected = None
+            body = self._ref(reader, tree.get("m_ConnectedBody"))
+            if body is not None:
+                go = self._ref(body, body.read_typetree().get("m_GameObject"))
+                if go is not None:
+                    transform = next((r for n, r in _components(go.read()) if n in ("Transform", "RectTransform")), None)
+                    if transform is not None:
+                        connected = (id(transform.assets_file), transform.path_id)
+            axis = None
+            if "m_Axis" in tree:
+                axis = matrix[:3, :3] @ np.asarray(_v3(tree.get("m_Axis"), 0.0), float)
+                axis[0] *= -1
+                norm = np.linalg.norm(axis)
+                axis = axis / norm if norm > 1e-9 else None
+            self.joints.append((anchor, connected, axis))
+        except Exception as e:
+            log.debug("Scene joint: %s", e)
+
+    def _joint_gizmos(self):
+        """Joint lines: anchor -> connected body (a ragdoll's bone chain), a small cross at each anchor, and the
+        hinge axis."""
+        pts, segs = [], []
+        for anchor, connected, axis in self.joints:
+            other = self.node_pos.get(connected, (None,))[0] if connected is not None else None
+            size = 0.05
+            if other is not None:
+                other = np.asarray(other, float)
+                size = max(0.02, min(0.25, 0.15 * float(np.linalg.norm(other - anchor))))
+                segs.append((len(pts), len(pts) + 1))
+                pts += [anchor, other]
+            for d in np.eye(3):
+                segs.append((len(pts), len(pts) + 1))
+                pts += [anchor - d * size, anchor + d * size]
+            if axis is not None:
+                segs.append((len(pts), len(pts) + 1))
+                pts += [anchor - axis * size * 2, anchor + axis * size * 2]
+        if pts:
+            self.gizmos.setdefault("joint", []).append((np.asarray(pts, np.float32), np.asarray(segs, np.int64)))
+
     def _default_material(self):
         if None not in self.material_index:
             self.material_index[None] = len(self.material_list)
@@ -775,8 +828,11 @@ class SceneBuilder:
             for name, reader in comps:
                 if name == "LODGroup" and self.hide_lods:
                     try:
-                        for level, lod in enumerate(reader.read().m_LODs):
-                            if level == 0:
+                        lods = list(reader.read().m_LODs)
+                        self.lod_count = max(self.lod_count, len(lods))
+                        keep = min(self.lod_level, len(lods) - 1)  # groups with fewer levels show their last
+                        for level, lod in enumerate(lods):
+                            if level == keep:
                                 continue
                             for lr in lod.renderers:
                                 found = _ptr_key(lr.renderer)
@@ -785,6 +841,12 @@ class SceneBuilder:
                     except Exception:
                         pass
             for name, reader in comps:
+                if name in JOINT_COMPONENTS:
+                    self._joint(reader, matrix)
+                    continue
+                if name == "Cloth":
+                    self.cloths += 1
+                    continue
                 if name in GIZMO_COMPONENTS:
                     self._gizmo(name, reader, matrix)
                     if name != "Light":
@@ -895,6 +957,7 @@ class SceneBuilder:
         return Bones([self.node_pos[k][0] for k in keys], parents, [self.node_pos[k][2] for k in keys])
 
     def result(self, name):
+        self._joint_gizmos()
         gizmos = {}
         for kind, parts in self.gizmos.items():
             pts, segs = join(*parts)
@@ -921,6 +984,7 @@ class SceneBuilder:
         md.gizmos_only = self.renderers == 0 and self.effects == 0 and bool(gizmos)
         md.emitters = self.emitters
         md.environment = self._environment()
+        md.lod_count = self.lod_count
         md.bones = self._bones()
         if self.effect_ranges:
             md.effect_mask = np.zeros(self.count, bool)
@@ -1037,6 +1101,10 @@ def build(session, roots, name):
         info.append(("Bones", f"{len(md.bones):,}"))
     if builder.effects:
         info.append(("Effects", f"{builder.effects:,} particle systems / lines (still, approximate)"))
+    if builder.joints:
+        info.append(("Joints", f"{len(builder.joints):,} (pink gizmo lines: anchor to the connected body)"))
+    if builder.cloths:
+        info.append(("Cloth", f"{builder.cloths:,} (simulated while the game runs; drawn at rest)"))
     if builder.lightmapped:
         info.append(("Lightmaps", f"{builder.lightmapped:,} renderers with baked lighting"))
     env = md.environment
@@ -1045,7 +1113,8 @@ def build(session, roots, name):
     if env and env.get("fog"):
         info.append(("Fog", env["fog"] + " (not drawn)"))
     if builder.skipped:
-        info.append(("Skipped", f"{builder.skipped:,} lower-detail LOD renderers"))
+        info.append(("Skipped", f"{builder.skipped:,} renderers of other LOD levels (showing LOD{builder.lod_level})"
+                     if builder.lod_level else f"{builder.skipped:,} lower-detail LOD renderers"))
     if builder.triangles >= MAX_TRIANGLES:
         info.append(("Note", f"stopped at {MAX_TRIANGLES:,} triangles"))
     log.info("Built '%s': %d objects, %d renderers, %s tris in %.1fs", name, builder.objects, builder.renderers,

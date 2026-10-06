@@ -18,7 +18,10 @@ log = logging.getLogger("viewer.unity")
 
 TYPE_KINDS = {"Mesh": "model", "Texture2D": "texture", "Sprite": "sprite", "TextAsset": "text", "AudioClip": "audio",
               "AnimationClip": "animation",
-              "Font": "font", "VideoClip": "video", "MonoBehaviour": "data", "Cubemap": "texture"}
+              "Font": "font", "VideoClip": "video", "MonoBehaviour": "data", "Cubemap": "texture",
+              "PhysicMaterial": "data", "PhysicsMaterial": "data", "PhysicsMaterial2D": "data",
+              "AnimatorController": "controller"}
+BUILTIN_DATA = ("PhysicMaterial", "PhysicsMaterial", "PhysicsMaterial2D")  # data assets that aren't scripts
 ALBEDO_PROPS = ("_MainTex", "_BaseMap", "_BaseColorMap", "_Albedo", "_BaseColorTexture")
 NORMAL_PROPS = ("_BumpMap", "_NormalMap")
 
@@ -453,6 +456,11 @@ def shader_labels(shader_ptr):
 
 
 _LABELS = {}  # id(assets file) -> {shader path id: {property: display name}}
+
+
+def _lod_stem(name):
+    """'barrel_T10_LOD2' -> 'barrel_t10' (a mesh name without its LOD suffix, lower case)."""
+    return re.sub(r"[\s_\-.]*lod\s*\d+$", "", str(name or ""), flags=re.I).lower()
 
 
 def _loose(text):
@@ -1259,7 +1267,9 @@ def _path_closeness(a, b):
 
 
 def script_class(obj):
-    """'Namespace.ClassName' of a MonoBehaviour's script, or ''."""
+    """'Namespace.ClassName' of a MonoBehaviour's script ('PhysicMaterial' etc. for built-in data), or ''."""
+    if getattr(getattr(obj, "type", None), "name", "") in BUILTIN_DATA:
+        return obj.type.name
     try:
         script = obj.read(check_read=False).m_Script.read()
         ns, cls = getattr(script, "m_Namespace", ""), getattr(script, "m_ClassName", "")
@@ -1308,6 +1318,7 @@ class UnitySession(GameSession):
         self._terrains = {}
         self._rigs = None        # humanoid Avatars (unity_humanoid.HumanRig)
         self._scene_settings = {}  # id(scene file) -> (RenderSettings tree, lightmaps)
+        self._lod_index = None     # renderer key -> (LODGroup, level), for lod_siblings
         self._container_scripts = None  # container -> its MonoBehaviours (for _data_materials)
         self._material_names = {}        # material name -> reader
         self._material_keys = []         # (loose name, loose .mat file name, name length, reader)
@@ -1777,7 +1788,11 @@ class UnitySession(GameSession):
         """(script class, unity_components.flatten() props) of a ScriptableObject data asset, or None."""
         from .unity_components import flatten
         reader = asset.ref
-        if getattr(getattr(reader, "type", None), "name", "") != "MonoBehaviour":
+        type_name = getattr(getattr(reader, "type", None), "name", "")
+        if type_name in BUILTIN_DATA:
+            with self.lock:
+                return type_name, flatten(reader.read_typetree(), self._ref_resolver(reader))
+        if type_name != "MonoBehaviour":
             return None
         cls = script_class(reader)
         if not cls:
@@ -1850,15 +1865,17 @@ class UnitySession(GameSession):
         return d
 
     def _scene(self, asset):
-        """(MeshData, materials, info rows) of a scene/prefab, cached (the last few)."""
+        """(MeshData, materials, info rows) of a scene/prefab, cached (the last few, per LOD level)."""
+        from .sdk import view_level
         from .unity_scene import build
-        if asset.key not in self._scenes:
+        key = (asset.key, view_level("lod_level"))
+        if key not in self._scenes:
             with self.lock:
                 result = build(self, self._scene_roots(asset), asset.name.split(": ", 1)[-1])
-            self._scenes[asset.key] = result
-            while len(self._scenes) > 3:
+            self._scenes[key] = result
+            while len(self._scenes) > 4:
                 self._scenes.pop(next(iter(self._scenes)))
-        return self._scenes[asset.key]
+        return self._scenes[key]
 
     def raw(self, asset):
         if asset.kind == "font":
@@ -1870,6 +1887,10 @@ class UnitySession(GameSession):
             import json
             tree, _note = self._data(asset)
             return json.dumps(tree, indent=2, ensure_ascii=False).encode("utf-8")
+        if asset.kind == "controller":
+            import json
+            return json.dumps(self.controller(asset), indent=2, ensure_ascii=False,
+                              default=lambda a: getattr(a, "name", str(a))).encode("utf-8")
         if asset.kind == "animation":
             import json
             return json.dumps(self._clip(asset), indent=1).encode("utf-8")
@@ -2176,6 +2197,63 @@ class UnitySession(GameSession):
             bind_poses = np.concatenate([bind_poses, np.tile(np.eye(4), (n - len(bind_poses), 1, 1))])
         return handler, bones, mesh_node, bind_poses[:n]
 
+    def lod_siblings(self, asset):
+        """The meshes of each level of the LODGroup this model's renderer belongs to (LOD0 first), or []."""
+        if asset.kind != "model" or self._is_terrain(asset) or not self.finder.indexed:
+            return []
+        f = self.finder
+        with self.lock:
+            if self._lod_index is None:
+                self._lod_index = {}  # renderer key -> (LODGroup reader, level, position in the level)
+                for obj in self.env.objects:
+                    if obj.type.name != "LODGroup":
+                        continue
+                    try:
+                        for level, lod in enumerate(obj.read().m_LODs):
+                            for pos, lr in enumerate(lod.renderers):
+                                if lr.renderer.path_id:
+                                    r = lr.renderer.deref()
+                                    self._lod_index.setdefault(obj_key(r.assets_file, r.path_id), (obj, level, pos))
+                    except Exception:
+                        continue
+            key = obj_key(asset.ref.assets_file, asset.ref.path_id)
+            renderers = [f._renderers.get(obj_key(af, go)) for af, go in f._mesh_users.get(key, [])]
+            renderers += f._skinned.get(key, [])
+            group = next((self._lod_index[k] for k in (obj_key(r.assets_file, r.path_id) for r in renderers if r)
+                          if k in self._lod_index), None)
+            if group is None:
+                return []
+            out = []
+            # A group often has several parts per level (base, barrel...): the same part in each level, by its name
+            # without the LOD suffix, else by its position in the level.
+            stem = _lod_stem(asset.name)
+            pos = group[2]
+            for lod in group[0].read().m_LODs:
+                parts = list(lod.renderers)
+                meshes = [self._renderer_mesh(lr.renderer) for lr in parts]
+                same = [m for m in meshes if m is not None and _lod_stem(m.name) == stem]
+                at = [meshes[pos]] if pos < len(meshes) and meshes[pos] is not None else []
+                out.append(next(iter(same + at + [m for m in meshes if m is not None]), None))
+        return out if sum(1 for m in out if m is not None) > 1 else []
+
+    def _renderer_mesh(self, ptr):
+        """Mesh Asset a renderer PPtr draws (its MeshFilter's, or a SkinnedMeshRenderer's own), or None."""
+        try:
+            reader = ptr.deref()
+            if reader.type.name == "SkinnedMeshRenderer":
+                mesh = reader.read().m_Mesh
+            else:
+                from .unity_scene import _components
+                go = reader.read().m_GameObject.deref().read()
+                mf = next((r for n, r in _components(go) if n == "MeshFilter"), None)
+                mesh = mf.read().m_Mesh if mf is not None else None
+            if mesh is None or not mesh.path_id:
+                return None
+            m = mesh.deref()
+            return self.by_key.get(obj_key(m.assets_file, m.path_id))
+        except Exception:
+            return None
+
     def bones(self, asset):
         """Skeleton of a skinned mesh in its bind pose (where the shown mesh's bones are), or None.
         Reads only the bone transforms (not every transform in the game), so it's quick."""
@@ -2405,6 +2483,22 @@ class UnitySession(GameSession):
                     out.append((uid, obj.peek_name() or "Controller", obj.assets_file.name))
         return out
 
+    def controller(self, asset):
+        """An AnimatorController asset decoded (unity_controller.decode_controller), clips as their Assets."""
+        from .unity_controller import decode_controller
+        reader = asset.ref
+        with self.lock:
+            tree = reader.read_typetree()
+            clips = []
+            for ptr in tree.get("m_AnimationClips") or []:
+                try:
+                    target = self.finder._file(reader.assets_file, ptr.get("m_FileID", 0))
+                    obj = target.objects.get(ptr.get("m_PathID")) if target is not None and ptr.get("m_PathID") else None
+                    clips.append(self._asset_for(obj, "AnimationClip") if obj is not None else None)
+                except Exception:
+                    clips.append(None)
+        return decode_controller(tree, lambda i: clips[i] if 0 <= i < len(clips) else None)
+
     def controller_export(self, uid):
         """unity_controller.decode_controller() of a controller from controllers(), clips as their asset uids."""
         from .unity_controller import decode_controller
@@ -2521,7 +2615,10 @@ class UnitySession(GameSession):
 
     def _data(self, asset):
         with self.lock:
-            tree, note = self._scripts().read(asset.ref)
+            if asset.ref.type.name in BUILTIN_DATA:
+                tree, note = asset.ref.read_typetree(), ""
+            else:
+                tree, note = self._scripts().read(asset.ref)
         return json_safe(tree), note
 
     def video(self, asset):
@@ -2563,6 +2660,13 @@ class UnitySession(GameSession):
             with self.lock:
                 cls = script_class(obj)
             return {"size": obj.byte_size, "info": cls.rsplit(".", 1)[-1], "sort": obj.byte_size}
+        if asset.kind == "controller":
+            try:
+                c = self.controller(asset)
+                n = sum(len(layer["states"]) for layer in c["layers"])
+                return {"size": obj.byte_size, "info": f"{n} states, {len(c['parameters'])} parameters", "sort": n}
+            except Exception:
+                return {"size": obj.byte_size, "info": "controller", "sort": 0}
         if asset.kind in ("font", "video"):
             return {"size": obj.byte_size, "info": asset.ext.upper(), "sort": obj.byte_size}
         if asset.kind == "animation":
@@ -2739,8 +2843,10 @@ class UnitySession(GameSession):
             return rows
         if asset.kind == "scene":
             rows = [("File", asset.source)] + ([("Path", asset.path)] if asset.path else [])
-            if asset.key in self._scenes:
-                rows += self._scenes[asset.key][2]
+            from .sdk import view_level
+            built = self._scenes.get((asset.key, view_level("lod_level")))
+            if built is not None:
+                rows += built[2]
             return rows
         rows = [("File", asset.source)]
         if asset.path:
@@ -2838,7 +2944,7 @@ class UnityPlugin(EnginePlugin):
                 return os.path.splitext(path)[1].lstrip(".").lower() or "mp4"
             except Exception:
                 return "mp4"
-        return {"text": "txt", "audio": "wav", "animation": "json", "data": "json"}.get(kind, "")
+        return {"text": "txt", "audio": "wav", "animation": "json", "data": "json", "controller": "json"}.get(kind, "")
 
     MAX_PREFAB_SCAN = 200_000
 
