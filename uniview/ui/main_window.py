@@ -964,7 +964,7 @@ class MainWindow(QMainWindow):
                         data, ext = session.audio(asset)
                         self.audio_view.load(asset.name, data, ext, rows)
                     except Exception as e:
-                        if not isinstance(e, NotImplementedError):
+                        if not isinstance(e, (ValueError, NotImplementedError)):  # those are expected, explained
                             log.exception("Couldn't decode the sound '%s'", asset.name)
                         self.audio_view.show_error(asset.name, str(e), rows)
                 elif asset.kind == "font":
@@ -1129,8 +1129,10 @@ class MainWindow(QMainWindow):
         if not sky:
             return env
         try:
-            if sky["kind"] == "cube":
-                images = self.session.cube_faces(sky["assets"][0])
+            if sky["kind"] == "gradient":  # drawn from its colour stops, nothing to load
+                images = []
+            elif sky["kind"] in ("cube", "clouds"):
+                images = self.session.cube_faces(sky["assets"][0], alpha=sky["kind"] == "clouds")
             else:
                 images = [self.session.image(a) for a in sky["assets"]]
         except Exception as e:

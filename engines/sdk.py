@@ -227,8 +227,11 @@ class MeshData:
     bones       skinned meshes' skeletons as a Bones (positions, parents, names) for the bone overlay, or None
     lod_count   scenes: the most LOD levels any LODGroup in it has (the LOD picker offers that many), else 0
     environment scenes: {"sky": (top, horizon, bottom) colors, "ambient": color, "fog": text or None,
-                "sky_name": text, "sky_texture": {"kind": "cube" / "six" / "pano", "assets": [texture
-                Assets], "tint", "rotation"} or None} from the scene's lighting settings, or None (colors are
+                "fog_params": {"mode": 1 linear / 2 exp / 3 exp squared, "color", "density", "start", "end"} or None,
+                "sun": {"direction" (where its light goes), "color", "intensity"} of the main directional light or None,
+                "sky_name": text, "sky_texture": {"kind": "cube" / "six" / "pano" / "clouds" /
+                "gradient", "assets": [texture Assets], "tint", "rotation", "stops": [(height -1..1, color)] of
+                three-colour gradient skies} or None} from the scene's lighting settings, or None (colors are
                 (r, g, b) 0..1; a "cube" asset's faces come from GameSession.cube_faces())
     Lightmapped scenes also have a "lightmap" entry in uvs (the baked-light texture coordinates; see
     Material.lightmap).

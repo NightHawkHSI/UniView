@@ -2,8 +2,9 @@
 
 Stateless: every particle that can be alive at time t is regenerated from its spawn time and a per-particle
 random seed, so any time can be shown directly (scrubbing, looping) without stepping a simulation.
-Approximate on purpose: curves are linear between keys, and noise, collisions, sub-emitters, trails,
-limit-velocity damping and rate-over-distance are left out.
+Approximate on purpose: curves are linear between keys, noise is a smooth wiggle, and collisions, collision
+sub-emitters and rate-over-distance (except on birth sub-emitters) are left out. Birth and death sub-emitters work the same stateless way: the
+child system is regenerated around every parent particle that can still have children alive (Emitter.driver).
 """
 
 import numpy as np
@@ -12,6 +13,8 @@ from .unity_scene import curve_value, euler_matrix
 
 MAX_PER_EMITTER = 1500   # particles one emitter shows at most
 TRAIL_POINTS = 10        # points along each particle's trail
+MAX_SUB_INSTANCES = 120  # parent particles a sub-emitter plays around at most
+SUB_BIRTH, SUB_COLLISION, SUB_DEATH = 0, 1, 2
 GRAVITY = 9.81
 
 RENDER_MODES = {0: "billboard", 1: "stretch", 2: "horizontal", 3: "vertical", 4: "mesh", 5: "none"}
@@ -29,7 +32,7 @@ class Particles:
         self.rot = rot      # (N,) float, radians around the view axis
         self.color = color  # (N, 4) float 0..1 (start color x color over lifetime)
         self.frame = frame  # (N,) int, texture sheet frame
-        self.trails = trails  # Trails module: (points (M, K, 3), widths (M, K), colors (M, K, 4)), newest point first
+        self.trails = trails  # Trails module: (points (M, K, 3), widths (M, K), colors (M, K, 4), texture u (M, K)), newest first
 
     def __len__(self):
         return len(self.pos)
@@ -201,6 +204,8 @@ class Emitter:
         emission = ps.get("EmissionModule") or {}
         on = bool(emission.get("enabled", 1))
         self.rate = max(curve_value(emission.get("rateOverTime"), 10.0), 0.0) if on else 0.0
+        # per unit travelled: only played for birth sub-emitters (riding a moving parent particle)
+        self.rate_distance = max(curve_value(emission.get("rateOverDistance"), 0.0), 0.0) if on else 0.0
         self.bursts = []
         if on:
             for b in (emission.get("m_Bursts") or [])[:int(emission.get("m_BurstCount", 8) or 0)]:
@@ -218,34 +223,42 @@ class Emitter:
         self.tiles = (max(tx, 1), max(ty, 1))
         # one-shot effects (explosions, flashes) repeat in the preview
         self.period = self.delay + self.duration + self.max_life + 0.5
+        # (parent Emitter, SUB_BIRTH / SUB_DEATH, emit probability) when this system is another one's
+        # sub-emitter: it then only plays around the parent's particles (see link_sub_emitters)
+        self.driver = None
 
     def _module(self, name):
         m = self.ps.get(name) or {}
         return m if m.get("enabled") else None
 
     # ---- spawning
-    def _spawns(self, t):
-        """(spawn times, ids) of particles that may be alive at system time t (newest last)."""
-        lo = t - self.max_life
+    def _spawns(self, t, extra=0.0, once=False, rate=None):
+        """(spawn times, ids) of particles that may be alive at system time t (newest last); `extra` seconds
+        more of older ones (for their sub-emitters), `once`: one run even if the system loops, `rate`: particles
+        per second instead of the emission rate."""
+        lo = t - self.max_life - extra
+        rate = self.rate if rate is None else rate
+        looping = self.looping and not once
+        prewarm = self.prewarm and not once
         times, ids = [], []
-        if self.rate > 0:
-            k0 = int(np.ceil((lo - self.delay) * self.rate))
-            k1 = int(np.floor((t - self.delay) * self.rate))
-            if not self.prewarm:
+        if rate > 0:
+            k0 = int(np.ceil((lo - self.delay) * rate))
+            k1 = int(np.floor((t - self.delay) * rate))
+            if not prewarm:
                 k0 = max(k0, 0)
-            if not self.looping:
-                k1 = min(k1, int(np.ceil(self.duration * self.rate)) - 1)
-            k0 = max(k0, k1 - self.max_count * 2)
+            if not looping:
+                k1 = min(k1, int(np.ceil(self.duration * rate)) - 1)
+            k0 = max(k0, k1 - self.max_count * 2 - int(extra * rate))
             if k1 >= k0:
                 k = np.arange(k0, k1 + 1, dtype=np.int64)
-                times.append(self.delay + k / self.rate)
+                times.append(self.delay + k / rate)
                 ids.append(k * 2)
         if self.bursts:
             first = int(np.floor((lo - self.delay) / self.duration))
             last = int(np.floor((t - self.delay) / self.duration))
-            if not self.prewarm:
+            if not prewarm:
                 first = max(first, 0)
-            if not self.looping:
+            if not looping:
                 first, last = 0, min(last, 0)
             for loop in range(max(first, last - 50), last + 1):
                 start = self.delay + loop * self.duration
@@ -326,21 +339,106 @@ class Emitter:
         return pos, dirs
 
     # ---- one moment
+    def _time(self, t):
+        """System time at preview time t (one-shot effects repeat)."""
+        return t if self.looping else t % self.period
+
+    def _loop_x(self, spawn):
+        return ((spawn - self.delay) % self.duration) / self.duration
+
+    def _life(self, ids, loop_x):
+        return np.maximum(eval_minmax(self.init.get("startLifetime"), _hash(ids, self.seed + 1), loop_x, 5.0), 1e-3)
+
     def simulate(self, t):
-        st = t if self.looping else t % self.period
+        if self.driver is not None:
+            return self._driven(t)
+        st = self._time(t)
         spawn, ids = self._spawns(st)
         if not len(ids):
             return None
+        return self._build(ids, st - spawn, self._loop_x(spawn))
+
+    def _world_at(self, ids, spawn, age):
+        """Unity world positions of particles `ids` (born at `spawn`) `age` seconds after their birth."""
         init = self.init
-        loop_x = ((spawn - self.delay) % self.duration) / self.duration
-        age = st - spawn
-        life = np.maximum(eval_minmax(init.get("startLifetime"), _hash(ids, self.seed + 1), loop_x, 5.0), 1e-3)
-        alive = (age >= 0) & (age < life)
-        if not alive.any():
+        loop_x = self._loop_x(spawn)
+        life = self._life(ids, loop_x)
+        speed = eval_minmax(init.get("startSpeed"), _hash(ids, self.seed + 2), loop_x, 5.0)
+        pos, dirs = self._shape(ids)
+        return self._motion(ids, pos, dirs, speed, age, life)[0]
+
+    def _driven(self, t):
+        """This system as a sub-emitter: its particles around each of the parent's particles - from where each
+        one died (death), or emitted along its path while it lived (birth)."""
+        parent, kind, chance = self.driver
+        pst = parent._time(t)
+        run = self.delay + self.duration + self.max_life  # one run of this system
+        spawn, pids = parent._spawns(pst, extra=run)
+        if not len(pids):
             return None
+        life = parent._life(pids, parent._loop_x(spawn))
+        if kind == SUB_DEATH:
+            when = spawn + life
+            sel = (when <= pst) & (when > pst - run)
+        else:
+            when = spawn
+            sel = (spawn <= pst) & (pst - spawn < life + run)
+        if chance < 1.0:
+            sel &= _hash(pids, self.seed + 98) < chance
+        sel = np.flatnonzero(sel)[-MAX_SUB_INSTANCES:]
+        if not len(sel):
+            return None
+        spawn, pids, life, when = spawn[sel], pids[sel], life[sel], when[sel]
+        if kind == SUB_DEATH:
+            where = parent._world_at(pids, spawn, life)
+        ids, ages, loop_xs, origins = [], [], [], []
+        rates = [None] * len(pids)
+        if kind == SUB_BIRTH and self.rate_distance > 0:
+            # rate over distance from the parent's average speed over its life so far
+            age = np.clip(pst - spawn, 1e-3, life)
+            moved = np.linalg.norm(parent._world_at(pids, spawn, age) - parent._world_at(pids, spawn, 0 * age), axis=1)
+            rates = list(self.rate + self.rate_distance * moved / age)
+        for j in range(len(pids)):
+            ct = pst - when[j]  # this system's time in the run started by parent particle j
+            csp, cid = self._spawns(ct, once=kind == SUB_DEATH, rate=rates[j])
+            if kind == SUB_BIRTH:
+                keep = (csp >= 0) & (csp <= life[j])  # emitted only while the parent lived
+                csp, cid = csp[keep], cid[keep]
+            if not len(cid):
+                continue
+            ids.append(pids[j] * 1000003 + cid)
+            ages.append(ct - csp)
+            loop_xs.append(self._loop_x(csp))
+            if kind == SUB_DEATH:
+                origins.append(np.repeat(where[j:j + 1], len(cid), 0))
+            else:
+                origins.append(parent._world_at(np.full(len(cid), pids[j]), np.full(len(cid), spawn[j]), csp))
+        if not ids:
+            return None
+        return self._build(np.concatenate(ids), np.concatenate(ages), np.concatenate(loop_xs),
+                           np.concatenate(origins))
+
+    def _build(self, ids, age, loop_x, origin=None):
+        """Particles of the given ids `age` seconds old; origin: (N, 3) Unity world points they're emitted
+        around instead of the emitter's own position (sub-emitters)."""
+        init = self.init
+        life = self._life(ids, loop_x)
+        alive = (age >= 0) & (age < life)
         if alive.sum() > self.max_count:  # the newest ones stay, like Unity's particle cap
             alive &= np.cumsum(alive[::-1])[::-1] <= self.max_count
-        ids, age, life, loop_x = ids[alive], age[alive], life[alive], loop_x[alive]
+        keep = alive
+        if self.trails is not None and not self.trails.get("dieWithParticles", 1) and                 int(self.trails.get("mode", 0) or 0) == 0:
+            # Trails that outlive their particle: dead ones stay (for their fading trail only).
+            tail = min(max(_max_of(self.trails.get("lifetime"), 1.0), 0.0), 1.0)
+            ghost = (age >= life) & (age < life * (1.0 + tail))
+            ghost &= np.cumsum(ghost[::-1])[::-1] <= self.max_count
+            keep = alive | ghost
+        if not keep.any():
+            return None
+        is_alive = alive[keep]
+        ids, age, life, loop_x = ids[keep], age[keep], life[keep], loop_x[keep]
+        if origin is not None:
+            origin = origin[keep]
         f = age / life
         n = len(ids)
         speed = eval_minmax(init.get("startSpeed"), _hash(ids, self.seed + 2), loop_x, 5.0)
@@ -348,7 +446,7 @@ class Emitter:
         rot = eval_minmax(init.get("startRotation"), _hash(ids, self.seed + 4), loop_x, 0.0)
         color = eval_minmax_gradient(init.get("startColor"), _hash(ids, self.seed + 5), loop_x)
         pos, dirs = self._shape(ids)
-        world, wvel = self._motion(ids, pos, dirs, speed, age, life)
+        world, wvel = self._motion(ids, pos, dirs, speed, age, life, origin)
         size = size * self.scale
         mod = self._module("SizeModule")
         if mod is not None:
@@ -372,18 +470,69 @@ class Emitter:
             frame = np.floor((start + over * cycles) * frames).astype(np.int64) % max(frames, 1)
         trails = None
         if self.trails is not None:
-            trails = self._trails(ids, pos, dirs, speed, age, life, world, np.abs(size), color)
+            trails = self._trails(ids, pos, dirs, speed, age, life, world, np.abs(size), color, origin)
         world[:, 0] *= -1  # UniView space is x-flipped
         wvel[:, 0] *= -1
-        return Particles(world, wvel, np.abs(size), -rot, np.clip(color, 0.0, 1.0), frame, trails)
+        a = is_alive
+        if not a.any() and trails is None:
+            return None
+        return Particles(world[a], wvel[a], np.abs(size)[a], -rot[a], np.clip(color, 0.0, 1.0)[a], frame[a], trails)
 
-    def _motion(self, ids, pos, dirs, speed, age, life):
-        """(world positions, world velocities) in Unity space of particles `age` seconds after they were born."""
+    def _travel(self, ids, speed, age):
+        """(distance travelled, speed now) of particles thrown at `speed`: Limit Velocity's cap (the excess over
+        it fades by `dampen` each 1/30 s, as in Unity) and drag (exp(-drag t)), integrated in closed form."""
+        dist, cur = speed * age, speed.astype(float)
+        mod = self._module("ClampVelocityModule")
+        if mod is None or mod.get("separateAxis"):
+            return dist, cur
+        limit = np.abs(eval_minmax(mod.get("magnitude"), _hash(ids, self.seed + 22), 0.0, 1e9))
+        dampen = min(max(float(mod.get("dampen", 0.0) or 0.0), 0.0), 1.0)
+        if dampen > 0:
+            over = np.maximum(speed - limit, 0.0)
+            capped = over > 0
+            if dampen >= 1.0:
+                dist = np.where(capped, limit * age, dist)
+                cur = np.where(capped, limit, cur)
+            else:
+                lam = -30.0 * np.log(1.0 - dampen)
+                fade = np.exp(-lam * age)
+                dist = np.where(capped, limit * age + over * (1.0 - fade) / lam, dist)
+                cur = np.where(capped, limit + over * fade, cur)
+        drag = curve_value(mod.get("drag"), 0.0)
+        if drag > 0:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                slow = np.where(age > 0, (1.0 - np.exp(-drag * age)) / (drag * age), 1.0)
+            dist, cur = dist * slow, cur * np.exp(-drag * age)
+        return dist, cur
+
+    def _noise(self, ids, age, life):
+        """Noise module as a smooth wiggle (emitter space): each axis a sine with its own random phase, its size
+        from the noise strength (units/s) over the wiggle rate. Unity samples Perlin noise along each particle's
+        path - this keeps the look (turbulent smoke, drifting embers) while staying a function of age."""
+        mod = self._module("NoiseModule")
+        if mod is None:
+            return 0.0
+        f = age / life
+        u = _hash(ids, self.seed + 30)
+        if mod.get("separateAxes"):
+            strength = np.stack([eval_minmax(mod.get(k), u, f, 1.0) for k in ("strength", "strengthY", "strengthZ")],
+                                axis=1)
+        else:
+            strength = np.repeat(eval_minmax(mod.get("strength"), u, f, 1.0)[:, None], 3, axis=1)
+        strength = strength * eval_minmax(mod.get("positionAmount"), u, f, 1.0)[:, None]
+        rate = 2 * np.pi * (0.5 + float(mod.get("frequency", 0.5) or 0.0) + abs(curve_value(mod.get("scrollSpeed"), 0.0)))
+        phase = np.stack([_hash(ids, self.seed + 31 + i) * 2 * np.pi for i in range(3)], axis=1)
+        return strength / rate * (np.sin(rate * age[:, None] + phase) - np.sin(phase))
+
+    def _motion(self, ids, pos, dirs, speed, age, life, origin=None):
+        """(world positions, world velocities) in Unity space of particles `age` seconds after they were born;
+        origin: (N, 3) world points to emit around instead of the emitter's position."""
         n = len(ids)
         f = age / life
         a = age[:, None]
-        vel = dirs * speed[:, None]                    # emitter space
-        move = vel * a
+        dist, cur = self._travel(ids, speed, age)
+        vel = dirs * cur[:, None]                      # emitter space
+        move = dirs * dist[:, None]
         wvel, wmove = np.zeros((n, 3)), np.zeros((n, 3))  # world space
         mod = self._module("VelocityModule")
         if mod is not None:
@@ -401,11 +550,13 @@ class Emitter:
                 wvel, wmove = wvel + force * a, wmove + 0.5 * force * a ** 2
             else:
                 vel, move = vel + force * a, move + 0.5 * force * a ** 2
+        move = move + self._noise(ids, age, life)
         g = np.array([0.0, -GRAVITY * self.gravity, 0.0])
-        world = (pos + move) @ self.rot.T + self.matrix[:3, 3] + wmove + 0.5 * g * a ** 2
+        base = self.matrix[:3, 3] if origin is None else origin
+        world = (pos + move) @ self.rot.T + base + wmove + 0.5 * g * a ** 2
         return world, vel @ self.rot.T + wvel + g * a
 
-    def _trails(self, ids, pos, dirs, speed, age, life, world, size, color):
+    def _trails(self, ids, pos, dirs, speed, age, life, world, size, color, origin=None):
         """Trails module at this moment: (points (M, K, 3) UniView space, widths (M, K), colors (M, K, 4)), newest
         point first, or None. "Particles" mode: each particle's path over the last trail lifetime (a fraction of
         its life); "Ribbon" mode: lines joining the particles in the order they were born."""
@@ -432,11 +583,14 @@ class Emitter:
             span = eval_minmax(tm.get("lifetime"), _hash(ids[sel], self.seed + 21), age[sel] / life[sel], 1.0)
             span = np.clip(span, 0.0, 1.0) * life[sel]
             along = np.linspace(0.0, 1.0, k)[None, :]
-            back = np.maximum(age[sel, None] - span[:, None] * along, 0.0)  # (M, K) ages along the trail
+            span = np.where(age[sel] > life[sel], np.maximum(span - (age[sel] - life[sel]), 0.0), span)  # fading out
+            end = np.minimum(age[sel], life[sel])[:, None]  # a dead particle's trail ends where it died
+            back = np.maximum(end - span[:, None] * along, 0.0)  # (M, K) ages along the trail
             m = len(sel)
             rep_ = np.repeat(np.arange(m), k)
             pts, _v = self._motion(ids[sel][rep_], pos[sel][rep_], dirs[sel][rep_], speed[sel][rep_],
-                                   back.reshape(-1), np.repeat(life[sel], k))
+                                   back.reshape(-1), np.repeat(life[sel], k),
+                                   None if origin is None else origin[sel][rep_])
             points = pts.reshape(m, k, 3)
             along = along.repeat(m, 0)
             base_width = np.repeat(size[sel, None], k, 1)
@@ -450,4 +604,58 @@ class Emitter:
             colors = colors * base_color
         points = points.copy()
         points[..., 0] *= -1
-        return points, np.abs(width), np.clip(colors, 0.0, 1.0)
+        mode = int(tm.get("textureMode", 0) or 0)
+        if mode == 1:  # Tile: the texture repeats along the trail's length in world units
+            seg = np.linalg.norm(np.diff(points, axis=1), axis=2)
+            u = np.concatenate([np.zeros((len(points), 1)), np.cumsum(seg, axis=1)], axis=1)
+        elif mode == 3:  # RepeatPerSegment: once per segment
+            u = np.repeat(np.arange(points.shape[1], dtype=float)[None, :], len(points), 0)
+        else:  # Stretch / DistributePerSegment: once over the whole trail
+            u = along
+        return points, np.abs(width), np.clip(colors, 0.0, 1.0), u
+
+
+# ---------------------------------------------------------------------------- sub-emitters
+
+def sub_emitter_refs(ps):
+    """[(PPtr dict, SUB_* type, emit probability)] of a ParticleSystem's Sub Emitters module (Unity 5.5+ list,
+    or the older fixed birth/collision/death slots)."""
+    mod = ps.get("SubModule") or {}
+    if not mod.get("enabled"):
+        return []
+    out = []
+    for sub in mod.get("subEmitters") or []:
+        if isinstance(sub, dict) and isinstance(sub.get("emitter"), dict):
+            chance = sub.get("emitProbability")
+            out.append((sub["emitter"], int(sub.get("type", 0) or 0), float(1.0 if chance is None else chance)))
+    for key, kind in (("subEmitterBirth", SUB_BIRTH), ("subEmitterBirth1", SUB_BIRTH),
+                      ("subEmitterCollision", SUB_COLLISION), ("subEmitterCollision1", SUB_COLLISION),
+                      ("subEmitterDeath", SUB_DEATH), ("subEmitterDeath1", SUB_DEATH)):
+        if isinstance(mod.get(key), dict):
+            out.append((mod[key], kind, 1.0))
+    return out
+
+
+def link_sub_emitters(emitters, links):
+    """Make birth/death sub-emitters play around their parent's particles. links: [(parent Emitter, child key,
+    SUB_* type, probability)]; children are found by their .key (several copies of a prefab: the nearest one).
+    Collision sub-emitters (no collisions simulated) and other types are left alone."""
+    by_key = {}
+    for e in emitters:
+        if getattr(e, "key", None) is not None:
+            by_key.setdefault(e.key, []).append(e)
+    for parent, key, kind, chance in links:
+        if kind not in (SUB_BIRTH, SUB_DEATH):
+            continue
+        free = [c for c in by_key.get(key, ()) if c.driver is None and c is not parent]
+        if not free:
+            continue
+        child = min(free, key=lambda c: float(np.sum((c.center - parent.center) ** 2)))
+        child.driver = (parent, kind, chance)
+        # no cycles: a child that (indirectly) drives its own parent plays on its own again
+        seen, p = set(), parent
+        while p is not None and id(p) not in seen:
+            seen.add(id(p))
+            p = p.driver[0] if p.driver else None
+        if p is not None:
+            child.driver = None

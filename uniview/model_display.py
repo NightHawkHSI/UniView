@@ -6,6 +6,7 @@ import numpy as np
 
 from uniview.constants import log
 from uniview import pbr
+from uniview.imaging import shrink
 from uniview.export import material_for
 
 
@@ -77,6 +78,38 @@ def _cube_lookup(faces, x, y, z):
     return out
 
 
+def _gradient_rgb(h, stops):
+    """Colours (0-255) at heights h (-1 down .. 1 up) of a sky given as [(height, rgb 0-1)] stops."""
+    stops = sorted(stops, key=lambda st: st[0])
+    at = np.array([float(st[0]) for st in stops])
+    rgb = np.array([st[1][:3] for st in stops], np.float32) * 255
+    return np.stack([np.interp(h, at, rgb[:, k]) for k in range(3)], axis=-1)
+
+
+def gradient_clouds(faces, sky, cloud_alpha=1.0, stops=None):
+    """Unity-order faces of a gradient sky ((top, horizon, bottom) colours by height, or `stops`: [(height -1..1,
+    rgb)]) with a cloud cubemap blended over it by the clouds' alpha (else brightness)."""
+    if stops is None:
+        top, horizon, bottom = sky
+        stops = [(-1.0, bottom), (0.0, horizon), (1.0, top)]
+    out = []
+    for i, face in enumerate(faces):
+        n = face.shape[0]
+        s, t = _face_grid(n)
+        x, y, z = _FACE_DIRS[i](s, t)
+        h = y / np.sqrt(x * x + y * y + z * z)  # -1 down .. 1 up
+        sky_rgb = _gradient_rgb(h, stops)
+        cloud = face.astype(np.float32)
+        a = (cloud[..., 3:4] if cloud.shape[2] == 4 else cloud[..., :3].max(axis=2, keepdims=True)) / 255 * cloud_alpha
+        out.append(np.clip(sky_rgb * (1 - a) + cloud[..., :3] * a, 0, 255).astype(np.uint8))
+    return out
+
+
+def gradient_faces(stops, size=64):
+    """Unity-order faces of a plain gradient sky ([(height -1..1, rgb)] stops) - no clouds."""
+    return gradient_clouds([np.zeros((size, size, 4), np.uint8)] * 6, None, 0.0, stops)
+
+
 def sky_faces(kind, images, rotation=0.0, size=512):
     """A skybox as 6 Unity-order cube faces (uint8 RGB arrays): "cube"/"six" faces as they are (resampled when
     the sky is rotated), "pano" (an equirectangular image) sampled the way Unity's Panoramic skybox reads it."""
@@ -114,6 +147,23 @@ VTK_CUBE_SLOTS = (1, 0, 2, 3, 5, 4)
 def vtk_cube_faces(faces):
     """Unity-order faces -> the 6 images for a VTK cube map texture (slot order, first row on top)."""
     return [np.ascontiguousarray(faces[f][::-1, ::-1] if f in (2, 3) else faces[f]) for f in VTK_CUBE_SLOTS]
+
+
+def fog_shader(fog):
+    """GLSL to splice into a VTK fragment shader (after //VTK::Light::Impl) that blends towards the scene's fog
+    colour with distance, like Unity's fog modes. The view depth is 1 / gl_FragCoord.w (perspective views)."""
+    mode = int(fog.get("mode", 3))
+    if mode == 1:
+        span = max(fog.get("end", 300.0) - fog.get("start", 0.0), 1e-3)
+        visible = f"clamp(({fog.get('end', 300.0):.6f} - d) / {span:.6f}, 0.0, 1.0)"
+    elif mode == 2:
+        visible = f"exp(-{fog.get('density', 0.01):.8f} * d)"
+    else:
+        visible = f"exp(-pow({fog.get('density', 0.01):.8f} * d, 2.0))"
+    r, g, b = (min(1.0, max(0.0, float(c))) for c in fog.get("color", (0.5, 0.5, 0.5))[:3])
+    return ("//VTK::Light::Impl\n  {\n    float d = 1.0 / gl_FragCoord.w;\n"
+            f"    gl_FragData[0].rgb = mix(vec3({r:.5f}, {g:.5f}, {b:.5f}), gl_FragData[0].rgb, {visible});\n"
+            "  }\n")
 
 
 def lightmap_image(img, mode):
@@ -182,10 +232,7 @@ def texture_loader(session, n_textures):
             return None
         if tex_asset.key not in images:
             try:
-                img = session.image(tex_asset)
-                if max(img.size) > max_side:
-                    img = img.copy()
-                    img.thumbnail((max_side, max_side))
+                img = shrink(session.image(tex_asset), max_side)  # keeps the colour under alpha 0
                 images[tex_asset.key] = img
             except Exception as e:
                 log.debug("Texture '%s' failed: %s", tex_asset.name, e)
@@ -216,3 +263,48 @@ def model_info_rows(session, asset, md, n_points, n_cells, uv_channels, favorite
     if favorite:
         rows.insert(0, "<span style='color:#f4c542'>★ Favorite</span>")
     return rows
+
+
+LAYER_STEP = 5e-4        # depth between stacked pieces of a flat mesh, x its size (beats the depth buffer)
+MAX_LAYERS = 400
+
+
+def layer_offsets(points, triangles):
+    """Flat meshes built from stacked pieces (2D sprite characters: a quad per body part, all at z = 0) are drawn
+    by Unity in triangle order with no depth test, later pieces on top. Drawn with depth, overlapping pieces
+    z-fight - worst while an animation swings an arm across the body. Returns (N, 3) offsets that move each
+    connected piece towards the viewer (Unity's -z for meshes in the xy plane) by its draw order, or None for
+    meshes that aren't flat or are one piece."""
+    pts = np.asarray(points, float)
+    tris = np.asarray(triangles, np.int64).reshape(-1, 3)
+    if len(pts) < 4 or len(tris) < 2:
+        return None
+    extent = pts.max(0) - pts.min(0)
+    size = float(extent.max())
+    axis = int(np.argmin(extent))
+    if size <= 0 or extent[axis] > 0.01 * size:
+        return None
+    parent = np.arange(len(pts))  # connected pieces: union-find over each triangle's vertices
+
+    def find(i):
+        root = i
+        while parent[root] != root:
+            root = parent[root]
+        while parent[i] != root:
+            parent[i], i = root, parent[i]
+        return root
+    for a, b, c in tris:
+        ra, rb, rc = find(a), find(b), find(c)
+        parent[rb] = ra
+        parent[find(rc)] = ra
+    roots = np.array([find(i) for i in range(len(pts))])
+    first = {}
+    for t, (a, _b, _c) in enumerate(tris):
+        first.setdefault(roots[a], t)  # a piece is drawn when its first triangle is
+    if len(first) < 2 or len(first) > MAX_LAYERS:
+        return None
+    order = {root: rank for rank, (root, _t) in enumerate(sorted(first.items(), key=lambda kv: kv[1]))}
+    rank = np.array([order.get(r, 0) for r in roots], float)
+    out = np.zeros_like(pts)
+    out[:, axis] = -rank * LAYER_STEP * size
+    return out.astype(np.float32)

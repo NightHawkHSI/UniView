@@ -45,3 +45,20 @@ def test_motion_clips():
     assert cg.motion_clips({"clip": a}) == [a]
     tree = {"tree": {"nodes": [{"clip": None, "children": [1, 2]}, {"clip": a}, {"clip": b}]}}
     assert cg.motion_clips(tree) == [a, b] and cg.motion_clips(None) == []
+
+
+def test_sub_machine_from_full_path():
+    assert cg.sub_machine({"path": "Base Layer.Emotes.Wave"}) == "Emotes"
+    assert cg.sub_machine({"path": "Base Layer.Locomotion.Ground.Run"}) == "Locomotion.Ground"
+    assert cg.sub_machine({"path": "Base Layer.Idle"}) == "" and cg.sub_machine({}) == ""
+
+
+def test_layout_keeps_sub_machines_together():
+    lay = {"default_state": 0, "states": [
+        {"name": "Idle", "path": "Base.Idle", "transitions": [{"dest": d} for d in (1, 2, 3)]},
+        {"name": "Wave", "path": "Base.Emotes.Wave", "transitions": []},
+        {"name": "Run", "path": "Base.Run", "transitions": []},
+        {"name": "Bow", "path": "Base.Emotes.Bow", "transitions": []}]}
+    places = cg.layout(lay)
+    rows = {i: places[i][1] for i in (1, 2, 3)}
+    assert abs(rows[1] - rows[3]) == 1  # Wave and Bow (both Emotes) next to each other

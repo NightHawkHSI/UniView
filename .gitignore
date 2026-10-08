@@ -20,7 +20,12 @@ mods/
 
 # Personal notes
 Bugs.txt
+Claude Notes.txt
+CLAUDE.md
 
 # Old icon (a screenshot) kept locally
 Icon_old_screenshot.png
 tools/
+
+# Claude Code local settings
+.claude/

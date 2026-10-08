@@ -98,3 +98,70 @@ def test_cubemap_cross_layout():
     at = {f: (c, r) for f, (c, r) in enumerate(((2, 1), (0, 1), (1, 0), (1, 2), (1, 1), (3, 1)))}
     for f, (c, r) in at.items():
         assert cross[r * n + 1, c * n + 1, 0] == f * 40
+
+
+def test_fog_shader_modes():
+    lin = md_.fog_shader({"mode": 1, "color": (1, 0.5, 0), "start": 20, "end": 600})
+    assert "clamp((600.000000 - d) / 580.000000" in lin and "vec3(1.00000, 0.50000, 0.00000)" in lin
+    assert lin.startswith("//VTK::Light::Impl") and "1.0 / gl_FragCoord.w" in lin
+    assert "exp(-0.02000000 * d)" in md_.fog_shader({"mode": 2, "density": 0.02})
+    assert "exp(-pow(0.02000000 * d, 2.0))" in md_.fog_shader({"mode": 3, "density": 0.02})
+
+
+def test_cubemap_faces_decode_all_six():
+    from engines.unity import cubemap_faces
+    n = 8
+    faces = []
+    for f in range(6):
+        px = np.zeros((n, n, 4), np.uint8)
+        px[..., 0] = f * 40
+        px[..., 3] = 0 if f == 2 else 255  # face +Y fully transparent (its colour must survive)
+        faces.append(px.tobytes())
+    cube = SimpleNamespace(get_image_data=lambda: b"".join(faces), m_Width=n, m_Height=n, m_TextureFormat=4,
+                           m_CompleteImageSize=n * n * 4, object_reader=None, m_PlatformBlob=None)
+    rgb = cubemap_faces(cube, max_side=4)
+    assert len(rgb) == 6 and all(f.size == (4, 4) and f.mode == "RGB" for f in rgb)
+    assert [f.getpixel((1, 1))[0] for f in rgb] == [0, 40, 80, 120, 160, 200]
+    rgba = cubemap_faces(cube, max_side=4, alpha=True)
+    assert rgba[2].mode == "RGBA" and rgba[2].getpixel((1, 1)) == (80, 0, 0, 0)
+
+
+def test_gradient_clouds():
+    n = 8
+    clear = [np.zeros((n, n, 4), np.uint8) for _ in range(6)]
+    sky = ((0, 0, 1.0), (0, 1.0, 0), (1.0, 0, 0))  # top blue, horizon green, ground red
+    faces = md_.gradient_clouds(clear, sky)
+    assert np.allclose(faces[2][n // 2, n // 2], (0, 0, 255), atol=8)  # +Y straight up: the top colour
+    assert np.allclose(faces[3][n // 2, n // 2], (255, 0, 0), atol=8)  # -Y: the ground colour
+    assert faces[4][n // 2, n // 2][1] > 200                    # +Z at the horizon: green
+    cloud = [np.full((n, n, 4), 255, np.uint8) for _ in range(6)]
+    half = md_.gradient_clouds(cloud, sky, cloud_alpha=0.5)
+    assert np.allclose(half[2][n // 2, n // 2], (127, 127, 255), atol=8)  # white clouds half over blue
+
+
+def test_three_colour_gradient_sky():
+    from engines.unity_scene import sky_stops
+    up, mid, low = (0.07, 0.25, 0.63), (0.1, 0.5, 0.73), (0.38, 0.81, 0.89)
+    colors = {"_skyuppercolor": up, "_skymiddlecolor": mid, "_skylowercolor": low}
+    stops = sky_stops(colors, {})
+    assert stops[0] == (-1.0, low) and stops[1] == (0.0, low) and stops[-1] == (1.0, up)  # lower = the horizon
+    funly = sky_stops({"_gradientskyuppercolor": up, "_gradientskymiddlecolor": mid, "_gradientskylowercolor": low},
+                      {"_gradientfadebegin": 0.0, "_gradientfadeend": 0.6, "_gradientfademiddleposition": 0.5})
+    assert [round(h, 3) for h, _c in funly] == [-1.0, 0.0, 0.3, 0.6, 1.0]
+    assert sky_stops({"_skyuppercolor": up}, {}) is None
+    n = 8
+    faces = md_.gradient_faces(stops, size=n)
+    assert np.allclose(faces[2][n // 2, n // 2], np.array(up) * 255, atol=4)    # straight up: upper
+    assert np.allclose(faces[4][n // 2, n // 2], np.array(low) * 255, atol=12)  # horizon: lower
+
+
+def test_layer_offsets_stack_flat_pieces_in_draw_order():
+    quad = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], float)
+    pts = np.vstack([quad, quad + [0.5, 0.5, 0], quad + [0.2, 0.0, 0]])  # three overlapping pieces at z = 0
+    tris = np.array([[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7], [8, 9, 10], [8, 10, 11]])
+    off = md_.layer_offsets(pts, tris)
+    z = off[:, 2]
+    assert z[0] == 0 and z[4] < z[0] and z[8] < z[4]           # later pieces nearer the viewer (-z)
+    assert np.all(off[:, :2] == 0) and len(set(z[:4])) == 1    # each piece moves as one
+    assert md_.layer_offsets(pts + np.c_[np.zeros((12, 2)), np.arange(12)], tris) is None  # not flat
+    assert md_.layer_offsets(quad, tris[:2]) is None            # one piece

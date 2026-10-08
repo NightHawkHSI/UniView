@@ -128,3 +128,23 @@ def test_mat_yaml_empty_sections():
 
 def test_number_format():
     assert [um._num(v) for v in (1.0, 0.5, float("inf"), float("-inf"), float("nan"), 3)] ==         ["1", "0.5", "Infinity", "-Infinity", "NaN", "3"]
+
+
+def test_shader_declared_transparency():
+    from engines.unity import material_alpha, queue_value
+    assert [queue_value(q) for q in ("Transparent", "Geometry+1", "AlphaTest-50", "2450", "", "Weird")] == \
+        [3000, 2001, 2400, 2450, -1, -1]
+    # Fallout Shelter's Underground/Dweller: nothing on the material, the shader says Transparent + alpha blend
+    assert material_alpha("Underground/Dweller", {}, [], 3000, {"RenderType": "Transparent"}, (1, 10))[0] == "blend"
+    assert material_alpha("Custom/Sprite", {}, [], -1, {}, (5, 10))[0] == "blend"   # blend state alone
+    assert material_alpha("Custom/Glow", {}, [], -1, {}, (1, 1))[0] == "opaque"     # One One without transparency
+    assert material_alpha("Custom/Glow", {}, [], 3000, {}, (5, 1))[0] == "add"
+    assert material_alpha("Custom/Rock", {}, [], 2000, {"RenderType": "Opaque"}, (1, 0))[0] == "opaque"
+
+
+def test_export_surface_uses_shader_render():
+    from uniview.unity_materials import surface
+    d = details("Underground/Dweller")
+    assert surface(d) == "opaque"
+    assert surface({**d, "shader_render": (3000, {"RenderType": "Transparent"}, (1, 10))}) == "transparent"
+    assert surface({**d, "queue": 2000, "shader_render": (3000, {"RenderType": "Transparent"}, None)}) == "opaque"

@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from uniview.controller_graph import edges, layout, motion_clips, transition_text
+from uniview.controller_graph import edges, layout, motion_clips, sub_machine, transition_text
 from uniview.ui import theme
 from uniview.ui.theme import role
 from uniview.util import wheel_steps
@@ -101,7 +101,10 @@ class ControllerView(QWidget):
     # ---- data
     def show_controller(self, name, controller):
         self.controller = controller
-        self.title.setText(f"{name}   ·   {len(controller['parameters'])} parameters")
+        title = f"{name}   ·   {len(controller['parameters'])} parameters"
+        if controller.get("override_of"):
+            title += f"   ·   override of {controller['override_of']} ({controller.get('overridden', 0)} clips swapped)"
+        self.title.setText(title)
         layers = controller.get("layers") or []
         self.layer_combo.blockSignals(True)
         self.layer_combo.clear()
@@ -154,7 +157,31 @@ class ControllerView(QWidget):
         self.scene.addItem(item)
         return item
 
-    def _arrow(self, a, b, color, offset=0.0, label=""):
+    def _sub_boxes(self, subs):
+        """A labelled dashed box around each sub-state machine's states (one per column they're in)."""
+        for name in sorted(set(subs) - {""}):
+            hue = QColor.fromHsv(hash(name) % 360, 150, 220)
+            columns = {}
+            for i, s in enumerate(subs):
+                if s == name and i in self._nodes:
+                    r = self._nodes[i].rect()
+                    columns.setdefault(round(r.x()), []).append(r)
+            for rects in columns.values():
+                box = rects[0]
+                for r in rects[1:]:
+                    box = box.united(r)
+                box = box.adjusted(-10, -24, 10, 10)
+                frame = QGraphicsRectItem(box)
+                frame.setPen(QPen(hue, 1.4, Qt.DashLine))
+                frame.setBrush(QBrush(Qt.NoBrush))
+                frame.setZValue(-2)
+                self.scene.addItem(frame)
+                label = QGraphicsSimpleTextItem(name)
+                label.setBrush(QBrush(hue))
+                label.setPos(box.x() + 6, box.y() + 4)
+                self.scene.addItem(label)
+
+    def _arrow(self, a, b, color, offset=0.0, label="", dashed=False):
         """An arrow between two rects' borders (offset sideways so A->B and B->A don't overlap)."""
         p, q = a.center(), b.center()
         dx, dy = q.x() - p.x(), q.y() - p.y()
@@ -169,7 +196,7 @@ class ControllerView(QWidget):
                           QPointF(q.x() - 10 * math.cos(angle + 0.4), q.y() - 10 * math.sin(angle + 0.4)), q])
         path.addPolygon(head)
         item = QGraphicsPathItem(path)
-        item.setPen(QPen(QColor(color), 1.4))
+        item.setPen(QPen(QColor(color), 1.4, Qt.DashLine if dashed else Qt.SolidLine))
         item.setBrush(QBrush(QColor(color)))
         item.setZValue(-1)
         if label:
@@ -189,8 +216,12 @@ class ControllerView(QWidget):
             clips = motion_clips(s.get("motion"))
             fill = DEFAULT_COLOR if i == default else theme.RAISED
             node = self._node(rect_at(col, row), s["name"], fill, data=i, bold=i == default)
-            tip = [s["name"]] + ([f"clip: {clips[0].name}"] if len(clips) == 1 else
-                                 [f"blend tree: {len(clips)} clips"] if clips else ["no motion"])
+            sub = sub_machine(s)
+            if sub:  # states of a sub-state machine get its own border colour
+                node.setPen(QPen(QColor.fromHsv(hash(sub) % 360, 150, 220), 2.4))
+            tip = [s["name"]] + ([f"in sub-state machine: {sub}"] if sub else []) + (
+                [f"clip: {clips[0].name}"] if len(clips) == 1 else
+                [f"blend tree: {len(clips)} clips"] if clips else ["no motion"])
             node.setToolTip("\n".join(tip))
             self._nodes[i] = node
         entry = self._node(QRectF(0, -(NODE_H + GAP_Y), NODE_W * 0.7, NODE_H), "Entry", ENTRY_COLOR)
@@ -199,13 +230,16 @@ class ControllerView(QWidget):
         if layer.get("any_transitions"):
             any_rect = self._node(QRectF(0, NODE_H + GAP_Y, NODE_W * 0.7, NODE_H), "Any State", ANY_COLOR).rect()
         pairs = {(a, b) for a, b, _t in edges(layer)}
+        subs = [sub_machine(s) for s in states]
         for a, b, t in edges(layer):
             src = any_rect if a == -1 else self._nodes[a].rect()
             if src is None:
                 continue
             offset = 5.0 if (b, a) in pairs else 0.0
             color = ANY_COLOR if a == -1 else theme.MUTED
-            self._arrow(src, self._nodes[b].rect(), color, offset, transition_text(t, states))
+            crossing = a >= 0 and subs[a] != subs[b]  # into / out of a sub-state machine
+            self._arrow(src, self._nodes[b].rect(), color, offset, transition_text(t, states), dashed=crossing)
+        self._sub_boxes(subs)
 
     # ---- details
     def _fill_details(self, layer):
@@ -223,11 +257,16 @@ class ControllerView(QWidget):
         states = layer["states"]
         top = QTreeWidgetItem(self.details, [f"States ({len(states)})", f"weight {layer.get('weight', 1):g}"])
         top.setFont(0, bold)
+        groups = {}  # sub-state machine -> its tree item
+        for name in sorted({sub_machine(s) for s in states} - {""}):
+            count = sum(1 for s in states if sub_machine(s) == name)
+            groups[name] = QTreeWidgetItem(top, [f"▸ {name}", f"sub-state machine, {count} states"])
+            groups[name].setFont(0, bold)
         for i, s in enumerate(states):
             clips = motion_clips(s.get("motion"))
             what = (clips[0].name if len(clips) == 1 else f"blend tree, {len(clips)} clips" if clips else "no motion")
-            item = QTreeWidgetItem(top, [s["name"] + ("  (default)" if i == layer.get("default_state") else ""),
-                                         what])
+            item = QTreeWidgetItem(groups.get(sub_machine(s), top),
+                                   [s["name"] + ("  (default)" if i == layer.get("default_state") else ""), what])
             item.setData(0, Qt.UserRole, clips[0] if clips else None)
             self._state_items[i] = item
             for clip in clips if len(clips) > 1 else []:

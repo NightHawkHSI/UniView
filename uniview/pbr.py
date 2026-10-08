@@ -12,6 +12,7 @@ import numpy as np
 from PIL import Image
 
 from engines.sdk import ALBEDO as ALBEDO_ROLE, NORMAL as NORMAL_ROLE
+from uniview.imaging import resize
 
 # Channels. Packed layouts:
 #   metal_gloss  Unity Standard/URP: R metallic, A smoothness
@@ -156,7 +157,7 @@ def _rgba(img):
 def _gray(img, size=None):
     """One channel (0..1) of a grayscale map: its red (= every channel of a gray image)."""
     if size is not None and img.size != size:
-        img = img.resize(size, Image.BILINEAR)
+        img = resize(img, size, Image.BILINEAR)
     return _rgba(img)[..., 0]
 
 
@@ -204,10 +205,10 @@ def gltf_metal_rough(channel, img, gloss_scale=1.0, second=None):
     metal = rough = None
     for ch, im in maps.items():
         if ch in (METAL_GLOSS, MASK):
-            p = _rgba(im if im.size == size else im.resize(size, Image.BILINEAR))
+            p = _rgba(im if im.size == size else resize(im, size, Image.BILINEAR))
             metal, rough = p[..., 0], 1 - p[..., 3] * gloss_scale
         elif ch == ORM:
-            p = _rgba(im if im.size == size else im.resize(size, Image.BILINEAR))
+            p = _rgba(im if im.size == size else resize(im, size, Image.BILINEAR))
             metal, rough = p[..., 2], p[..., 1]
         elif ch == METALLIC:
             metal = _gray(im, size)
@@ -229,7 +230,7 @@ def unity_metal_gloss(channel, img, second=None):
     metal = smooth = None
     for ch, im in maps.items():
         if ch == ORM:
-            p = _rgba(im if im.size == size else im.resize(size, Image.BILINEAR))
+            p = _rgba(im if im.size == size else resize(im, size, Image.BILINEAR))
             metal, smooth = p[..., 2], 1 - p[..., 1]
         elif ch == METALLIC:
             metal = _gray(im, size)

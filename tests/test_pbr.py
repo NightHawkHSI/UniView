@@ -214,3 +214,35 @@ def test_mat_specular_setup():
                            colors={"_SpecColor": (0.5, 0.5, 0.5, 1)}), guid)
     assert m["shader"] == "Standard (Specular setup)" and m["shader_id"] == 45
     assert "_SPECGLOSSMAP" in m["keywords"] and m["colors"]["_SpecColor"] == (0.5, 0.5, 0.5, 1)
+
+
+def tiled_ref(slot, name, role):
+    return TextureRef(slot, name, SimpleNamespace(key=name, name=name, uid=f"tex:{name}"), role,
+                      uv_scale=(4.0, 2.0), uv_offset=(0.25, 0.5))
+
+
+def test_glb_tiling_as_texture_transform(tmp_path):
+    textures = [tiled_ref("_MainTex", "albedo", ALBEDO), ref("_BumpMap", "bump", NORMAL)]
+    path = str(tmp_path / "m.glb")
+    uv.write_glb(Session(), quad(), [Material("M", textures)], path)
+    gltf, _bin = parse_glb(path)
+    assert gltf["extensionsUsed"] == ["KHR_texture_transform"]
+    m = gltf["materials"][0]
+    t = m["pbrMetallicRoughness"]["baseColorTexture"]["extensions"]["KHR_texture_transform"]
+    assert t == {"scale": [4.0, 2.0], "offset": [0.25, 1.0 - 2.0 - 0.5]}  # glTF's V runs top-down
+    assert m["normalTexture"]["extensions"]["KHR_texture_transform"] == t  # Unity tiles every map like _MainTex
+
+
+def test_glb_untiled_has_no_extension(tmp_path):
+    path = str(tmp_path / "p.glb")
+    uv.write_glb(Session(), quad(), [Material("M", [ref("_MainTex", "albedo", ALBEDO)])], path)
+    gltf, _bin = parse_glb(path)
+    assert "extensionsUsed" not in gltf
+    assert "extensions" not in gltf["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"]
+
+
+def test_obj_tiling_options(tmp_path):
+    path = str(tmp_path / "m.obj")
+    uv.write_obj(Session(), quad(), [Material("M", [tiled_ref("_MainTex", "albedo", ALBEDO)])], path)
+    mtl = open(str(tmp_path / "m.mtl"), encoding="utf-8").read()
+    assert "map_Kd -s 4 2 1 -o 0.25 0.5 0 " in mtl

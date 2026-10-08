@@ -28,6 +28,41 @@ def _lzma(data):
     return lzma.decompress(props + struct.pack("<Q", actual) + data[17:], format=lzma.FORMAT_ALONE)[:actual]
 
 
+def triangle_count(read):
+    """(triangles, vertices) of a map's world from its face table alone - no geometry is built (for sorting and
+    search). read(start, length) -> bytes of the .bsp. Tool faces (nodraw, trigger, sky...) are left out like the
+    view does; the 3D skybox isn't (that needs the leaves)."""
+    header = read(0, 8 + 64 * 16)
+    if header[:4] != b"VBSP":
+        raise ValueError("Not a Source map (.bsp)")
+    lumps = [struct.unpack_from("<iiii", header, 8 + i * 16) for i in range(64)]
+
+    def lump(index):
+        off, length, _ver, _fourcc = lumps[index]
+        raw = read(off, length) if length else b""
+        return _lzma(raw) if raw[:4] == b"LZMA" else raw  # these three tables are small
+    faces, texinfo, dispinfo = lump(LUMP_FACES), lump(LUMP_TEXINFO), lump(LUMP_DISPINFO)
+    f = np.frombuffer(faces, np.dtype({"names": ["edges", "texinfo", "disp"], "formats": ["<i2", "<i2", "<i2"],
+                                       "offsets": [8, 10, 12], "itemsize": 56}), len(faces) // 56)
+    flags = np.frombuffer(texinfo, np.dtype({"names": ["flags"], "formats": ["<i4"], "offsets": [64],
+                                             "itemsize": 72}), len(texinfo) // 72)["flags"]
+    ti = f["texinfo"].astype(np.int64)
+    keep = (ti >= 0) & (f["edges"] >= 3)
+    keep &= ~((flags[np.clip(ti, 0, max(len(flags) - 1, 0))] & SKIP_FLAGS) != 0) if len(flags) else keep
+    disp = f["disp"].astype(np.int64)
+    is_disp = keep & (disp >= 0) & (f["edges"] == 4) & ((disp + 1) * 176 <= len(dispinfo))
+    plain = keep & ~is_disp
+    tris = int((f["edges"][plain].astype(np.int64) - 2).sum())
+    verts = int(f["edges"][plain].astype(np.int64).sum())
+    if is_disp.any():
+        power = np.frombuffer(dispinfo, np.dtype({"names": ["power"], "formats": ["<i4"], "offsets": [20],
+                                                  "itemsize": 176}), len(dispinfo) // 176)["power"]
+        side = (1 << power[disp[is_disp]].astype(np.int64))
+        tris += int((2 * side * side).sum())
+        verts += int(((side + 1) ** 2).sum())
+    return tris, verts
+
+
 class BSP:
     def __init__(self, data):
         if data[:4] != b"VBSP":

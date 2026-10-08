@@ -151,7 +151,7 @@ def trail_system(mode=0, **trail):
 
 def test_particle_trails_follow_the_path():
     p = trail_system().simulate(0.95)
-    pts, widths, colors = p.trails
+    pts, widths, colors = p.trails[:3]
     assert pts.shape == (len(p), up.TRAIL_POINTS, 3) and widths.shape == pts.shape[:2]
     oldest = 0  # born at t=0: 0.95 s old, its trail covers the last 0.5 s of its 1 s life
     assert np.allclose(pts[oldest, 0], p.pos[oldest])                       # starts at the particle
@@ -161,7 +161,7 @@ def test_particle_trails_follow_the_path():
 
 def test_ribbon_trails_join_particles():
     p = trail_system(mode=1).simulate(0.55)
-    pts, widths, _c = p.trails
+    pts, widths, _c = p.trails[:3]
     assert pts.shape == (1, len(p), 3)  # one ribbon through every particle, newest first
     assert np.allclose(pts[0, 0], p.pos[-1]) and np.allclose(pts[0, -1], p.pos[0])
 
@@ -179,3 +179,104 @@ def test_trail_strips_and_keys():
     m = len(e.simulate(0.95))
     assert len(pts) == m * up.TRAIL_POINTS * 2 and len(tris) == m * (up.TRAIL_POINTS - 1) * 2
     assert uvs[:, 0].min() == 0 and uvs[:, 0].max() == 1 and "p" in geo
+
+
+def test_limit_velocity_slows_particles():
+    ps = system()
+    ps["InitialModule"]["startSpeed"] = const(10.0)
+    ps["ClampVelocityModule"] = {"enabled": 1, "magnitude": const(2.0), "dampen": 1.0, "separateAxis": 0,
+                                 "drag": const(0.0)}
+    p = emitter(ps).simulate(0.55)
+    assert p.pos[0, 2] == pytest.approx(2.0 * 0.55)          # capped at once: 2 units/s
+    ps["ClampVelocityModule"]["dampen"] = 0.1
+    p = emitter(ps).simulate(0.55)
+    assert 2.0 * 0.55 < p.pos[0, 2] < 10.0 * 0.55             # the excess fades over time
+    assert np.linalg.norm(p.vel[0]) < 10.0
+
+
+def test_drag():
+    ps = system()
+    ps["ClampVelocityModule"] = {"enabled": 1, "magnitude": const(1e9), "dampen": 0.0, "drag": const(2.0)}
+    p = emitter(ps).simulate(0.55)
+    expected = 2.0 * (1 - np.exp(-2.0 * 0.55)) / 2.0             # speed 2, drag 2: (1 - e^-kt) s0 / k
+    assert p.pos[0, 2] == pytest.approx(expected, rel=1e-6)
+
+
+def test_trails_linger_after_death():
+    e = trail_system(dieWithParticles=0)
+    p = e.simulate(1.2)  # the first particles died at 1.0 s; their trails (0.5 s) still fade out
+    alive = len(p)
+    assert p.trails[0].shape[0] > alive
+    ghost = p.trails[0][0]
+    assert np.allclose(ghost[0], [0.0, 0.0, 2.0])              # the dead particle's trail ends where it died
+    assert not trail_system().simulate(1.2).trails[0].shape[0] > alive  # dieWithParticles: no ghosts
+
+
+def test_noise_wiggles_but_starts_at_the_emitter():
+    ps = system()
+    ps["NoiseModule"] = {"enabled": 1, "strength": const(2.0), "frequency": 1.0, "scrollSpeed": const(0.0),
+                         "positionAmount": const(1.0), "separateAxes": 0}
+    calm = emitter(system()).simulate(1.5)
+    noisy = emitter(ps).simulate(1.5)
+    assert np.allclose(noisy.pos[-1], calm.pos[-1], atol=0.05)  # just born: hardly moved off its path
+    shift = np.linalg.norm(noisy.pos - calm.pos, axis=1)
+    assert shift.max() > 0.05 and shift.max() < 2.0              # older ones drift, bounded
+
+
+def test_trail_texture_modes():
+    stretch = trail_system().simulate(0.95).trails[3]
+    assert stretch[0, 0] == 0 and stretch[0, -1] == 1
+    tile = trail_system(textureMode=1).simulate(0.95).trails[3]
+    assert tile[0, -1] == pytest.approx(1.0)                    # the oldest trail spans 0.5 s at 2 units/s = 1 unit
+    per_segment = trail_system(textureMode=3).simulate(0.95).trails[3]
+    assert per_segment[0, -1] == up.TRAIL_POINTS - 1
+
+
+def _sub_pair(kind, child_ps, parent_ps=None):
+    parent, child = emitter(parent_ps or system()), emitter(child_ps)
+    parent.key, child.key = ("f", 1), ("f", 2)
+    up.link_sub_emitters([parent, child], [(parent, ("f", 2), kind, 1.0)])
+    return parent, child
+
+
+def test_death_sub_emitter_bursts_where_parents_die():
+    burst = system(looping=0, InitialModule={**system()["InitialModule"], "startLifetime": const(0.5),
+                                             "startSpeed": const(0.0)},
+                   EmissionModule={"enabled": 1, "rateOverTime": const(0.0), "m_BurstCount": 1,
+                                   "m_Bursts": [{"time": 0.0, "minCount": 5, "maxCount": 5, "cycleCount": 1}]})
+    _parent, child = _sub_pair(up.SUB_DEATH, burst)
+    assert child.driver is not None
+    assert child.simulate(0.5) is None              # no parent particle has died yet
+    p = child.simulate(1.25)                        # parents born at 0, 0.1, 0.2 died at 1.0, 1.1, 1.2
+    assert len(p) == 15
+    assert np.allclose(p.pos, [0.0, 0.0, 2.0])      # where they died: 1 s at 2 units/s along +z
+
+
+def test_birth_sub_emitter_follows_parent_path():
+    one = system(EmissionModule={"enabled": 1, "rateOverTime": const(0.0), "m_BurstCount": 1,
+                                 "m_Bursts": [{"time": 0.0, "minCount": 1, "maxCount": 1, "cycleCount": 1}]})
+    trail = system(InitialModule={**system()["InitialModule"], "startLifetime": const(0.3),
+                                  "startSpeed": const(0.0)})
+    _parent, child = _sub_pair(up.SUB_BIRTH, trail, one)
+    p = child.simulate(0.5)                          # children emitted at 0.3, 0.4, 0.5 still alive
+    assert sorted(np.round(p.pos[:, 2], 3)) == [0.6, 0.8, 1.0]
+
+
+def test_sub_emitter_refs_and_collision_ignored():
+    ptr = {"m_FileID": 0, "m_PathID": 5}
+    ps = system(SubModule={"enabled": 1, "subEmitters": [{"emitter": ptr, "type": 2, "emitProbability": 0.5}],
+                           "subEmitterBirth": ptr})
+    assert up.sub_emitter_refs(ps) == [(ptr, up.SUB_DEATH, 0.5), (ptr, up.SUB_BIRTH, 1.0)]
+    assert up.sub_emitter_refs(system()) == []
+    _parent, child = _sub_pair(up.SUB_COLLISION, system())
+    assert child.driver is None                      # plays on its own
+
+
+def test_birth_sub_emitter_rate_over_distance():
+    one = system(EmissionModule={"enabled": 1, "rateOverTime": const(0.0), "m_BurstCount": 1,
+                                 "m_Bursts": [{"time": 0.0, "minCount": 1, "maxCount": 1, "cycleCount": 1}]})
+    trail = system(InitialModule={**system()["InitialModule"], "startSpeed": const(0.0)},
+                   EmissionModule={"enabled": 1, "rateOverTime": const(0.0), "rateOverDistance": const(5.0),
+                                   "m_BurstCount": 0, "m_Bursts": []})
+    _parent, child = _sub_pair(up.SUB_BIRTH, trail, one)
+    assert len(child.simulate(0.5)) == 6             # 2 units/s x 5 per unit = 10/s: 0, 0.1 ... 0.5

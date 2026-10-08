@@ -81,7 +81,7 @@ def quads(emitter, p, axes):
 
 def trail_strips(trails, axes):
     """(points, uvs, colors, triangles) of Particles.trails as camera-facing strips (u along the trail)."""
-    pts, widths, colors = trails
+    pts, widths, colors = trails[:3]
     m, k = widths.shape
     view = axes[0]
     d = np.zeros_like(pts)
@@ -92,7 +92,7 @@ def trail_strips(trails, axes):
     norm = np.linalg.norm(side, axis=2, keepdims=True)
     side = np.where(norm > 1e-9, side / np.maximum(norm, 1e-9), axes[1]) * (widths / 2)[..., None]
     points = np.stack([pts - side, pts + side], axis=2).reshape(-1, 3)        # (M, K, 2) -> rows
-    u = np.repeat(np.linspace(0.0, 1.0, k)[None, :], m, 0)
+    u = trails[3] if len(trails) > 3 else np.repeat(np.linspace(0.0, 1.0, k)[None, :], m, 0)
     uvs = np.stack([np.stack([u, np.zeros_like(u)], -1), np.stack([u, np.ones_like(u)], -1)], axis=2).reshape(-1, 2)
     cols = np.repeat(colors[:, :, None, :], 2, axis=2).reshape(-1, 4)
     base = (np.arange(m)[:, None] * k + np.arange(k - 1)[None, :]).reshape(-1) * 2
@@ -111,10 +111,10 @@ def frame_geometry(emitters, indices, t, axes, look_of, trail_look_of=None):
             p = e.simulate(t)
         except Exception:
             continue
-        if p is None or not len(p) or total >= MAX_PARTICLES:
+        if p is None or (not len(p) and p.trails is None) or total >= MAX_PARTICLES:
             continue
         total += len(p)
-        if e.render_mode != "none":
+        if e.render_mode != "none" and len(p):
             pieces.setdefault(look_of(i), []).append(quads(e, p, axes))
         if p.trails is not None and trail_look_of is not None and p.trails[1].shape[1] >= 2:
             key = trail_look_of(i)

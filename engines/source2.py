@@ -495,6 +495,7 @@ BLOCK = {1: (1, 8), 2: (3, 16), 27: (4, 8), 21: (5, 16), 19: (6, 16), 20: (7, 16
 BPP = {3: 1, 4: 4, 5: 2, 6: 4, 7: 8, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 12, 14: 16, 22: 2, 28: 4}
 VTEX_CUBE = 0x10
 EXTRA_COMPRESSED_MIPS = 4
+NO_ALPHA = 8  # an alpha channel never above this (BC7 leaves stray 1-4s in an all-0 one) isn't opacity
 
 
 def vtex_info(data):
@@ -627,7 +628,10 @@ class Source2Session(GameSession):
     def image(self, asset):
         data = self.fs.read(asset.ref)
         if asset.ref.endswith(".vtex_c"):
-            return vtex_image(data)
+            img = vtex_image(data)
+            if img.mode == "RGBA" and img.getchannel("A").getextrema()[1] <= NO_ALPHA:
+                img = img.convert("RGB")  # alpha ~0 everywhere: the channel holds no opacity (Deadlock g_tColor)
+            return img
         if asset.ref.endswith(".vsvg_c"):
             from .sdk import svg_image
             text = panorama_text(data, resource_block_list(data))

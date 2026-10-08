@@ -426,7 +426,7 @@ class MeshView(QWidget):
         self.plotter = QtInteractor(self)
         self.environment = None   # the shown scene's sky / ambient (MeshData.environment)
         self.show_lighting = tool_button("sun", "Lighting: the scene's baked lightmaps (shadows and light painted\n"
-                                         "into the level), its sky colors and ambient light.", checked=True)
+                                         "into the level), its sky, ambient light and fog.", checked=True)
         self.show_lighting.setEnabled(False)
         self.show_lighting.toggled.connect(self._lighting_toggled)
         self._set_background()
@@ -455,7 +455,9 @@ class MeshView(QWidget):
         self.use_colors = tool_button("colors", "Vertex colors", checked=True)
         self.show_gizmos = tool_button("gizmo", "Gizmos: draw colliders (green, triggers yellow), light ranges "
                                        "(orange),\ncamera views (white), sound sources (cyan) and physics joints (pink:\n"
-                                       "anchor to the connected body, e.g. a ragdoll) as wire shapes.")
+                                       "anchor to the connected body, e.g. a ragdoll), VFX Graph effects (violet\n"
+                                       "markers - they can't be played), reflection/light probes (lime) and\n"
+                                       "occlusion areas/portals (grey) as wire shapes.")
         self.show_gizmos.setEnabled(False)
         self.play_fx = tool_button("sparkle", "Play effects: move the particle systems' particles (simulated, "
                                    "approximate)\ninstead of showing still puffs. Needs View > Show particle "
@@ -1026,6 +1028,8 @@ class MeshView(QWidget):
         self.animator = animator
         self.anim_time = 0.0
         self._rest_points = self.poly.points.copy() if self.poly is not None else None
+        if self._rest_points is not None and getattr(self, "_layers", None) is not None:
+            self._rest_points = self._rest_points - self._layers  # _set_points adds them back
         self.anim_bar.show()
         self.anim_label.setToolTip(title)
         self.anim_play.setText("\u23f8 Pause")
@@ -1053,6 +1057,14 @@ class MeshView(QWidget):
         self.redraw()
 
     def _set_points(self, pts):
+        layers = getattr(self, "_layers", None)
+        if layers is not None and len(layers) == len(pts):
+            # Unity draws these pieces in triangle order whatever their depth: keep the posed mesh flat and
+            # stacked in that order (the animation's own small depth moves would make neighbours swap)
+            axis, base = self._layer_flat
+            pts = np.array(pts, dtype=np.float32)
+            pts[:, axis] = base
+            pts = pts + layers
         meshes = [(self.poly, pts)] + [(part, pts[used]) for (part, *_), used
                                        in zip(self.parts, getattr(self, "_part_vertices", []))]
         for mesh, pts in meshes:
@@ -1128,6 +1140,15 @@ class MeshView(QWidget):
         self.animator = None
         self.anim_bar.hide()
         self.poly = poly
+        # stacked pieces of a flat mesh (2D sprite characters) pulled apart in draw order so they don't z-fight
+        self._layers = None
+        if poly is not None and owners is None and poly.n_points:
+            from uniview.model_display import layer_offsets
+            self._layers = layer_offsets(poly.points, poly.faces.reshape(-1, 4)[:, 1:])
+            if self._layers is not None:
+                axis = int(np.argmax(np.abs(self._layers).max(0)))
+                self._layer_flat = (axis, np.asarray(poly.points)[:, axis].copy())
+                poly.points = poly.points + self._layers
         self.texture_img = texture_img
         self.override = None
         self._textures = {}
@@ -1257,7 +1278,8 @@ class MeshView(QWidget):
                 self.plotter.disable_depth_peeling()
 
     GIZMO_COLORS = {"collider": "#3ddc84", "trigger": "#e8d44d", "light": "#ff9f43", "camera": "#ffffff",
-                    "audio": "#4dd0e1", "joint": "#ff6ad5"}
+                    "audio": "#4dd0e1", "joint": "#ff6ad5", "vfx": "#b388ff", "probe": "#d4e157",
+                    "occlusion": "#90a4ae"}
 
     def _draw_gizmos(self):
         if not (self.show_gizmos.isChecked() and self.gizmos):
@@ -1285,7 +1307,16 @@ class MeshView(QWidget):
             kind, images = env["sky_images"]
             sky = env.get("sky_texture") or {}
             tint = np.asarray(sky.get("tint", (1.0, 1.0, 1.0)), np.float32)
-            faces = sky_faces(kind, images, float(sky.get("rotation", 0.0) or 0.0))
+            if kind == "clouds":
+                from uniview.model_display import gradient_clouds
+                gradient = env.get("sky") or ((0.45, 0.6, 0.85), (0.75, 0.82, 0.9), (0.4, 0.4, 0.42))
+                faces = gradient_clouds([np.asarray(i) for i in images], gradient, sky.get("cloud_alpha", 1.0),
+                                        sky.get("stops"))
+            elif kind == "gradient":
+                from uniview.model_display import gradient_faces
+                faces = gradient_faces(sky["stops"])
+            else:
+                faces = sky_faces(kind, images, float(sky.get("rotation", 0.0) or 0.0))
             texture = pv.Texture()
             texture.mipmap = True
             texture.interpolate = True
@@ -1301,6 +1332,32 @@ class MeshView(QWidget):
             skybox.SetTexture(texture)
             self._sky = (env, skybox, texture, keep)
         return self._sky[1]
+
+    def _apply_lights(self):
+        """The scene's sun (Lighting button) or the default light kit."""
+        sun = (self.environment or {}).get("sun") if self.show_lighting.isChecked() else None
+        want = ("sun", tuple(sun["direction"]), tuple(sun["color"]), sun["intensity"]) if sun else ("kit",)
+        if getattr(self, "_lights", None) == want and self.plotter.renderer.lights:
+            return
+        self.plotter.remove_all_lights()
+        if sun is None:
+            self.plotter.enable_lightkit()
+        else:
+            d = np.asarray(sun["direction"], float)
+            light = pv.Light(position=tuple(-d), focal_point=(0.0, 0.0, 0.0), color=tuple(sun["color"]),
+                             intensity=float(sun["intensity"]), light_type="scene light")
+            light.positional = False
+            self.plotter.add_light(light)
+            self.plotter.add_light(pv.Light(light_type="headlight", intensity=0.25))  # shadow sides not pitch black
+        self._lights = want
+
+    def _fog(self, actor):
+        """Lighting button: the scene's fog on this actor (a fragment shader step), in perspective views."""
+        fog = (self.environment or {}).get("fog_params")
+        if not fog or not self.show_lighting.isChecked() or self.flat:
+            return
+        from uniview.model_display import fog_shader
+        actor.GetShaderProperty().AddFragmentShaderReplacement("//VTK::Light::Impl", True, fog_shader(fog), False)
 
     def _lightmap_texture(self, img, mode):
         key = ("lightmap", id(img), mode, self.flip_v.isChecked())
@@ -1419,6 +1476,7 @@ class MeshView(QWidget):
             if img is not None and self.use_tex.isChecked():
                 kwargs["texture"] = self._texture(img, alpha or ("blend", 1.0), tint)
             self._fx_actors[key] = self.plotter.add_mesh(poly, **kwargs)
+            self._fog(self._fx_actors[key])
         shown = (f"{len(indices)} of {len(emitters)} effects (nearest the camera)" if len(indices) < len(emitters)
                  else f"{len(emitters)} effect{'s' if len(emitters) != 1 else ''}")
         self.fx_label.setText(f"{self._fx_time:6.2f} s   \u00b7   {total:,} particles   \u00b7   {shown}")
@@ -1429,8 +1487,7 @@ class MeshView(QWidget):
         sky = self._sky_actor() if self.show_lighting.isChecked() and not self.flat else None
         if sky is not None:
             self.plotter.renderer.AddActor(sky)
-        if not self.plotter.renderer.lights:
-            self.plotter.enable_lightkit()
+        self._apply_lights()
         if self.poly is None:
             return
         self._draw_gizmos()
@@ -1465,6 +1522,7 @@ class MeshView(QWidget):
                     part_kwargs["color"] = "#c8c8c8"
                 actor = self.plotter.add_mesh(part, **part_kwargs)
                 self._light_part(actor, i, env_ambient)
+                self._fog(actor)
                 if alpha and alpha[0] in ("blend", "add"):
                     self._blended.append(actor)
                 if playing and i in self.effect_parts:
@@ -1485,7 +1543,7 @@ class MeshView(QWidget):
             kwargs.update(scalars="vertex_colors", rgba=True)
         else:
             kwargs["color"] = "#c8c8c8"
-        self.plotter.add_mesh(self.poly, **kwargs)
+        self._fog(self.plotter.add_mesh(self.poly, **kwargs))
         self._depth_peeling("texture" in kwargs and self.tex_alpha.isChecked())
         self._draw_highlight()
         if reset_camera:

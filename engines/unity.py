@@ -20,7 +20,8 @@ TYPE_KINDS = {"Mesh": "model", "Texture2D": "texture", "Sprite": "sprite", "Text
               "AnimationClip": "animation",
               "Font": "font", "VideoClip": "video", "MonoBehaviour": "data", "Cubemap": "texture",
               "PhysicMaterial": "data", "PhysicsMaterial": "data", "PhysicsMaterial2D": "data",
-              "AnimatorController": "controller"}
+              "AnimatorController": "controller", "AnimatorOverrideController": "controller", "Shader": "data",
+              "AudioMixerController": "data"}
 BUILTIN_DATA = ("PhysicMaterial", "PhysicsMaterial", "PhysicsMaterial2D")  # data assets that aren't scripts
 ALBEDO_PROPS = ("_MainTex", "_BaseMap", "_BaseColorMap", "_Albedo", "_BaseColorTexture")
 NORMAL_PROPS = ("_BumpMap", "_NormalMap")
@@ -275,7 +276,7 @@ def asset_image(asset):
 CUBE_FACES = ("+X", "-X", "+Y", "-Y", "+Z", "-Z")  # Unity's face order
 
 
-def cubemap_faces(cube, max_side=1024):
+def cubemap_faces(cube, max_side=1024, alpha=False):
     """The 6 faces of a parsed Cubemap as PIL images in Unity's order (+X, -X, +Y, -Y, +Z, -Z), at most
     max_side pixels wide. Unity stores the faces one after another (each with its mipmaps)."""
     from UnityPy.enums import BuildTarget
@@ -294,9 +295,19 @@ def cubemap_faces(cube, max_side=1024):
         img = parse_image_data(chunk, w, h, cube.m_TextureFormat, getattr(reader, "version", (0, 0, 0, 0)),
                                getattr(reader, "platform", BuildTarget.UnknownPlatform),
                                getattr(cube, "m_PlatformBlob", None), False)
-        if max(img.size) > max_side:
-            img = img.resize((max_side, max_side * img.height // img.width))
-        faces.append(img.convert("RGB"))
+        target = (max_side, max_side * img.height // img.width) if max(img.size) > max_side else None
+        if alpha:  # colour and alpha resized apart: RGBA resizes turn colour under alpha 0 black
+            a = img.getchannel("A") if "A" in img.getbands() else None
+            img = img.convert("RGB")
+            if target:
+                img, a = img.resize(target), (a.resize(target) if a is not None else None)
+            if a is not None:
+                img.putalpha(a)
+        else:
+            img = img.convert("RGB")
+            if target:
+                img = img.resize(target)
+        faces.append(img)
     return faces
 
 
@@ -351,7 +362,8 @@ def shader_name(ptr):
 def read_material_details(mat):
     """Everything a Unity project needs to rebuild a Material: {"name", "shader", "textures":
     [(property, texture ObjectReader, (scale x, y), (offset x, y))], "colors": {prop: rgba}, "floats": {prop: v},
-    "keywords": [..], "queue" (-1 = the shader's), "tags": {name: value}}."""
+    "keywords": [..], "queue" (-1 = the shader's), "tags": {name: value}, "shader_render": the shader's own
+    (queue, tags, blend) - see shader_render()}."""
     saved = mat.m_SavedProperties
     textures = []
     for prop, tex_env in saved.m_TexEnvs:
@@ -389,7 +401,8 @@ def read_material_details(mat):
         except (TypeError, ValueError, AttributeError):
             continue
     return {"name": mat.m_Name, "shader": shader_name(mat.m_Shader), "textures": textures, "colors": colors, "floats": floats,
-            "keywords": list(keywords), "queue": int(getattr(mat, "m_CustomRenderQueue", -1)), "tags": tags}
+            "keywords": list(keywords), "queue": int(getattr(mat, "m_CustomRenderQueue", -1)), "tags": tags,
+            "shader_render": shader_render(mat.m_Shader)}
 
 
 _CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
@@ -445,7 +458,7 @@ def shader_labels(shader_ptr):
     if reader.path_id not in cache:
         labels = {}
         try:
-            form = reader.read_typetree().get("m_ParsedForm") or {}
+            form = read_without_blobs(reader).get("m_ParsedForm") or {}
             for prop in (form.get("m_PropInfo") or {}).get("m_Props") or []:
                 if prop.get("m_Type") == 4 and prop.get("m_Description") and prop.get("m_Name"):
                     labels[prop["m_Name"]] = str(prop["m_Description"])
@@ -456,6 +469,74 @@ def shader_labels(shader_ptr):
 
 
 _LABELS = {}  # id(assets file) -> {shader path id: {property: display name}}
+
+QUEUE_NAMES = {"background": 1000, "geometry": 2000, "alphatest": 2450, "transparent": 3000, "overlay": 4000}
+BLEND_ONE, BLEND_SRC_ALPHA, BLEND_ONE_MINUS_SRC_ALPHA = 1, 5, 10
+
+
+def queue_value(text):
+    """A ShaderLab "Queue" tag ("Transparent", "Geometry+1", "2450") -> render queue number, or -1."""
+    text = str(text or "").strip().lower().replace(" ", "")
+    if not text:
+        return -1
+    m = re.match(r"^([a-z]*)([+-]\d+)?$", text) or re.match(r"^()(\d+)$", text)
+    if not m:
+        return -1
+    base = QUEUE_NAMES.get(m.group(1), 0 if not m.group(1) else None)
+    if base is None:
+        return -1
+    return base + int(m.group(2) or 0)
+
+
+def shader_render(shader_ptr):
+    """(queue, {tag: value}, (src, dst) blend or None) the Shader itself declares in its first sub-shader - what
+    a material with no queue/tags of its own (m_CustomRenderQueue -1) gets. (-1, {}, None) if unknown. Many
+    games' own shaders only say "transparent" here (Fallout Shelter's Underground/Dweller sprite characters)."""
+    try:
+        if not shader_ptr.path_id:
+            return -1, {}, None
+        reader = shader_ptr.deref()
+    except Exception:
+        return -1, {}, None
+    cache = _RENDER.setdefault(id(reader.assets_file), {})
+    if reader.path_id not in cache:
+        out = (-1, {}, None)
+        try:
+            form = read_without_blobs(reader).get("m_ParsedForm") or {}
+            subs = form.get("m_SubShaders") or []
+            if subs:
+                tags = {}
+                for k, v in (subs[0].get("m_Tags") or {}).get("tags") or []:
+                    tags[str(k)] = str(v)
+                passes = subs[0].get("m_Passes") or []
+                state = passes[0].get("m_State") or {} if passes else {}
+                for k, v in (state.get("m_Tags") or {}).get("tags") or []:
+                    tags.setdefault(str(k), str(v))
+                low = {k.lower(): v for k, v in tags.items()}
+                blend = None
+                rt = state.get("rtBlend0") or {}
+                src, dst = rt.get("srcBlend") or {}, rt.get("destBlend") or {}
+                if src.get("name") in (None, "", "<noninit>") and dst.get("name") in (None, "", "<noninit>"):
+                    if "val" in src and "val" in dst:  # fixed in the shader, not from material properties
+                        blend = (int(src["val"]), int(dst["val"]))
+                render_type = low.get("rendertype")
+                out = (queue_value(low.get("queue")),
+                       {"RenderType": render_type} if render_type else {}, blend)
+        except Exception as e:
+            log.debug("Shader render tags: %s", e)
+        cache[reader.path_id] = out
+    return cache[reader.path_id]
+
+
+_RENDER = {}  # id(assets file) -> {shader path id: (queue, tags, blend)}
+
+
+def effective_render(shader_ptr, queue, tags):
+    """(queue, tags, shader blend) a material really renders with: its own queue and tags, else its shader's."""
+    if queue != -1:
+        return queue, tags, None
+    s_queue, s_tags, blend = shader_render(shader_ptr)
+    return s_queue, {**s_tags, **(tags or {})}, blend
 
 
 def _lod_stem(name):
@@ -479,6 +560,28 @@ def world_mapped(shader, floats):
         return True
     return any("triplanar" in prop.lower() and not prop.lower().endswith(("scale", "sharpness", "blend", "pos"))
                and value >= 0.5 for prop, value in (floats or {}).items())
+
+
+UTF16_TEXT = re.compile(rb"(?:[\x20-\x7e]\x00){2,64}")  # string literals in .NET assemblies
+ASCII_TEXT = re.compile(rb"[\x20-\x7e]{2,64}")
+SHADER_PROP_TYPES = {0: "Color", 1: "Vector", 2: "Float", 3: "Range", 4: "Texture", 5: "Int"}
+
+
+def read_without_blobs(reader):
+    """A Shader's type tree up to m_ParsedForm, without the compiled programs after it (hundreds of MB in HDRP
+    games). The type tree node is trimmed for the read and put back (callers hold the session lock)."""
+    node = reader._get_typetree_node(None)
+    full = node.m_Children
+    keep = []
+    for child in full:
+        keep.append(child)
+        if child.m_Name == "m_ParsedForm":
+            break
+    node.m_Children = keep
+    try:
+        return reader.read_typetree(node, check_read=False)
+    finally:
+        node.m_Children = full
 
 
 def make_material(mat, asset_for):
@@ -556,7 +659,8 @@ def read_material(mat):
             tags[str(k)] = str(v)
         except (TypeError, ValueError, AttributeError):
             continue
-    alpha_mode, cutoff = material_alpha(shader, floats, keywords, int(getattr(mat, "m_CustomRenderQueue", -1)), tags)
+    queue, tags, blend = effective_render(mat.m_Shader, int(getattr(mat, "m_CustomRenderQueue", -1)), tags)
+    alpha_mode, cutoff = material_alpha(shader, floats, keywords, queue, tags, blend)
     if world_mapped(shader, floats):
         st = {}  # its tiling is per world unit, not for the mesh's UVs
     for prop, label in labels.items():
@@ -591,16 +695,19 @@ def is_additive(shader, floats):
     return floats.get("_SrcBlend") in (1, 5) and floats.get("_DstBlend") == 1
 
 
-def material_alpha(shader, floats, keywords, queue=-1, tags=None):
+def material_alpha(shader, floats, keywords, queue=-1, tags=None, blend=None):
     """("opaque" | "mask" | "blend" | "add", cutoff) of a Unity material: what its shader does with the albedo
     alpha (the 3D view draws it see-through, Unity project export picks a matching shader). "add" is a
     blended material whose shader adds it on top (is_additive). The material's own switches (keywords,
     URP _Surface/_AlphaClip, HDRP flags, Standard _Mode) win; then the RenderType tag, the render queue and
-    finally words in the shader's name."""
+    finally words in the shader's name. blend: the (src, dst) blend factors the shader fixes, if known."""
     if "additive" in (shader or "").lower():
         return "add", _cutoff(floats)  # legacy additive shaders ignore any leftover surface switches
     mode, cutoff = _surface_alpha(shader, floats, keywords, queue, tags)
-    if mode == "blend" and is_additive(shader, floats):
+    if mode == "opaque" and blend is not None and blend[1] == BLEND_ONE_MINUS_SRC_ALPHA:
+        mode = "blend"  # alpha blending set in the shader's pass, nothing on the material says so
+    if mode == "blend" and (is_additive(shader, floats) or
+                            (blend is not None and blend[0] in (BLEND_ONE, BLEND_SRC_ALPHA) and blend[1] == BLEND_ONE)):
         return "add", cutoff
     return mode, cutoff
 
@@ -1267,8 +1374,8 @@ def _path_closeness(a, b):
 
 
 def script_class(obj):
-    """'Namespace.ClassName' of a MonoBehaviour's script ('PhysicMaterial' etc. for built-in data), or ''."""
-    if getattr(getattr(obj, "type", None), "name", "") in BUILTIN_DATA:
+    """'Namespace.ClassName' of a MonoBehaviour's script ('PhysicMaterial', 'Shader'... for built-in data), or ''."""
+    if getattr(getattr(obj, "type", None), "name", "") in BUILTIN_DATA + ("Shader", "AudioMixerController"):
         return obj.type.name
     try:
         script = obj.read(check_read=False).m_Script.read()
@@ -1318,9 +1425,16 @@ class UnitySession(GameSession):
         self._terrains = {}
         self._rigs = None        # humanoid Avatars (unity_humanoid.HumanRig)
         self._scene_settings = {}  # id(scene file) -> (RenderSettings tree, lightmaps)
+        self._shader_info = {}     # shader key -> shader_info()
+        self._shader_users = None  # shader key -> [material names], built on first use
+        self._routing = None       # AudioMixer routing (see _mixer_routing)
+        self._crc = None           # CRC32 -> string of the game's code (see _crc_names)
         self._lod_index = None     # renderer key -> (LODGroup, level), for lod_siblings
         self._container_scripts = None  # container -> its MonoBehaviours (for _data_materials)
         self._material_names = {}        # material name -> reader
+        self._material_paths = {}        # material container path (lower case) -> reader
+        self._registry = None            # name -> Addressables GUID, from data assets (see _registry_material)
+        self._catalog = None             # Addressables key -> [asset paths]
         self._material_keys = []         # (loose name, loose .mat file name, name length, reader)
         self._model_rigs = {}    # mesh key -> the HumanRig that fits its skeleton, or None
         self._humanoid = {}      # (clip key, rig) -> clip converted to bone curves
@@ -1406,10 +1520,10 @@ class UnitySession(GameSession):
             return cubemap_cross(self.cube_faces(asset, 512))
         return asset_image(asset.ref.read())
 
-    def cube_faces(self, asset, max_side=1024):
-        """The 6 faces of a Cubemap asset (Unity order +X, -X, +Y, -Y, +Z, -Z)."""
+    def cube_faces(self, asset, max_side=1024, alpha=False):
+        """The 6 faces of a Cubemap asset (Unity order +X, -X, +Y, -Y, +Z, -Z); alpha=True keeps their alpha."""
         with self.lock:
-            return cubemap_faces(asset.ref.read(), max_side)
+            return cubemap_faces(asset.ref.read(), max_side, alpha)
 
     def float_texture(self, asset):
         """(pixels H x W x C float32, settings dict) of a half/float Texture2D, else None. Settings: the
@@ -1883,6 +1997,10 @@ class UnitySession(GameSession):
                 return bytes(asset.ref.read().m_FontData)
         if asset.kind == "video":
             return self.video(asset)[0]
+        if asset.kind == "data" and asset.ref.type.name == "Shader":
+            return self._shader_text(asset).encode("utf-8")
+        if asset.kind == "data" and asset.ref.type.name == "AudioMixerController":
+            return self._mixer_text(asset).encode("utf-8")
         if asset.kind == "data":
             import json
             tree, _note = self._data(asset)
@@ -1955,7 +2073,179 @@ class UnitySession(GameSession):
             feed(tree)
         return h.digest()
 
+    def shader_info(self, reader):
+        """{"name", "properties": [{"name", "label", "type", "default"}], "keywords": [...]} of a Shader, read
+        without its compiled code (cached)."""
+        key = obj_key(reader.assets_file, reader.path_id)
+        if key not in self._shader_info:
+            with self.lock:
+                form = (read_without_blobs(reader).get("m_ParsedForm") or {})
+            props = []
+            for p in (form.get("m_PropInfo") or {}).get("m_Props") or []:
+                kind = SHADER_PROP_TYPES.get(int(p.get("m_Type", -1)), "?")
+                values = [round(float(p.get(f"m_DefValue[{i}]", 0) or 0), 4) for i in range(4)]
+                if kind == "Texture":
+                    default = (p.get("m_DefTexture") or {}).get("m_DefaultName") or ""
+                elif kind in ("Color", "Vector"):
+                    default = values
+                else:
+                    default = values[0]
+                props.append({"name": p.get("m_Name", ""), "label": p.get("m_Description", ""), "type": kind,
+                              "default": default, "attributes": list(p.get("m_Attributes") or [])})
+            keywords = list(form.get("m_KeywordNames") or [])
+            self._shader_info[key] = {"name": form.get("m_Name") or reader.peek_name() or "Shader",
+                                      "properties": props, "keywords": keywords}
+        return self._shader_info[key]
+
+    def shader_users(self, reader):
+        """Names of the materials that use a Shader (index built on first use)."""
+        if self._shader_users is None:
+            index = {}
+            with self.lock:
+                for obj in self.env.objects:
+                    if obj.type.name != "Material":
+                        continue
+                    try:
+                        ptr = obj.read_typetree().get("m_Shader") or {}
+                        target = self.finder._file(obj.assets_file, ptr.get("m_FileID", 0))
+                        if target is not None and ptr.get("m_PathID"):
+                            index.setdefault((id(target), ptr["m_PathID"]), []).append(obj.peek_name() or "?")
+                    except Exception:
+                        continue
+            self._shader_users = index
+        return self._shader_users.get(obj_key(reader.assets_file, reader.path_id), [])
+
+    def _shader_text(self, asset):
+        info = self.shader_info(asset.ref)
+        users = self.shader_users(asset.ref)
+        lines = [f"{info['name']}   (Shader)", "", f"Properties ({len(info['properties'])}):"]
+        for p in info["properties"]:
+            label = f"  \"{p['label']}\"" if p["label"] and p["label"] != p["name"] else ""
+            default = "" if p["default"] in (None, "", []) else f" = {p['default']}"
+            attrs = f"  [{', '.join(p['attributes'])}]" if p["attributes"] else ""
+            lines.append(f"  {p['name']}{label}  ({p['type']}){default}{attrs}")
+        if info["keywords"]:
+            lines += ["", f"Keywords ({len(info['keywords'])}): " + ", ".join(info["keywords"][:200])]
+        lines += ["", f"Used by {len(users)} material(s):"] + [f"  {n}" for n in sorted(users)[:2000]]
+        return "\n".join(lines)
+
+    def mixer_info(self, reader):
+        """An AudioMixer: {"name", "snapshots": [names], "start", "exposed": n, "groups": [{"name", "parent" (index
+        or -1), "volumes": {snapshot: dB}, "mute", "solo", "bypass", "effects": n, "sources": [object names]}]}."""
+        with self.lock:
+            tree = reader.read_typetree()
+        mc = tree.get("m_MixerConstant") or {}
+
+        def names(buffer):
+            return bytes(buffer or []).split(b"\0")
+        group_names = [n.decode("utf-8", "replace") for n in names(mc.get("groupNameBuffer"))]
+        snap_names = [n.decode("utf-8", "replace") for n in names(mc.get("snapshotNameBuffer"))]
+        snaps = mc.get("snapshots") or []
+        snap_names = [snap_names[i] if i < len(snap_names) and snap_names[i] else f"Snapshot {i}"
+                      for i in range(len(snaps))]
+        effects = [0] * len(mc.get("groups") or [])
+        for e in mc.get("effects") or []:
+            if 0 <= e.get("groupConstantIndex", -1) < len(effects):
+                effects[e["groupConstantIndex"]] += 1
+        guid_index = {tuple(g.get(f"data[{i}]") for i in range(4)): n for n, g in enumerate(mc.get("groupGUIDs") or [])}
+        sources = self._mixer_routing().get(obj_key(reader.assets_file, reader.path_id), {})
+        groups = []
+        for n, g in enumerate(mc.get("groups") or []):
+            vol = g.get("volumeIndex", -1)
+            volumes = {snap_names[i]: float(s["values"][vol]) for i, s in enumerate(snaps)
+                       if 0 <= vol < len(s.get("values") or [])}
+            guid = next((k for k, v in guid_index.items() if v == n), None)
+            groups.append({"name": group_names[n] if n < len(group_names) and group_names[n] else f"Group {n}",
+                           "parent": int(g.get("parentConstantIndex", -1)), "volumes": volumes,
+                           "mute": bool(g.get("mute")), "solo": bool(g.get("solo")),
+                           "bypass": bool(g.get("bypassEffects")), "effects": effects[n],
+                           "sources": sources.get(guid, [])})
+        start = self._ptr_reader(reader, tree.get("m_StartSnapshot"))
+        names = self._crc_names()
+        exposed = [names.get(int(h) & 0xFFFFFFFF, f"#{int(h) & 0xFFFFFFFF:08x}")
+                   for h in mc.get("exposedParameterNames") or []]
+        return {"name": tree.get("m_Name", "Mixer"), "snapshots": snap_names,
+                "start": start.peek_name() if start is not None else (snap_names[0] if snap_names else ""),
+                "exposed": exposed, "groups": groups}
+
+    def _crc_names(self):
+        """{CRC32: text} of the strings in the game's own code (its .NET assemblies, or IL2CPP's
+        global-metadata.dat) - Unity keeps only CRC32s of exposed mixer parameter names; scripts name them."""
+        if self._crc is None:
+            import glob
+            import zlib
+            game = self.path if os.path.isdir(self.path) else os.path.dirname(self.path)
+            files = [f for f in glob.glob(os.path.join(game, "*_Data", "Managed", "*.dll"))
+                     if not re.match(r"(System|Mono|mscorlib|netstandard|Unity|UnityEngine)", os.path.basename(f))]
+            files += glob.glob(os.path.join(game, "*_Data", "il2cpp_data", "Metadata", "global-metadata.dat"))
+            texts = set()
+            for path in files:
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    continue
+                texts.update(m.group().decode("utf-16-le") for m in UTF16_TEXT.finditer(data))
+                texts.update(m.group().decode("ascii") for m in ASCII_TEXT.finditer(data))
+            self._crc = {zlib.crc32(t.encode("utf-8")): t for t in texts}
+        return self._crc
+
+    def _mixer_routing(self):
+        """{mixer key: {group GUID: [names of the objects whose AudioSource plays into it]}} (built once)."""
+        if self._routing is None:
+            routing = {}
+            with self.lock:
+                for obj in self.env.objects:
+                    if obj.type.name != "AudioSource":
+                        continue
+                    try:
+                        tree = obj.read_typetree()
+                        group = self._ptr_reader(obj, tree.get("OutputAudioMixerGroup"))
+                        if group is None:
+                            continue
+                        gtree = group.read_typetree()
+                        mixer = self._ptr_reader(group, gtree.get("m_AudioMixer"))
+                        go = self._ptr_reader(obj, tree.get("m_GameObject"))
+                        if mixer is None:
+                            continue
+                        guid = tuple((gtree.get("m_GroupID") or {}).get(f"data[{i}]") for i in range(4))
+                        routing.setdefault(obj_key(mixer.assets_file, mixer.path_id), {}).setdefault(guid, []).append(
+                            (go.peek_name() if go is not None else "") or "?")
+                    except Exception:
+                        continue
+            self._routing = routing
+        return self._routing
+
+    def _mixer_text(self, asset):
+        m = self.mixer_info(asset.ref)
+        lines = [f"{m['name']}   (AudioMixer)", "",
+                 "Snapshots: " + ", ".join(s + ("  (start)" if s == m["start"] else "") for s in m["snapshots"]),
+                 f"Exposed parameters ({len(m['exposed'])}): " + (", ".join(m["exposed"]) or "none"), "",
+                 "Groups (volume in dB per snapshot):"]
+
+        def walk(index, depth):
+            g = m["groups"][index]
+            vols = ", ".join(f"{s} {v:+.1f}" for s, v in g["volumes"].items())
+            flags = [f for f, on in (("muted", g["mute"]), ("solo", g["solo"]), ("effects bypassed", g["bypass"])) if on]
+            extra = (f" · {g['effects']} effect(s)" if g["effects"] else "") + (f" · {', '.join(flags)}" if flags else "")
+            lines.append(f"{'    ' * depth}{g['name']}   [{vols}]{extra}")
+            if g["sources"]:
+                shown = sorted(set(g["sources"]))
+                lines.append(f"{'    ' * depth}  <- {len(g['sources'])} audio source(s): " + ", ".join(shown[:12])
+                             + (" ..." if len(shown) > 12 else ""))
+            for child, c in enumerate(m["groups"]):
+                if c["parent"] == index and child != index:
+                    walk(child, depth + 1)
+        for root, g in enumerate(m["groups"]):
+            if g["parent"] < 0:
+                walk(root, 1)
+        return "\n".join(lines)
+
     def text(self, asset):
+        if asset.kind == "data" and asset.ref.type.name == "AudioMixerController":
+            return self._mixer_text(asset)
+        if asset.kind == "data" and asset.ref.type.name == "Shader":
+            return self._shader_text(asset)
         if asset.kind == "data":
             import json
             tree, note = self._data(asset)
@@ -2189,6 +2479,10 @@ class UnitySession(GameSession):
             mesh = model.ref.read()
             handler = MeshHandler(mesh)
             handler.process()
+        if handler.m_BoneIndices and not handler.m_BoneWeights:
+            # Bone indices without a weight channel: one bone per vertex, weight 1 (Fallout Shelter's sprite
+            # characters - each body-part quad follows one bone)
+            handler.m_BoneWeights = [(1.0,) + (0.0,) * (len(ix) - 1) for ix in handler.m_BoneIndices]
         if not handler.m_BoneWeights or not handler.m_BoneIndices:
             raise ValueError("This model has no bone weights.")
         bind_poses = bind_matrices(getattr(handler, "m_BindPose", None) or mesh.m_BindPose)
@@ -2484,9 +2778,45 @@ class UnitySession(GameSession):
         return out
 
     def controller(self, asset):
-        """An AnimatorController asset decoded (unity_controller.decode_controller), clips as their Assets."""
-        from .unity_controller import decode_controller
+        """An AnimatorController asset decoded (unity_controller.decode_controller), clips as their Assets. An
+        AnimatorOverrideController is its base controller with the clips swapped ("override_of": base name,
+        "overridden": how many clips)."""
         reader = asset.ref
+        if reader.type.name == "AnimatorOverrideController":
+            with self.lock:
+                tree = reader.read_typetree()
+                base = self._ptr_reader(reader, tree.get("m_Controller"))
+                swaps = {}
+                for pair in tree.get("m_Clips") or []:
+                    orig = self._ptr_reader(reader, pair.get("m_OriginalClip"))
+                    new = self._ptr_reader(reader, pair.get("m_OverrideClip"))
+                    if orig is not None and new is not None:
+                        swaps[obj_key(orig.assets_file, orig.path_id)] = self._asset_for(new, "AnimationClip")
+            if base is None or base.type.name not in ("AnimatorController", "AnimatorOverrideController"):
+                raise ValueError("This override controller's base controller isn't in the game files.")
+            decoded = self.controller(self._asset_for(base, base.type.name))
+            for layer in decoded["layers"]:
+                for state in layer["states"]:
+                    motion = state.get("motion") or {}
+                    nodes = [motion] + list((motion.get("tree") or {}).get("nodes", []))
+                    for node in nodes:
+                        clip = node.get("clip")
+                        if clip is not None and clip.key in swaps:
+                            node["clip"] = swaps[clip.key]
+            decoded.update(name=tree.get("m_Name", asset.name), override_of=base.peek_name() or "controller",
+                           overridden=len(swaps))
+            return decoded
+        return self._controller_from(reader)
+
+    def _ptr_reader(self, owner, ptr):
+        """ObjectReader a type-tree PPtr dict of `owner` points to, or None."""
+        if not isinstance(ptr, dict) or not ptr.get("m_PathID"):
+            return None
+        target = self.finder._file(owner.assets_file, ptr.get("m_FileID", 0))
+        return target.objects.get(ptr["m_PathID"]) if target is not None else None
+
+    def _controller_from(self, reader):
+        from .unity_controller import decode_controller
         with self.lock:
             tree = reader.read_typetree()
             clips = []
@@ -2633,6 +2963,15 @@ class UnitySession(GameSession):
 
     def audio(self, asset):
         clip = asset.ref.read()
+        resource = getattr(clip, "m_Resource", None)
+        if (resource is not None and not getattr(resource, "m_Source", "") and not getattr(resource, "m_Size", 0)
+                and not getattr(clip, "m_AudioData", None)):
+            # An empty placeholder (UnityPy would open the game folder as a file): Unity makes these for a video's
+            # sound track, whose sound stays inside the video.
+            video = asset.name[:-6] if asset.name.lower().endswith(" audio") else ""
+            raise ValueError("This AudioClip is an empty placeholder: its sound isn't stored in the game files."
+                             + (f"\nIt's the sound track of the video '{video}' - the sound plays with the video."
+                                if video else ""))
         try:
             samples = clip.samples  # UnityPy converts through FMOD to WAV
         except OSError as e:
@@ -2656,6 +2995,14 @@ class UnitySession(GameSession):
             return {"size": asset.size, "info": f"{n:,} objects" if n else "prefab", "sort": n}
         obj = asset.ref
         stats = {"size": obj.byte_size}
+        if asset.kind == "data" and obj.type.name == "AudioMixerController":
+            mc = obj.read_typetree().get("m_MixerConstant") or {}
+            return {"size": obj.byte_size, "info": f"AudioMixer · {len(mc.get('groups') or [])} groups, "
+                    f"{len(mc.get('snapshots') or [])} snapshots", "sort": obj.byte_size}
+        if asset.kind == "data" and obj.type.name == "Shader":
+            info = self.shader_info(obj)
+            return {"size": obj.byte_size, "info": f"{info['name']} · {len(info['properties'])} properties",
+                    "sort": obj.byte_size}
         if asset.kind == "data":
             with self.lock:
                 cls = script_class(obj)
@@ -2770,6 +3117,8 @@ class UnitySession(GameSession):
                         self._material_names.setdefault(mat_name, obj)
                         stem = os.path.splitext(os.path.basename(getattr(obj, "container", None) or ""))[0]
                         self._material_keys.append((_loose(mat_name), _loose(stem), len(mat_name), obj))
+                        if getattr(obj, "container", None):
+                            self._material_paths[obj.container.lower()] = obj
         target = (id(asset.ref.assets_file), asset.ref.path_id)
         for mb in self._container_scripts.get(asset.path, [])[:20]:
             with self.lock:
@@ -2781,6 +3130,63 @@ class UnitySession(GameSession):
                 with self.lock:
                     return [read_material(r.read()) for r in readers]
         return []
+
+    def catalog(self):
+        """{Addressables key (address, label, GUID): [asset paths]} from the game's catalog(s), read once."""
+        if self._catalog is None:
+            import glob
+            from .unity_catalog import catalog_entries
+            game = self.path if os.path.isdir(self.path) else os.path.dirname(self.path)
+            entries = {}
+            for path in glob.glob(os.path.join(game, "*_Data", "StreamingAssets", "aa", "catalog*.*")):
+                if path.lower().endswith((".bin", ".json")):
+                    try:
+                        for k, v in catalog_entries(path).items():
+                            entries.setdefault(k, []).extend(v)
+                    except Exception as e:
+                        log.debug("Addressables catalog %s: %s", path, e)
+            self._catalog = entries
+        return self._catalog
+
+    def _registry_material(self, name):
+        """The material a game's name for it means through its own registry: a data asset listing
+        {"name": "RailgunPart", <AssetReference>: {"m_AssetGUID": ...}} and the Addressables catalog that says
+        what that GUID is (Assets/.../HDRPRailgun.mat). None if there's no such entry."""
+        if self._registry is None:
+            self._registry = {}
+            if self.catalog():
+                guid_text = re.compile(rb"\x20\x00\x00\x00[0-9a-f]{32}")
+                for obj in self.env.objects:
+                    if obj.type.name != "MonoBehaviour":
+                        continue
+                    try:
+                        if len(guid_text.findall(obj.get_raw_data())) < 2:
+                            continue  # registries list several references
+                        tree, _note = self._scripts().read(obj)
+                    except Exception:
+                        continue
+                    self._collect_registry(tree, 0)
+        guid = self._registry.get(name.lower())
+        for path in self.catalog().get(guid, []) if guid else []:
+            reader = self._material_paths.get(path.lower())
+            if reader is not None:
+                return reader
+        return None
+
+    def _collect_registry(self, node, depth):
+        if depth > 8:
+            return
+        if isinstance(node, dict):
+            names = [v for v in node.values() if isinstance(v, str) and v]
+            guids = [v.get("m_AssetGUID") for v in node.values() if isinstance(v, dict) and v.get("m_AssetGUID")]
+            if names and len(guids) == 1:
+                for n in names:
+                    self._registry.setdefault(n.lower(), guids[0])
+            for v in node.values():
+                self._collect_registry(v, depth + 1)
+        elif isinstance(node, list):
+            for v in node[:5000]:
+                self._collect_registry(v, depth + 1)
 
     def _material_like(self, key):
         """The material a game's own name for it most likely means ("WING_DELTA" -> MAT_MOV_WING_DELTA): its
@@ -2827,7 +3233,8 @@ class UnitySession(GameSession):
                     reader = self._ptr_target(v, owner)
                     reader = reader if reader is not None and reader.type.name == "Material" else None
                 elif isinstance(v, str) and v:
-                    reader = self._material_names.get(v) or self._material_like(v)
+                    reader = (self._material_names.get(v) or self._registry_material(v)
+                              or self._material_like(v))
                 if reader is not None and reader not in out:
                     out.append(reader)
         return out
@@ -3082,6 +3489,7 @@ class UnityPlugin(EnginePlugin):
         transforms_by_file = {}   # id(assets file) -> (assets file, [Transform readers])
         prefab_containers = {}    # container path -> [GameObject readers]
         renderer_readers = []     # MeshFilter / SkinnedMeshRenderer (to find prefab roots in classic builds)
+        shader_budget = 3.0       # seconds spent naming shaders while loading
         for i, obj in enumerate(env.objects):
             type_name = obj.type.name
             if type_name in ("Transform", "RectTransform"):
@@ -3105,6 +3513,20 @@ class UnityPlugin(EnginePlugin):
                 name = obj.peek_name()
             except Exception:
                 name = None
+            if type_name == "Shader" and not name:
+                # Its real name ("HDRP/Lit") is inside its parsed form: read without the compiled programs (fast),
+                # within a time budget; past it, the bundle path or id (the stats pass shows the real name).
+                if shader_budget > 0:
+                    t = time.time()
+                    try:
+                        name = (read_without_blobs(obj).get("m_ParsedForm") or {}).get("m_Name") or ""
+                    except Exception:
+                        name = ""
+                    shader_budget -= time.time() - t
+                if not name:
+                    container = getattr(obj, "container", None)
+                    name = (os.path.splitext(os.path.basename(container))[0] if container
+                            else f"Shader {obj.path_id % 100000:05d}")
             if kind == "data" and not name:
                 continue  # only named MonoBehaviours: data assets (ScriptableObjects), not components
             if kind == "font":

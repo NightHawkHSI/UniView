@@ -50,8 +50,12 @@ def _first(mapping, names):
 def surface(details):
     """'opaque', 'cutout' or 'transparent', from the queue, tags, keywords, floats and shader name
     (engines.unity.material_alpha, which the 3D view uses too)."""
+    queue, tags, blend = details.get("queue", -1), details.get("tags"), None
+    if queue == -1 and details.get("shader_render"):  # the shader's own queue / tags / blending
+        s_queue, s_tags, blend = details["shader_render"]
+        queue, tags = s_queue, {**s_tags, **(tags or {})}
     mode, _cutoff = material_alpha(details.get("shader"), details.get("floats"), details.get("keywords"),
-                                   details.get("queue", -1), details.get("tags"))
+                                   queue, tags, blend)
     return {"mask": "cutout", "blend": "transparent", "add": "transparent"}.get(mode, "opaque")
 
 

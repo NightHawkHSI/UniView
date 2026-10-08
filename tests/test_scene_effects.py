@@ -70,3 +70,20 @@ def test_scene_vertices_remember_their_object():
     assert list(starts) == [0, 3, 6] and uids == ["go:level0:1", "go:level0:2", "go:level0:1"]
     vertex = 4  # in the second triangle
     assert uids[int(np.searchsorted(starts, vertex, side="right")) - 1] == "go:level0:2"
+
+
+def test_trail_preview_streams_back_and_tapers():
+    from engines.unity_scene import trail_preview
+    m = np.eye(4)
+    m[:3, 3] = (1.0, 2.0, 3.0)
+    trail = {"m_Enabled": 1, "m_Time": 0.2,
+             "m_Parameters": {"widthMultiplier": 0.5,
+                              "widthCurve": {"m_Curve": [{"time": 0.0, "value": 1.0}, {"time": 1.0, "value": 0.0}]},
+                              "colorGradient": {"key0": {"r": 1, "g": 0.2, "b": 0, "a": 1}}}}
+    points, widths, color = trail_preview(trail, m)
+    assert np.allclose(points[0], (1, 2, 3)) and np.allclose(points[-1], (1, 2, 1))  # 0.2 s x 10 units/s back
+    assert widths[0] == 0.5 and widths[-1] == 0.0
+    assert color == (1.0, 0.2, 0.0, 1.0)
+    assert trail_preview(dict(trail, m_Time=0.0), m) is None
+    pts, uvs, _tris = ribbon(points, 0.0, widths=widths)
+    assert uvs[:, 0].min() == 0.0 and uvs[:, 0].max() == 1.0   # stretched once along the trail

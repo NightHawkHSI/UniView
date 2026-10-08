@@ -398,10 +398,11 @@ class SourceSession(GameSession):
     def stats(self, asset):
         stats = {"size": asset.size}
         if asset.kind == "model" and asset.ref.endswith(".bsp"):
-            # World only (placing every prop is too slow for background measuring).
-            _bsp, points, _uvs, parts, _pak, _sky = self._map(asset.ref)
-            tris = sum(len(t) for _td, t in parts)
-            stats.update(tris=tris, verts=len(points), info=f"{tris:,} tris (map)", sort=tris)
+            # World only, counted from the face table (building the map took ~1 s each: far too slow to measure
+            # hundreds of maps in the background).
+            from .bsp import triangle_count
+            tris, verts = triangle_count(lambda start, length: self.fs.read(asset.ref, start, length))
+            stats.update(tris=tris, verts=verts, info=f"{tris:,} tris (map)", sort=tris)
         elif asset.kind == "model":
             hdr, meshes = self._model_parts(asset)
             tris = sum(len(ids) // 3 for (b, m, _k), ids in meshes.items() if m == 0)

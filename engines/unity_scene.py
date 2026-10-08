@@ -166,12 +166,18 @@ def crossed_quads(centres, size, uv_rect=(0.0, 0.0, 1.0, 1.0)):
             np.array(tris, np.int64).reshape(-1, 3))
 
 
-def ribbon(positions, width, loop=False):
-    """(points, uvs, triangles) of a line as two crossed double-sided strips, or None under 2 points."""
+def ribbon(positions, width, loop=False, widths=None):
+    """(points, uvs, triangles) of a line as two crossed double-sided strips, or None under 2 points.
+    widths: one per point (a tapering trail) - the texture is then stretched once over the whole line."""
     line = np.asarray(positions, np.float64).reshape(-1, 3)
     if loop and len(line) > 2:
         line = np.vstack([line, line[:1]])
-    h = max(width, 1e-4) / 2
+    half = np.full(len(line), max(width, 1e-4) / 2)
+    along = None
+    if widths is not None:
+        half = np.maximum(np.asarray(widths, float).reshape(-1)[:len(line)], 1e-4) / 2
+        seg = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(line, axis=0), axis=1))])
+        along = seg / seg[-1] if seg[-1] > 0 else seg
     pts, uvs, tris = [], [], []
     for i in range(len(line) - 1):
         a, b = line[i], line[i + 1]
@@ -184,15 +190,46 @@ def ribbon(positions, width, loop=False):
         n1 = np.cross(d, up)
         n1 /= np.linalg.norm(n1)
         n2 = np.cross(d, n1)
+        ha, hb = half[i], half[i + 1]
+        u0, u1 = (0.0, 1.0) if along is None else (along[i], along[i + 1])
         for n in (n1, n2):
             base = len(pts)
-            pts += [a - n * h, b - n * h, b + n * h, a + n * h]
-            uvs += [(0, 0), (1, 0), (1, 1), (0, 1)]
+            pts += [a - n * ha, b - n * hb, b + n * hb, a + n * ha]
+            uvs += [(u0, 0), (u1, 0), (u1, 1), (u0, 1)]
             tris += [[base, base + 1, base + 2], [base, base + 2, base + 3],
                      [base, base + 2, base + 1], [base, base + 3, base + 2]]
     if not pts:
         return None
     return np.array(pts, np.float32), np.array(uvs, np.float32), np.array(tris, np.int64)
+
+
+TRAIL_SPEED = 10.0    # units/s a TrailRenderer's object is shown moving at (the preview strip's length / its time)
+TRAIL_POINTS = 8
+
+
+def trail_preview(trail, matrix):
+    """A TrailRenderer (type tree) drawn as if its object had been moving forward: (Unity world points, widths,
+    head colour rgba), the trail streaming back along the object's -z for its time x TRAIL_SPEED (0.25 to 8
+    units), tapered by its width curve. None when it's switched off or has no time."""
+    if not trail.get("m_Enabled", 1):
+        return None
+    time = float(trail.get("m_Time", 5.0) or 0.0)
+    if time <= 0:
+        return None
+    from .unity_particles import eval_curve
+    m = np.asarray(matrix, float)
+    back = -m[:3, 2]
+    norm = np.linalg.norm(back)
+    back = back / norm if norm > 1e-9 else np.array([0.0, 0.0, -1.0])
+    length = min(max(time * TRAIL_SPEED, 0.25), 8.0)
+    along = np.linspace(0.0, 1.0, TRAIL_POINTS)
+    points = m[:3, 3] + back * (along * length)[:, None]
+    params = trail.get("m_Parameters") or {}
+    mult = float(params.get("widthMultiplier", 1.0) if params.get("widthMultiplier") is not None else 1.0)
+    widths = np.abs(eval_curve(params.get("widthCurve"), along)) * mult
+    grad = params.get("colorGradient") or {}
+    color = tuple(float((grad.get("key0") or {}).get(k, 1.0)) for k in "rgba")
+    return points, widths, color
 
 
 class _Deref:
@@ -341,11 +378,26 @@ def component_gizmo(name, tree):
         return ("camera",) + frustum_lines(float(tree.get("field of view", 60.0)), 16 / 9, near, far, ortho)
     if name == "AudioSource":
         return ("audio",) + marker_lines()
+    if name == "ReflectionProbe":
+        return ("probe",) + join(box_lines(_v3(tree.get("m_BoxOffset")), _v3(tree.get("m_BoxSize"), 1.0)),
+                                 sphere_lines((0, 0, 0), 0.5))
+    if name in ("OcclusionArea", "OcclusionPortal"):
+        return ("occlusion",) + box_lines(_v3(tree.get("m_Center")), _v3(tree.get("m_Size"), 1.0))
+    if name == "LightProbeGroup":
+        positions = tree.get("m_SourcePositions") or []
+        if not positions:
+            return None
+        parts = []
+        for p in positions[:4096]:
+            pts, segs = marker_lines(0.15)
+            parts.append((np.asarray(pts, float) + _v3(p), segs))
+        return ("probe",) + join(*parts)
     return None
 
 
 GIZMO_COMPONENTS = {"BoxCollider", "SphereCollider", "CapsuleCollider", "CharacterController", "BoxCollider2D",
-                    "CircleCollider2D", "MeshCollider", "Light", "Camera", "AudioSource"}
+                    "CircleCollider2D", "MeshCollider", "Light", "Camera", "AudioSource", "ReflectionProbe",
+                    "OcclusionArea", "OcclusionPortal", "LightProbeGroup"}
 JOINT_COMPONENTS = {"CharacterJoint", "ConfigurableJoint", "HingeJoint", "FixedJoint", "SpringJoint"}
 
 
@@ -395,14 +447,18 @@ class SceneBuilder:
         self.sprite_count = 0
         self.effects = 0      # particle systems and lines drawn
         self.emitters = []    # unity_particles.Emitter per particle system, for playback
+        self.sub_links = []   # (parent Emitter, child key, type, probability) of Sub Emitters modules
         self.effect_ranges = []  # (first, end) vertices of the still particle puffs (hidden during playback)
         self.lm_uvs = []      # per placed piece: lightmap UVs (or None)
         self.lightmapped = 0  # renderers drawn with their baked lightmap
         self.render_settings = None  # RenderSettings of the first scene file visited (sky, ambient, fog)
         self.joints = []      # (anchor (3,) UniView space, connected transform key or None, axis (3,) or None)
         self.cloths = 0
+        self.suns = []        # (strength, direction (UniView), colour, intensity) of enabled directional lights
+        self.vfx = []         # names of the VFX Graph effects (VisualEffect) placed - drawn as markers only
         self.node_pos = {}    # transform key -> (position in UniView space, parent transform key, name)
-        self.skin_bones = []  # bone transform keys of each skinned mesh renderer drawn
+        self.skin_bones = []  # (bone transform keys (None for missing), bind poses or None, matrix) per skinned renderer
+        self.binds = {}       # mesh key -> (B, 4, 4) bind poses
         self.gizmos = {}      # kind -> [(points in UniView space, segments)]
         self.gizmo_segments = 0
         self.show_effects = view_option("show_effects")
@@ -413,9 +469,13 @@ class SceneBuilder:
 
     def _mesh(self, key, reader):
         if key not in self.meshes:
-            from .unity import mesh_to_meshdata
+            from .unity import bind_matrices, mesh_to_meshdata
             try:
-                self.meshes[key] = mesh_to_meshdata(reader.read())
+                mesh = reader.read()
+                self.meshes[key] = mesh_to_meshdata(mesh)
+                bind = getattr(mesh, "m_BindPose", None)
+                if bind:
+                    self.binds[key] = bind_matrices(bind)
             except Exception as e:
                 log.debug("Scene mesh %s: %s", reader.peek_name(), e)
                 self.meshes[key] = None
@@ -654,7 +714,7 @@ class SceneBuilder:
             if int(renderer.get("m_RenderMode", 0) or 0) == 4 and mesh is not None:
                 md = self._mesh((id(mesh.assets_file), mesh.path_id), mesh)
             self._renderer_reader = renderer_reader
-            self._emitter(ps, renderer, matrix, ps_reader.path_id, mat_reader, md)
+            self._emitter(ps, renderer, matrix, ps_reader, mat_reader, md)
             first = self.count
             if md is not None:
                 for c in centres:
@@ -679,9 +739,9 @@ class SceneBuilder:
             self.effect_ranges.append((first, self.count))
             self.effects += 1
 
-    def _emitter(self, ps, renderer, matrix, seed, mat_reader, md):
+    def _emitter(self, ps, renderer, matrix, ps_reader, mat_reader, md):
         """Keep what playback needs to move this particle system's particles (see unity_particles)."""
-        from .unity_particles import Emitter
+        from .unity_particles import Emitter, sub_emitter_refs
         try:
             index = self._material(_Deref(mat_reader)) if mat_reader is not None else None
             mesh = None
@@ -693,8 +753,14 @@ class SceneBuilder:
                                      (mats[1] if len(mats) > 1 else None))
             if trail_reader is not None:
                 trail = self._material(_Deref(trail_reader))
-            self.emitters.append(Emitter(ps, renderer, matrix, seed,
-                                         index if index is not None else self._default_material(), mesh, trail))
+            emitter = Emitter(ps, renderer, matrix, ps_reader.path_id,
+                              index if index is not None else self._default_material(), mesh, trail)
+            emitter.key = (id(ps_reader.assets_file), ps_reader.path_id)
+            for ptr, kind, chance in sub_emitter_refs(ps):
+                child = self._ref(ps_reader, ptr)
+                if child is not None:
+                    self.sub_links.append((emitter, (id(child.assets_file), child.path_id), kind, chance))
+            self.emitters.append(emitter)
         except Exception as e:
             log.debug("Scene particle playback: %s", e)
 
@@ -720,6 +786,27 @@ class SceneBuilder:
             return
         place = np.eye(4) if line.get("m_UseWorldSpace", 1) else matrix
         if self._add_local(*built, place, material):
+            self.effects += 1
+
+    def _trail(self, reader, matrix):
+        """A TrailRenderer as a short tapering strip behind its object (trails only exist while things move)."""
+        try:
+            trail = reader.read_typetree()
+            if not trail.get("m_Enabled", 1) and not self.hide_inactive:
+                trail = dict(trail, m_Enabled=1)
+            preview = trail_preview(trail, matrix)
+            if preview is None:
+                return
+            points, widths, color = preview
+            built = ribbon(points, 0.0, widths=widths)
+            if built is None:
+                return
+            mats = trail.get("m_Materials") or []
+            material = self._tinted(self._ref(reader, mats[0]) if mats else None, color)
+        except Exception as e:
+            log.debug("Scene trail: %s", e)
+            return
+        if self._add_local(*built, np.eye(4), material):
             self.effects += 1
 
     def _gizmo(self, name, reader, matrix):
@@ -775,6 +862,42 @@ class SceneBuilder:
             self.joints.append((anchor, connected, axis))
         except Exception as e:
             log.debug("Scene joint: %s", e)
+
+    def _sun(self, reader, matrix):
+        """Remember an enabled directional light (the scene's sun) for the Lighting button."""
+        try:
+            tree = reader.read_typetree()
+            if int(tree.get("m_Type", 2)) != 1 or not tree.get("m_Enabled", 1):
+                return
+            c = tree.get("m_Color") or {}
+            color = tuple(float(c.get(k, 1.0)) for k in "rgb")
+            intensity = float(tree.get("m_Intensity", 1.0) or 0.0)
+            direction = matrix[:3, :3] @ np.array([0.0, 0.0, 1.0])  # lights shine along their +z
+            direction[0] *= -1
+            norm = np.linalg.norm(direction)
+            if norm < 1e-9 or intensity <= 0:
+                return
+            # HDRP stores physical units (lux, often 10^4+): only the relative order matters there.
+            shown = intensity if intensity <= 8 else 1.2
+            self.suns.append((intensity * max(color), direction / norm, color, min(shown, 2.0)))
+        except Exception as e:
+            log.debug("Scene light: %s", e)
+
+    def _vfx(self, reader, matrix):
+        """A VFX Graph effect: can't be simulated from the files, so a marker where it sits (and its name)."""
+        try:
+            tree = reader.read_typetree()
+            if not tree.get("m_Enabled", 1):
+                return
+            asset = self._ref(reader, tree.get("m_Asset"))
+            self.vfx.append((asset.peek_name() if asset is not None else "") or "VFX")
+        except Exception as e:
+            log.debug("Scene VFX: %s", e)
+            return
+        pts, segs = join(marker_lines(0.5), sphere_lines((0, 0, 0), 0.35))
+        world = np.asarray(pts, float) @ matrix[:3, :3].T + matrix[:3, 3]
+        world[:, 0] *= -1
+        self.gizmos.setdefault("vfx", []).append((world.astype(np.float32), np.asarray(segs, np.int64)))
 
     def _joint_gizmos(self):
         """Joint lines: anchor -> connected body (a ragdoll's bone chain), a small cross at each anchor, and the
@@ -847,6 +970,11 @@ class SceneBuilder:
                 if name == "Cloth":
                     self.cloths += 1
                     continue
+                if name == "VisualEffect":
+                    self._vfx(reader, matrix)
+                    continue
+                if name == "Light":
+                    self._sun(reader, matrix)
                 if name in GIZMO_COMPONENTS:
                     self._gizmo(name, reader, matrix)
                     if name != "Light":
@@ -862,6 +990,9 @@ class SceneBuilder:
                     continue
                 if name == "LineRenderer" and self.show_effects:
                     self._line(reader, matrix)
+                    continue
+                if name == "TrailRenderer" and self.show_effects:
+                    self._trail(reader, matrix)
                     continue
                 if name not in ("MeshRenderer", "SkinnedMeshRenderer"):
                     continue
@@ -903,7 +1034,8 @@ class SceneBuilder:
                     self._add(md, matrix, materials, lightmap_uv=lightmap_uv)
                 self.renderers += 1
                 if name == "SkinnedMeshRenderer":
-                    self.skin_bones.append([f[0] for f in map(_ptr_key, renderer.m_Bones or []) if f])
+                    self.skin_bones.append(([f[0] if f else None for f in map(_ptr_key, renderer.m_Bones or [])],
+                                            self.binds.get(found[0]), matrix.copy()))
         for child in t.m_Children or []:
             try:
                 self.visit(child.deref(), matrix, active, depth + 1, key)
@@ -924,8 +1056,13 @@ class SceneBuilder:
             ground = rgb(render.get("m_AmbientGroundColor"), ambient)
             horizon = rgb(render.get("m_AmbientEquatorColor"), ambient)
             sky = (ambient, horizon, ground) if int(render.get("m_AmbientMode", 0) or 0) == 1 else None
-        fog = None
+        fog = fog_params = None
         if render.get("m_Fog"):
+            fog_params = {"mode": int(render.get("m_FogMode", 3) or 3),
+                          "color": rgb(render.get("m_FogColor"), (0.5, 0.5, 0.5)),
+                          "density": float(render.get("m_FogDensity", 0.01) or 0.0),
+                          "start": float(render.get("m_LinearFogStart", 0.0) or 0.0),
+                          "end": float(render.get("m_LinearFogEnd", 300.0) or 0.0)}
             mode = {1: "linear", 2: "exponential", 3: "exponential squared"}.get(int(render.get("m_FogMode", 3)), "")
             c = rgb(render.get("m_FogColor"), (0.5, 0.5, 0.5))
             fog = (f"{mode}, color #{''.join(f'{int(max(0, min(1, v)) * 255):02x}' for v in c)}" +
@@ -938,15 +1075,26 @@ class SceneBuilder:
                 name = ptr.deref().peek_name() or ""
         except Exception:
             pass
-        return {"sky": sky, "ambient": ambient, "fog": fog, "sky_name": name,
+        sun = max(self.suns, key=lambda s: s[0]) if self.suns else None
+        return {"sky": sky, "ambient": ambient, "fog": fog, "fog_params": fog_params, "sky_name": name,
+                "sun": {"direction": tuple(sun[1]), "color": sun[2], "intensity": sun[3]} if sun else None,
                 "sky_texture": sky_texture(self.session, render)}
 
     def _bones(self):
-        """Bones of the skinned meshes drawn, where the scene/prefab puts their transforms (or None)."""
+        """Bones of the skinned meshes drawn (or None): where the mesh's bind pose puts them - the mesh is drawn in
+        that pose at its renderer - else where the scene/prefab puts their transforms."""
         from .sdk import Bones
-        keys = list(dict.fromkeys(k for bones in self.skin_bones for k in bones if k in self.node_pos))
+        keys = list(dict.fromkeys(k for bones, _b, _m in self.skin_bones for k in bones if k in self.node_pos))
         if not keys:
             return None
+        at = {}
+        for bones, bind, matrix in self.skin_bones:
+            if bind is None or len(bind) < len(bones):
+                continue
+            for k, b in zip(bones, bind):
+                if k is not None and k not in at and abs(np.linalg.det(b)) > 1e-12:
+                    p = (matrix @ np.linalg.inv(b))[:3, 3]
+                    at[k] = (-p[0], p[1], p[2])
         index = {k: i for i, k in enumerate(keys)}
         parents = []
         for k in keys:
@@ -954,7 +1102,7 @@ class SceneBuilder:
             while p is not None and p not in index and p in self.node_pos and hops < 64:
                 p, hops = self.node_pos[p][1], hops + 1
             parents.append(index.get(p, -1))
-        return Bones([self.node_pos[k][0] for k in keys], parents, [self.node_pos[k][2] for k in keys])
+        return Bones([at.get(k, self.node_pos[k][0]) for k in keys], parents, [self.node_pos[k][2] for k in keys])
 
     def result(self, name):
         self._joint_gizmos()
@@ -982,6 +1130,9 @@ class SceneBuilder:
         md.gizmos = gizmos
         md.owners = (np.array(self.owner_starts, np.int64), self.owner_uids)
         md.gizmos_only = self.renderers == 0 and self.effects == 0 and bool(gizmos)
+        if self.sub_links:
+            from .unity_particles import link_sub_emitters
+            link_sub_emitters(self.emitters, self.sub_links)
         md.emitters = self.emitters
         md.environment = self._environment()
         md.lod_count = self.lod_count
@@ -994,9 +1145,35 @@ class SceneBuilder:
         return md, self.material_list
 
 
-SKY_TOP = ("_skytint", "_skycolor", "_topcolor", "_skytopcolor", "_zenithcolor", "_upcolor", "_color1", "_tint")
-SKY_HORIZON = ("_horizoncolor", "_skymiddlecolor", "_middlecolor", "_equatorcolor", "_color2")
-SKY_GROUND = ("_groundcolor", "_bottomcolor", "_skybottomcolor", "_downcolor", "_color3")
+# Three-colour gradient skies (Funly Sky Studio, Schedule I's Shader Graph): upper at the zenith, middle part-way
+# up, lower at the horizon and below (not a ground colour).
+SKY_THREE = (("_gradientskyuppercolor", "_gradientskymiddlecolor", "_gradientskylowercolor"),
+             ("_skyuppercolor", "_skymiddlecolor", "_skylowercolor"))
+SKY_MIDDLE_AT = 0.35     # height (0 horizon .. 1 zenith) of the middle colour when the material doesn't say
+
+
+def sky_stops(colors, floats):
+    """[(height -1..1, rgb)] of a three-colour gradient sky (lowercase property name dicts), or None."""
+    for upper, middle, lower in SKY_THREE:
+        if upper in colors and middle in colors and lower in colors:
+            # Funly: lower up to _GradientFadeBegin, upper from _GradientFadeEnd, middle at _GradientFadeMiddlePosition
+            # of the way between them
+            begin = min(max(float(floats.get("_gradientfadebegin", 0.0)), -0.99), 0.98)
+            end = min(max(float(floats.get("_gradientfadeend", 1.0)), begin + 0.01), 1.0)
+            frac = float(floats.get("_gradientfademiddleposition", SKY_MIDDLE_AT))
+            mid = begin + (end - begin) * min(max(frac, 0.0), 1.0)
+            stops = [(-1.0, colors[lower]), (begin, colors[lower]), (mid, colors[middle]), (end, colors[upper])]
+            return stops + ([(1.0, colors[upper])] if end < 1.0 else [])
+    return None
+
+
+SKY_TOP = ("_skytint", "_skycolor", "_topcolor", "_skytopcolor", "_zenithcolor", "_upcolor", "_gradientskyuppercolor",
+           "_skyuppercolor", "_color1", "_tint")
+SKY_HORIZON = ("_horizoncolor", "_skymiddlecolor", "_middlecolor", "_equatorcolor", "_gradientskymiddlecolor", "_color2")
+SKY_GROUND = ("_groundcolor", "_bottomcolor", "_skybottomcolor", "_downcolor", "_gradientskylowercolor", "_skylowercolor",
+              "_color3")
+SKY_CUBE_SLOTS = ("_Tex", "_MainTex", "_Cubemap", "_CubeMap", "_SkyCubemap", "_SkyboxCubemap", "_Skybox")
+CLOUD_CUBE_SLOTS = ("_CloudCubemapTexture", "_CloudCubemap", "_CloudsCubemap")
 
 
 def sky_colors(session, render):
@@ -1022,6 +1199,9 @@ def sky_colors(session, render):
     def pick(names):
         return next((colors[n] for n in names if n in colors), None)
     top, horizon, bottom = pick(SKY_TOP), pick(SKY_HORIZON), pick(SKY_GROUND)
+    stops = sky_stops(colors, floats)
+    if stops is not None:  # the horizon is the lower colour; the middle one only shows in the skybox
+        top, horizon, bottom = stops[-1][1], stops[0][1], stops[0][1]
     if "_skytint" in colors and "_atmospherethickness" in floats:
         # Unity's procedural sky: the tint (0.5 gray = default) scales a blue scattering color
         top = tuple(2.0 * t * b for t, b in zip(colors["_skytint"], (0.36, 0.56, 0.92)))
@@ -1056,6 +1236,8 @@ def sky_texture(session, render):
                 texs[prop] = reader
         colors = {(p if isinstance(p, str) else getattr(p, "name", str(p))): c for p, c in saved.m_Colors or []}
         floats = {(p if isinstance(p, str) else getattr(p, "name", str(p))): float(v) for p, v in saved.m_Floats or []}
+        stops = sky_stops({k.lower(): (float(c.r), float(c.g), float(c.b)) for k, c in colors.items()},
+                          {k.lower(): v for k, v in floats.items()})
     except Exception as e:
         log.debug("Sky texture: %s", e)
         return None
@@ -1064,13 +1246,23 @@ def sky_texture(session, render):
     scale = (tuple(min(2.0, 2.0 * float(getattr(tint, k)) * exposure) for k in "rgb") if tint is not None
              else (exposure,) * 3)
     out = {"tint": scale, "rotation": floats.get("_Rotation", 0.0)}
-    cube = next((r for r in texs.values() if r.type.name == "Cubemap"), None)
+    # The sky's own cubemap - not a star field or cloud layer some sky shaders also have (Valheim's _StarFieldTex
+    # is the night sky).
+    cube = next((texs[k] for k in SKY_CUBE_SLOTS if k in texs and texs[k].type.name == "Cubemap"), None)
+    if cube is None and "cubemap" in shader:
+        cube = next((r for r in texs.values() if r.type.name == "Cubemap"), None)
     if cube is not None:
         return {**out, "kind": "cube", "assets": [session._asset_for(cube, "Cubemap")]}
+    clouds = next((texs[k] for k in CLOUD_CUBE_SLOTS if k in texs and texs[k].type.name == "Cubemap"), None)
+    if clouds is not None:  # gradient sky shaders (Funly Sky Studio): clouds over the sky colours
+        return {**out, "tint": (1.0, 1.0, 1.0), "kind": "clouds", "assets": [session._asset_for(clouds, "Cubemap")],
+                "cloud_alpha": min(max(floats.get("_CloudAlpha", 1.0), 0.0), 1.0), "stops": stops}
     if all(k in texs for k in SIX_SIDED):
         return {**out, "kind": "six", "assets": [session._asset_for(texs[k]) for k in SIX_SIDED]}
     if "panoram" in shader and texs.get("_MainTex") is not None and texs["_MainTex"].type.name == "Texture2D":
         return {**out, "kind": "pano", "assets": [session._asset_for(texs["_MainTex"])]}
+    if stops is not None:  # a three-colour gradient: drawn as a skybox so the middle colour shows
+        return {**out, "tint": (1.0, 1.0, 1.0), "kind": "gradient", "assets": [], "stops": stops}
     return None
 
 
@@ -1103,6 +1295,10 @@ def build(session, roots, name):
         info.append(("Effects", f"{builder.effects:,} particle systems / lines (still, approximate)"))
     if builder.joints:
         info.append(("Joints", f"{len(builder.joints):,} (pink gizmo lines: anchor to the connected body)"))
+    if builder.vfx:
+        names = sorted(set(builder.vfx))
+        info.append(("VFX Graph", f"{len(builder.vfx):,} effects shown as violet markers (not simulated): "
+                     + ", ".join(names[:6]) + (" ..." if len(names) > 6 else "")))
     if builder.cloths:
         info.append(("Cloth", f"{builder.cloths:,} (simulated while the game runs; drawn at rest)"))
     if builder.lightmapped:
@@ -1111,7 +1307,7 @@ def build(session, roots, name):
     if env and env.get("sky_name"):
         info.append(("Skybox", env["sky_name"]))
     if env and env.get("fog"):
-        info.append(("Fog", env["fog"] + " (not drawn)"))
+        info.append(("Fog", env["fog"]))
     if builder.skipped:
         info.append(("Skipped", f"{builder.skipped:,} renderers of other LOD levels (showing LOD{builder.lod_level})"
                      if builder.lod_level else f"{builder.skipped:,} lower-detail LOD renderers"))

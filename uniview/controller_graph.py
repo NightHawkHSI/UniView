@@ -24,6 +24,13 @@ def transition_text(t, states):
     return f"{dest}  ({', '.join(parts)})" if parts else dest
 
 
+def sub_machine(state):
+    """The sub-state machine a state was in ('Emotes', 'Locomotion.Ground'), '' for the layer itself. Builds
+    flatten them, but each state keeps its full path ('Base Layer.Emotes.Wave')."""
+    parts = (state.get("path") or "").split(".")
+    return ".".join(parts[1:-1]) if len(parts) > 2 else ""
+
+
 def motion_clips(motion):
     """Clip Assets a state plays (its clip, or every clip of its blend tree)."""
     if not motion:
@@ -60,7 +67,8 @@ def layout(layer, max_rows=10):
         depth.setdefault(i, last)
     out, col = {}, -1
     for d in sorted(set(depth.values())):
-        group = sorted(i for i in range(n) if depth[i] == d)
+        # a sub-state machine's states stay together (they get a box around them)
+        group = sorted((i for i in range(n) if depth[i] == d), key=lambda i: (sub_machine(states[i]), i))
         for k, i in enumerate(group):  # a long step (e.g. 100 states behind Any State) wraps into more columns
             if k % max_rows == 0:
                 col += 1

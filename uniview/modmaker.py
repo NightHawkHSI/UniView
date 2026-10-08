@@ -339,11 +339,13 @@ def _find_object(env, inner, path_id):
 
 def _texture_image(edit, files_dir, tex):
     from PIL import Image
+
+    from uniview.imaging import resize
     img = Image.open(os.path.join(files_dir, edit["file"])).convert("RGBA")
     if edit["options"].get("keep_size"):
         return img
     if (img.width, img.height) != (tex.m_Width, tex.m_Height):
-        img = img.resize((tex.m_Width, tex.m_Height), Image.Resampling.LANCZOS)
+        img = resize(img, (tex.m_Width, tex.m_Height))  # keeps the colour under transparent pixels
     return img
 
 
@@ -352,6 +354,7 @@ def _apply_texture(obj, edits, files_dir):
     from PIL import Image
 
     from engines.unity import asset_image
+    from uniview.imaging import resize
     tex = obj.parse_as_object()
     whole = next((e for e in edits if e["kind"] == "texture"), None)
     if whole is not None:
@@ -366,7 +369,7 @@ def _apply_texture(obj, edits, files_dir):
         sx, sy = img.width / sw, img.height / sh  # the sheet was replaced with a bigger/smaller one
         box_w, box_h = max(1, round(w * sx)), max(1, round(h * sy))
         piece = Image.open(os.path.join(files_dir, edit["file"])).convert("RGBA")
-        piece = piece.resize((box_w, box_h), Image.Resampling.LANCZOS)
+        piece = resize(piece, (box_w, box_h))
         left, top = round(x * sx), img.height - round(y * sy) - box_h
         img.paste(piece, (left, top))
     mips = int(getattr(tex, "m_MipCount", 1) or 1)

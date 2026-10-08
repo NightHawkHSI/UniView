@@ -68,15 +68,35 @@ def metal_rough_sources(maps):
     return first[0], first[1], rough if metal and rough else None
 
 
+def uv_transform(mat, maps):
+    """(scale, offset) tiling of a material's textures, or None: its base texture's, which Unity's Standard
+    shaders use for every map (else the first tiled texture's)."""
+    base = base_texture(mat, maps)
+    tiled = base if base is not None and getattr(base, "tiled", False) else next(
+        (t for t in mat.textures if getattr(t, "tiled", False)), None)
+    return (tiled.uv_scale, tiled.uv_offset) if tiled is not None else None
+
+
+def gltf_texture_info(index, transform):
+    """A glTF textureInfo, with KHR_texture_transform for the material's tiling. glTF's V runs top-down, so the
+    Unity offset (bottom-up) becomes 1 - scale - offset."""
+    info = {"index": index}
+    if transform is not None:
+        (sx, sy), (ox, oy) = transform
+        info["extensions"] = {"KHR_texture_transform": {"offset": [ox, 1.0 - sy - oy], "scale": [sx, sy]}}
+    return info
+
+
 def _gltf_maps(mat, maps, texture):
     """glTF material fields (base color / normal / metallicRoughness / occlusion / emissive textures and factors)
     for a Material whose textures pbr.assign() sorted into `maps`. texture(TextureRef, convert=None) -> index."""
     out = {}
+    st = uv_transform(mat, maps)
     base = base_texture(mat, maps)
     if base is not None and (i := texture(base)) is not None:
-        out["baseColorTexture"] = {"index": i}
+        out["baseColorTexture"] = gltf_texture_info(i, st)
     if pbr.NORMAL in maps and (i := texture(maps[pbr.NORMAL], ("normal", _normal_image))) is not None:
-        out["normalTexture"] = {"index": i}
+        out["normalTexture"] = gltf_texture_info(i, st)
         scale = pbr.property_float(mat, ("_BumpScale", "_NormalScale"))
         if scale is not None and scale != 1:
             out["normalTexture"]["scale"] = scale
@@ -101,7 +121,7 @@ def _gltf_maps(mat, maps, texture):
             tag = f"mr:{ch}:{scale}" + (f":{second[0]}:{second[1].asset.key}" if second else "")
             i = texture(tex, (tag, repack))
         if i is not None:
-            out["metallicRoughnessTexture"] = {"index": i}
+            out["metallicRoughnessTexture"] = gltf_texture_info(i, st)
             channels = {ch} | ({second[0]} if second else set())
             if channels & {pbr.METAL_GLOSS, pbr.MASK, pbr.ORM, pbr.METALLIC}:
                 out["metallicFactor"] = 1.0
@@ -116,7 +136,7 @@ def _gltf_maps(mat, maps, texture):
     elif pbr.MASK in maps:
         occlusion = texture(maps[pbr.MASK], ("ao", lambda session, t: pbr.occlusion(pbr.MASK, session.image(t.asset))))
     if occlusion is not None:
-        out["occlusionTexture"] = {"index": occlusion}
+        out["occlusionTexture"] = gltf_texture_info(occlusion, st)
         strength = pbr.property_float(mat, ("_OcclusionStrength", "_AORemapMax"))
         if strength is not None and strength != 1:
             out["occlusionTexture"]["strength"] = min(1.0, max(0.0, strength))
@@ -124,7 +144,7 @@ def _gltf_maps(mat, maps, texture):
     color = pbr.property_color(mat, EMISSION_COLOR)
     if pbr.EMISSION in maps and (color is None or max(color) > 0.001):
         if (i := texture(maps[pbr.EMISSION])) is not None:
-            out["emissiveTexture"] = {"index": i}
+            out["emissiveTexture"] = gltf_texture_info(i, st)
             out["emissiveFactor"] = list(color or (1.0, 1.0, 1.0))
     elif color is not None and max(color) > 0.001:
         out["emissiveFactor"] = list(color)
@@ -274,6 +294,8 @@ def write_glb(session, md, materials, path, rig=None, animation=None, image_uri=
         _add_skeleton(gltf, rig, animation, add_accessor)
     if gl_materials:
         gltf["materials"] = gl_materials
+    if '"KHR_texture_transform"' in json.dumps(gl_materials):
+        gltf["extensionsUsed"] = ["KHR_texture_transform"]
     if images:
         gltf.update(images=images, textures=textures,
                     samplers=[{"magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497}])
@@ -362,12 +384,14 @@ def write_obj(session, md, materials, path):
         mtl += [f"newmtl {mat_name}", f"Kd {kd}"]
         maps = pbr.assign(mat.textures)
         used = set()
+        st = uv_transform(mat, maps)
+        opt = (f"-s {st[0][0]:g} {st[0][1]:g} 1 -o {st[1][0]:g} {st[1][1]:g} 0 " if st else "")  # MTL tiling
         base = base_texture(mat, maps)
         if base is not None and (png := save(base)):
-            mtl.append(f"map_Kd {png}")
+            mtl.append(f"map_Kd {opt}{png}")
             used.add(id(base))
         if pbr.NORMAL in maps and (png := save(maps[pbr.NORMAL], make=_normal_image)):
-            mtl.append(f"map_Bump {png}")
+            mtl.append(f"map_Bump {opt}{png}")
             used.add(id(maps[pbr.NORMAL]))
         metallic = pbr.property_float(mat, ("_Metallic",))
         smooth = pbr.property_float(mat, GLOSS)
@@ -386,7 +410,7 @@ def write_obj(session, md, materials, path):
                 png = save(tex, f"_{want}", lambda session, t, ch=ch, want=want:
                            pbr.single(ch, session.image(t.asset), want))
                 if png:
-                    mtl.append(f"map_{key} {png}")
+                    mtl.append(f"map_{key} {opt}{png}")
                     used.add(id(tex))
                     continue
             value = metallic if want == pbr.METALLIC else (1 - smooth if smooth is not None else None)
@@ -394,10 +418,10 @@ def write_obj(session, md, materials, path):
                 mtl.append(f"{key} {min(1.0, max(0.0, value)):.4f}")
         if pbr.EMISSION in maps and (png := save(maps[pbr.EMISSION])):
             color = pbr.property_color(mat, EMISSION_COLOR) or (1.0, 1.0, 1.0)
-            mtl += ["Ke " + " ".join(f"{c:.4f}" for c in color), f"map_Ke {png}"]
+            mtl += ["Ke " + " ".join(f"{c:.4f}" for c in color), f"map_Ke {opt}{png}"]
             used.add(id(maps[pbr.EMISSION]))
         if pbr.HEIGHT in maps and (png := save(maps[pbr.HEIGHT])):
-            mtl.append(f"disp {png}")
+            mtl.append(f"disp {opt}{png}")
             used.add(id(maps[pbr.HEIGHT]))
         for tex in mat.textures:  # occlusion, detail maps, masks...: saved next to it
             if id(tex) not in used:
