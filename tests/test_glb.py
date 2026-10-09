@@ -130,8 +130,9 @@ def test_normals_uvs_colors(tmp_path):
     n = accessor(gltf, buf, attrs["NORMAL"])
     np.testing.assert_allclose(n, [[0, 0, 1], [0, 1, 0], [0, 0, 1], [1, 0, 0]])
     t = accessor(gltf, buf, attrs["TEXCOORD_0"])
-    np.testing.assert_allclose(t, [[0, 1], [1, 1], [1, 0], [0.25, 0.25]])  # V flipped, first set only
-    assert "TEXCOORD_1" not in attrs
+    np.testing.assert_allclose(t, [[0, 1], [1, 1], [1, 0], [0.25, 0.25]])  # V flipped
+    np.testing.assert_allclose(accessor(gltf, buf, attrs["TEXCOORD_1"]), [[9, -8]] * 4)  # lightmap UVs, V flipped
+    np.testing.assert_allclose(md.uvs["UV1"][0], [9, 9])  # the source mesh isn't modified
     np.testing.assert_allclose(accessor(gltf, buf, attrs["COLOR_0"]), [[1, 0, 0.5, 1]] * 4)
     np.testing.assert_allclose(md.uvs["UV0"][3], [0.25, 0.75])  # the source mesh isn't modified
 

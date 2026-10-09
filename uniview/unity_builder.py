@@ -91,6 +91,7 @@ namespace UniView
         public Comp[] components;
         public int layer;
         public string tag;
+        public float[] lightmap;  // [scene lightmap index, tiling x, y, offset x, y]
     }
 
     [Serializable]
@@ -98,6 +99,7 @@ namespace UniView
     {
         public string model;
         public string[] materials;
+        public int lightmap = -1;  // the scene lightmap it's baked into (tiling/offset already in its UVs)
     }
 
     [Serializable]
@@ -209,6 +211,77 @@ namespace UniView
     public class CtrlInfo { public CtrlParam[] parameters; public CtrlLayer[] layers; }
 
     [Serializable]
+    public class TLayer
+    {
+        public string name;
+        public string target;   // the .terrainlayer asset (shared by terrains that use the same layer)
+        public string diffuse;
+        public string normal;
+        public string mask;
+        public float[] tileSize;
+        public float[] tileOffset;
+        public float[] specular;
+        public float metallic;
+        public float smoothness;
+        public float normalScale = 1f;
+        public float[] diffuseRemapMin;
+        public float[] diffuseRemapMax;
+        public float[] maskRemapMin;
+        public float[] maskRemapMax;
+    }
+
+    [Serializable]
+    public class TTree { public string prefab; public float bendFactor; public int navMeshLod; }
+
+    [Serializable]
+    public class TDetail
+    {
+        public string prefab;
+        public string texture;
+        public float minWidth;
+        public float maxWidth;
+        public float minHeight;
+        public float maxHeight;
+        public int noiseSeed;
+        public float noiseSpread;
+        public float holeEdgePadding;
+        public float density;
+        public float[] healthyColor;
+        public float[] dryColor;
+        public int renderMode;
+        public bool usePrototypeMesh;
+        public bool useInstancing;
+        public bool useDensityScaling;
+        public float alignToGround;
+        public float positionJitter;
+        public float targetCoverage;
+    }
+
+    [Serializable]
+    public class TerrainInfo
+    {
+        public string name;
+        public int resolution;
+        public float[] size;
+        public string heights;     // raw files (see uniview/unity_terrains.py), project-relative paths
+        public string holes;
+        public int alphamapResolution;
+        public string alphamaps;
+        public int baseMapResolution;
+        public TLayer[] layers;
+        public TTree[] trees;
+        public int treeCount;
+        public string treeInstances;
+        public TDetail[] details;
+        public int detailResolution;
+        public int detailPatch;
+        public bool coverage;
+        public string detailMap;
+        public float[] grassTint;
+        public float[] grass;
+    }
+
+    [Serializable]
     public class Manager
     {
         public string type;
@@ -224,15 +297,33 @@ namespace UniView
         public Node[] nodes;
         public PropList[] shared;  // prop lists components share (Comp.shared)
         public BatchRef[] batches;
-        public Manager[] managers;   // kind "settings" only
+        public Manager[] managers;   // kind "settings": project settings; kind "scene": its RenderSettings
         public string[] scenes;
         public string product;
         public string company;
+        public int colorSpace;  // the game's color space + 1 (0 unknown, 1 gamma, 2 linear)
         public Sheet[] sheets;  // kind "sprites"
         public ClipInfo clip;   // kind "clip"
         public CtrlInfo controller;  // kind "controller"
         public string script;  // kind "data": the ScriptableObject class
         public Prop[] props;   // kind "data": its values
+        public TerrainInfo terrain;  // kind "terrain"
+        public string[] lightmaps;   // kind "scene": its baked lightmaps (EXR, "" = missing)
+        public string pipeline;      // kind "pipeline": "urp" or "hdrp" (props: the pipeline asset's settings)
+        public MatSwap[] materials;  // kind "pipeline": materials to put back on the game's shaders
+        public string stamp;         // kind "pipeline": changes with the contents (applied again after a new export)
+    }
+
+    [Serializable]
+    public class MatSwap
+    {
+        public string path;
+        public string shader;  // the game's shader, when the project has it (URP's own shaders)
+        public string[] keywords;
+        public int queue = -1;
+        public bool lit;       // a Standard material: else the pipeline's Lit (Standard draws pink there)
+        public string[] litKeywords;
+        public int litQueue = -1;
     }
 
     [InitializeOnLoad]
@@ -248,6 +339,8 @@ namespace UniView
 
         const string SettingsMarker = "ProjectSettings/UniViewSettingsApplied.txt";
         const string SpritesMarker = "ProjectSettings/UniViewSpritesApplied.txt";
+        const string PipelineMarker = "ProjectSettings/UniViewPipelineApplied.txt";
+        const string AddressablesMarker = "ProjectSettings/UniViewAddressablesApplied.txt";
         const string ScriptsParked = "Assets/UniView/GameScripts~";   // ignored by Unity
         const string ScriptsActive = "Assets/GameScripts";
         const string RebuildMarker = "ProjectSettings/UniViewRebuildAfterScripts.txt";
@@ -268,7 +361,9 @@ namespace UniView
             foreach (string file in Descriptions())
             {
                 Description d = Load(file);
-                if (d != null && !File.Exists(d.target)) { BuildMissing(); return; }
+                if (d != null && (d.kind == "pipeline" ? !PipelineApplied(d)
+                                  : d.kind == "addressables" ? !Stamped(AddressablesMarker, d) : !File.Exists(d.target)))
+                { BuildMissing(); return; }
             }
         }
 
@@ -393,6 +488,8 @@ namespace UniView
             var data = new List<Description>();
             var clips = new List<Description>();
             var controllers = new List<Description>();
+            var terrains = new List<Description>();
+            string addressables = null;
             foreach (string file in Descriptions())
             {
                 Description d = Load(file);
@@ -412,6 +509,11 @@ namespace UniView
                     if (!onlyMissing || !File.Exists(d.target)) clips.Add(d);
                     continue;
                 }
+                if (d != null && d.kind == "terrain")
+                {
+                    if (!onlyMissing || !File.Exists(d.target)) terrains.Add(d);
+                    continue;
+                }
                 if (d != null && d.kind == "data")
                 {
                     if (!onlyMissing || !File.Exists(d.target)) data.Add(d);
@@ -423,6 +525,18 @@ namespace UniView
                     if (!onlyMissing || !File.Exists(SettingsMarker)) ApplySettings(d);
                     continue;
                 }
+                if (d != null && d.kind == "pipeline")
+                {
+                    // After the settings (their quality levels get the pipeline asset), before the scenes.
+                    if (!onlyMissing || !PipelineApplied(d)) ApplyPipeline(d);
+                    continue;
+                }
+                if (d != null && d.kind == "addressables")
+                {
+                    // Last: the groups point at the prefabs and scenes this build makes.
+                    if (!onlyMissing || !Stamped(AddressablesMarker, d)) addressables = file;
+                    continue;
+                }
                 if (d == null || d.nodes == null || d.nodes.Length == 0) continue;
                 if (onlyMissing && File.Exists(d.target)) continue;
                 todo.Add(d);
@@ -430,12 +544,17 @@ namespace UniView
             int clipsMade = BuildClips(clips);  // before prefabs: Animation components point at clips
             int controllersMade = BuildControllers(controllers);  // Animators point at controllers
             int dataMade = CreateDataAssets(data);
+            int terrainsMade = 0;
+            bool terrainsBuilt = false;
             if (todo.Count == 0)
             {
+                terrainsMade = BuildTerrains(terrains);
                 FillDataAssets(data);
                 AssetDatabase.SaveAssets();
-                if (data.Count > 0 || clips.Count > 0)
-                    Debug.Log("UniView: " + dataMade + " data asset(s), " + clipsMade + " animation clip(s) built");
+                if (data.Count > 0 || clips.Count > 0 || terrains.Count > 0)
+                    Debug.Log("UniView: " + dataMade + " data asset(s), " + clipsMade + " animation clip(s), "
+                              + terrainsMade + " terrain(s) built");
+                if (addressables != null) ApplyAddressables(addressables);
                 return;
             }
             // Prefabs first, then scenes (building a scene replaces the open one).
@@ -455,6 +574,12 @@ namespace UniView
                 {
                     Description d = todo[i];
                     if (EditorUtility.DisplayCancelableProgressBar("UniView", "Building " + d.target, (float)i / todo.Count)) break;
+                    if (d.kind == "scene" && !terrainsBuilt)
+                    {
+                        // After the prefabs (trees and grass are prefabs), before the scenes that use them.
+                        terrainsBuilt = true;
+                        terrainsMade = BuildTerrains(terrains);
+                    }
                     try
                     {
                         if (d.kind == "scene") { BuildScene(d, parts); scenes++; }
@@ -467,9 +592,11 @@ namespace UniView
             {
                 EditorUtility.ClearProgressBar();
             }
+            if (!terrainsBuilt) terrainsMade = BuildTerrains(terrains);
             FillDataAssets(data);  // after the prefabs exist, so data can point at them
             AssetDatabase.SaveAssets();
             AssetDatabase.Refresh();
+            if (addressables != null) ApplyAddressables(addressables);
             if (anyScene)
             {
                 if (!string.IsNullOrEmpty(openScene) && File.Exists(openScene)) EditorSceneManager.OpenScene(openScene);
@@ -482,6 +609,7 @@ namespace UniView
                       + "; data assets: " + dataMade + " of " + data.Count
                       + "; animation clips: " + clipsMade + " of " + clips.Count
                       + "; animator controllers: " + controllersMade + " of " + controllers.Count
+                      + "; terrains: " + terrainsMade + " of " + terrains.Count
                       + "; scripts: " + scriptsAdded + " attached"
                       + (scriptsMissing > 0 ? ", " + scriptsMissing + " script classes not in the project (UniView > Add the game's scripts)" : ""));
         }
@@ -542,6 +670,13 @@ namespace UniView
                 if (n.light != null && n.light.present) AddLight(objects[i], n.light);
             }
             AddComponents(d, objects, parts);
+            foreach (GameObject go in objects)
+            {
+                // A terrain material the export mapped to a non-terrain shader would hide the terrain layers.
+                var terrain = go.GetComponent<Terrain>();
+                if (terrain != null && terrain.materialTemplate != null && !terrain.materialTemplate.shader.name.Contains("Terrain"))
+                    terrain.materialTemplate = null;
+            }
             for (int i = 0; i < d.nodes.Length; i++)
                 if (!d.nodes[i].active && (rootsCanBeInactive || d.nodes[i].parent >= 0)) objects[i].SetActive(false);
             return objects;
@@ -568,7 +703,20 @@ namespace UniView
         static void BuildScene(Description d, Dictionary<string, Renderer> parts)
         {
             var scene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
-            BuildObjects(d, parts, true);
+            GameObject[] objects = BuildObjects(d, parts, true);
+            ApplySceneSettings(d, objects, parts);
+            var lit = new List<Renderer>();
+            var litIndex = new List<int>();
+            var litScaleOffset = new List<Vector4>();
+            for (int i = 0; i < d.nodes.Length; i++)
+            {
+                float[] lm = d.nodes[i].lightmap;
+                var r = lm != null && lm.Length >= 5 ? objects[i].GetComponent<MeshRenderer>() : null;
+                if (r == null) continue;
+                lit.Add(r);
+                litIndex.Add((int)lm[0]);
+                litScaleOffset.Add(new Vector4(lm[1], lm[2], lm[3], lm[4]));
+            }
             if (d.batches != null && d.batches.Length > 0)
             {
                 // Static batching: the game merged these objects' meshes, already in world space.
@@ -582,12 +730,290 @@ namespace UniView
                     Mesh mesh = src.GetComponent<MeshFilter>() != null ? src.GetComponent<MeshFilter>().sharedMesh : null;
                     if (mesh == null) continue;
                     go.AddComponent<MeshFilter>().sharedMesh = mesh;
-                    go.AddComponent<MeshRenderer>().sharedMaterials = Materials(src, mesh, b.materials);
+                    var mr = go.AddComponent<MeshRenderer>();
+                    mr.sharedMaterials = Materials(src, mesh, b.materials);
                     go.isStatic = true;
+                    if (b.lightmap >= 0)
+                    {
+                        lit.Add(mr);
+                        litIndex.Add(b.lightmap);
+                        litScaleOffset.Add(new Vector4(1f, 1f, 0f, 0f));  // already in the batch's UVs
+                    }
                 }
             }
+            AddLightmaps(d, lit, litIndex, litScaleOffset);
             Directory.CreateDirectory(Path.GetDirectoryName(d.target));
             EditorSceneManager.SaveScene(scene, d.target);
+        }
+
+        static void AddLightmaps(Description d, List<Renderer> lit, List<int> index, List<Vector4> scaleOffset)
+        {
+            // The game's baked lightmaps, put back by a UniView.SceneLightmaps component (UniView/Runtime).
+            if (d.lightmaps == null || d.lightmaps.Length == 0 || lit.Count == 0) return;
+            Type type = ScriptType("UniView.SceneLightmaps");
+            if (type == null)
+            {
+                Debug.LogWarning("UniView: UniView.SceneLightmaps isn't compiled, so " + d.target + " has no lightmaps");
+                return;
+            }
+            var textures = new Texture2D[d.lightmaps.Length];
+            for (int i = 0; i < textures.Length; i++) textures[i] = Load<Texture2D>(d.lightmaps[i]);
+            var comp = new GameObject("Lightmaps (UniView)").AddComponent(type);
+            type.GetField("lightmaps").SetValue(comp, textures);
+            type.GetField("renderers").SetValue(comp, lit.ToArray());
+            type.GetField("indices").SetValue(comp, index.ToArray());
+            type.GetField("scaleOffsets").SetValue(comp, scaleOffset.ToArray());
+            type.GetMethod("Apply").Invoke(comp, null);
+        }
+
+        static void ApplySceneSettings(Description d, GameObject[] objects, Dictionary<string, Renderer> parts)
+        {
+            // The scene's RenderSettings (skybox, ambient light, fog, reflections, sun), field by field.
+            if (d.managers == null) return;
+            foreach (Manager m in d.managers)
+            {
+                if (m.type != "RenderSettings" || m.props == null) continue;
+                var get = typeof(RenderSettings).GetMethod("GetRenderSettings",
+                    System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public);
+                var target = get != null ? get.Invoke(null, null) as UnityEngine.Object : null;
+                if (target == null) { Debug.LogWarning("UniView: can't reach the RenderSettings of " + d.target); continue; }
+                var so = new SerializedObject(target);
+                foreach (Prop pr in m.props) SetProp(so, pr, objects, null, parts);
+                so.ApplyModifiedPropertiesWithoutUndo();
+                DynamicGI.UpdateEnvironment();  // ambient light from the new skybox
+            }
+        }
+
+        // ---- terrains
+        static int BuildTerrains(List<Description> list)
+        {
+            int made = 0;
+            var layers = new Dictionary<string, UnityEngine.Object>();
+            foreach (Description d in list)
+            {
+                try { BuildTerrain(d, layers); made++; }
+                catch (Exception e) { Debug.LogWarning("UniView: couldn't build terrain " + d.target + ": " + e.Message); }
+            }
+            if (made > 0) AssetDatabase.SaveAssets();
+            return made;
+        }
+
+        static Color C(float[] a, Color fallback)
+        {
+            return a != null && a.Length >= 4 ? new Color(a[0], a[1], a[2], a[3]) : fallback;
+        }
+
+        static Vector4 V4(float[] a, Vector4 fallback)
+        {
+            return a != null && a.Length >= 4 ? new Vector4(a[0], a[1], a[2], a[3]) : fallback;
+        }
+
+        static T Load<T>(string path) where T : UnityEngine.Object
+        {
+            return string.IsNullOrEmpty(path) ? null : AssetDatabase.LoadAssetAtPath<T>(path);
+        }
+
+        static void SetMember(object target, string name, object value)
+        {
+            // Values only some Unity versions have, set by name so this script compiles in all of them.
+            var prop = target.GetType().GetProperty(name);
+            try
+            {
+                if (prop != null && prop.CanWrite) prop.SetValue(target, Convert.ChangeType(value, prop.PropertyType), null);
+            }
+            catch (Exception) { }
+        }
+
+        static void BuildTerrain(Description d, Dictionary<string, UnityEngine.Object> layerAssets)
+        {
+            TerrainInfo t = d.terrain;
+            if (t == null || t.resolution < 2 || !File.Exists(t.heights)) throw new Exception("no heightmap");
+            Directory.CreateDirectory(Path.GetDirectoryName(d.target));
+            int res = t.resolution;
+            var td = new TerrainData();
+            td.heightmapResolution = res;
+            td.size = V(t.size, new Vector3(500f, 600f, 500f));  // after the resolution, which resets it
+            AssetDatabase.CreateAsset(td, d.target);
+
+            byte[] raw = File.ReadAllBytes(t.heights);
+            var heights = new float[res, res];
+            for (int z = 0, i = 0; z < res; z++)
+                for (int x = 0; x < res; x++, i += 2)
+                    heights[z, x] = Math.Min(1f, BitConverter.ToUInt16(raw, i) / 32766f);
+            td.SetHeights(0, 0, heights);
+#if UNITY_2019_3_OR_NEWER
+            if (!string.IsNullOrEmpty(t.holes) && File.Exists(t.holes))
+            {
+                raw = File.ReadAllBytes(t.holes);
+                var solid = new bool[res - 1, res - 1];
+                for (int z = 0, i = 0; z < res - 1; z++)
+                    for (int x = 0; x < res - 1; x++, i++)
+                        solid[z, x] = raw[i] != 0;
+                td.SetHoles(0, 0, solid);
+            }
+#endif
+            int count = t.layers != null ? t.layers.Length : 0;
+            if (count > 0)
+            {
+                if (t.alphamapResolution >= 16) td.alphamapResolution = t.alphamapResolution;
+                if (t.baseMapResolution >= 16) td.baseMapResolution = t.baseMapResolution;
+#if UNITY_2018_3_OR_NEWER
+                var terrainLayers = new TerrainLayer[count];
+                for (int l = 0; l < count; l++)
+                {
+                    TLayer src = t.layers[l];
+                    UnityEngine.Object made;
+                    if (!layerAssets.TryGetValue(src.target, out made))
+                    {
+                        var layer = new TerrainLayer();
+                        layer.name = src.name;
+                        layer.diffuseTexture = Load<Texture2D>(src.diffuse);
+                        layer.normalMapTexture = Load<Texture2D>(src.normal);
+                        layer.maskMapTexture = Load<Texture2D>(src.mask);
+                        layer.tileSize = V2(src.tileSize, new Vector2(15f, 15f));
+                        layer.tileOffset = V2(src.tileOffset, Vector2.zero);
+                        layer.specular = C(src.specular, Color.black);
+                        layer.metallic = src.metallic;
+                        layer.smoothness = src.smoothness;
+                        layer.normalScale = src.normalScale;
+                        layer.diffuseRemapMin = V4(src.diffuseRemapMin, Vector4.zero);
+                        layer.diffuseRemapMax = V4(src.diffuseRemapMax, Vector4.one);
+                        layer.maskMapRemapMin = V4(src.maskRemapMin, Vector4.zero);
+                        layer.maskMapRemapMax = V4(src.maskRemapMax, Vector4.one);
+                        Directory.CreateDirectory(Path.GetDirectoryName(src.target));
+                        AssetDatabase.CreateAsset(layer, src.target);
+                        made = layer;
+                        layerAssets[src.target] = made;
+                    }
+                    terrainLayers[l] = made as TerrainLayer;
+                }
+                td.terrainLayers = terrainLayers;
+#else
+                var splats = new SplatPrototype[count];
+                for (int l = 0; l < count; l++)
+                {
+                    TLayer src = t.layers[l];
+                    var sp = new SplatPrototype();
+                    sp.texture = Load<Texture2D>(src.diffuse);
+                    sp.normalMap = Load<Texture2D>(src.normal);
+                    sp.tileSize = V2(src.tileSize, new Vector2(15f, 15f));
+                    sp.tileOffset = V2(src.tileOffset, Vector2.zero);
+                    SetMember(sp, "specular", C(src.specular, Color.black));
+                    SetMember(sp, "metallic", src.metallic);
+                    SetMember(sp, "smoothness", src.smoothness);
+                    splats[l] = sp;
+                }
+                td.splatPrototypes = splats;
+#endif
+                if (!string.IsNullOrEmpty(t.alphamaps) && File.Exists(t.alphamaps))
+                {
+                    raw = File.ReadAllBytes(t.alphamaps);
+                    int ares = t.alphamapResolution;
+                    var maps = new float[ares, ares, count];
+                    for (int l = 0, i = 0; l < count; l++)
+                        for (int z = 0; z < ares; z++)
+                            for (int x = 0; x < ares; x++, i++)
+                                maps[z, x, l] = raw[i] / 255f;
+                    if (td.alphamapResolution != ares) Debug.LogWarning("UniView: " + d.target + ": Unity changed the splat map size");
+                    else td.SetAlphamaps(0, 0, maps);
+                }
+            }
+
+            // Trees: prototypes whose prefab is not in the project are left out.
+            var treeIndex = new List<int>();
+            var protos = new List<TreePrototype>();
+            foreach (TTree src in t.trees ?? new TTree[0])
+            {
+                var prefab = Load<GameObject>(src.prefab);
+                treeIndex.Add(prefab != null ? protos.Count : -1);
+                if (prefab == null) continue;
+                var p = new TreePrototype();
+                p.prefab = prefab;
+                p.bendFactor = src.bendFactor;
+                SetMember(p, "navMeshLod", src.navMeshLod);
+                protos.Add(p);
+            }
+            td.treePrototypes = protos.ToArray();
+            if (t.treeCount > 0 && File.Exists(t.treeInstances) && protos.Count > 0)
+            {
+                raw = File.ReadAllBytes(t.treeInstances);
+                var trees = new List<TreeInstance>();
+                for (int i = 0; i + 36 <= raw.Length; i += 36)
+                {
+                    int index = BitConverter.ToInt32(raw, i + 32);
+                    if (index < 0 || index >= treeIndex.Count || treeIndex[index] < 0) continue;
+                    var tree = new TreeInstance();
+                    tree.position = new Vector3(BitConverter.ToSingle(raw, i), BitConverter.ToSingle(raw, i + 4),
+                                                BitConverter.ToSingle(raw, i + 8));
+                    tree.widthScale = BitConverter.ToSingle(raw, i + 12);
+                    tree.heightScale = BitConverter.ToSingle(raw, i + 16);
+                    tree.rotation = BitConverter.ToSingle(raw, i + 20);
+                    tree.color = new Color32(raw[i + 24], raw[i + 25], raw[i + 26], raw[i + 27]);
+                    tree.lightmapColor = new Color32(raw[i + 28], raw[i + 29], raw[i + 30], raw[i + 31]);
+                    tree.prototypeIndex = treeIndex[index];
+                    trees.Add(tree);
+                }
+                td.treeInstances = trees.ToArray();
+            }
+
+            // Grass and detail meshes.
+            var detailIndex = new List<int>();
+            var details = new List<DetailPrototype>();
+            foreach (TDetail src in t.details ?? new TDetail[0])
+            {
+                var prefab = src.usePrototypeMesh ? Load<GameObject>(src.prefab) : null;
+                var texture = src.usePrototypeMesh ? null : Load<Texture2D>(src.texture);
+                detailIndex.Add(prefab != null || texture != null ? details.Count : -1);
+                if (prefab == null && texture == null) continue;
+                var p = new DetailPrototype();
+                p.usePrototypeMesh = prefab != null;
+                p.prototype = prefab;
+                p.prototypeTexture = texture;
+                p.minWidth = src.minWidth;
+                p.maxWidth = src.maxWidth;
+                p.minHeight = src.minHeight;
+                p.maxHeight = src.maxHeight;
+                p.noiseSpread = src.noiseSpread;
+                p.healthyColor = C(src.healthyColor, Color.white);
+                p.dryColor = C(src.dryColor, Color.white);
+                p.renderMode = (DetailRenderMode)src.renderMode;
+                SetMember(p, "noiseSeed", src.noiseSeed);
+                SetMember(p, "holeEdgePadding", src.holeEdgePadding);
+                SetMember(p, "density", src.density);
+                SetMember(p, "useInstancing", src.useInstancing);
+                SetMember(p, "useDensityScaling", src.useDensityScaling);
+                SetMember(p, "alignToGround", src.alignToGround);
+                SetMember(p, "positionJitter", src.positionJitter);
+                SetMember(p, "targetCoverage", src.targetCoverage);
+                details.Add(p);
+            }
+            if (details.Count > 0 && t.detailResolution > 0 && File.Exists(t.detailMap))
+            {
+                td.SetDetailResolution(t.detailResolution, Math.Max(8, t.detailPatch));
+                var scatter = typeof(TerrainData).GetMethod("SetDetailScatterMode");
+                if (scatter != null && t.coverage)  // Unity 2022.2+: the values are coverage, not counts
+                    scatter.Invoke(td, new object[] { Enum.ToObject(scatter.GetParameters()[0].ParameterType, 1) });
+                td.detailPrototypes = details.ToArray();
+                raw = File.ReadAllBytes(t.detailMap);
+                int dres = t.detailResolution;
+                for (int l = 0; l < detailIndex.Count; l++)
+                {
+                    if (detailIndex[l] < 0 || (l + 1) * dres * dres > raw.Length) continue;
+                    var map = new int[dres, dres];
+                    for (int z = 0, i = l * dres * dres; z < dres; z++)
+                        for (int x = 0; x < dres; x++, i++)
+                            map[z, x] = raw[i];
+                    td.SetDetailLayer(0, 0, detailIndex[l], map);
+                }
+            }
+            td.wavingGrassTint = C(t.grassTint, td.wavingGrassTint);
+            if (t.grass != null && t.grass.Length >= 3)
+            {
+                td.wavingGrassStrength = t.grass[0];
+                td.wavingGrassAmount = t.grass[1];
+                td.wavingGrassSpeed = t.grass[2];
+            }
+            EditorUtility.SetDirty(td);
         }
 
         // ---- animation clips
@@ -840,6 +1266,217 @@ namespace UniView
             { "NavMeshProjectSettings", "ProjectSettings/NavMeshAreas.asset" },
         };
 
+        // ---- render pipeline (URP / HDRP): a pipeline asset with the game's settings, and the materials back on its shaders.
+        // All through reflection: the builder compiles without the URP package (and in Unity versions without SRP).
+        const System.Reflection.BindingFlags AnyStatic = System.Reflection.BindingFlags.Static
+            | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+
+        static bool PipelineApplied(Description d)
+        {
+            return Stamped(PipelineMarker, d);
+        }
+
+        static bool Stamped(string marker, Description d)
+        {
+            return File.Exists(marker) && File.ReadAllText(marker).Contains(d.stamp ?? "");
+        }
+
+        static void ApplyAddressables(string file)
+        {
+            Description d = Load(file);
+            if (d == null) return;
+            File.WriteAllText(AddressablesMarker, "UniView added the game's Addressables entries (delete this file to add them again).\n" + d.stamp + "\n");
+            Type builder = AnyType("UniView.AddressablesBuilder");
+            var apply = builder == null ? null : builder.GetMethod("Apply", AnyStatic);
+            if (apply == null)
+            {
+                Debug.LogWarning("UniView: the game uses Addressables, but the Addressables package isn't in the project - its groups weren't made");
+                return;
+            }
+            try { Debug.Log("UniView: Addressables: " + apply.Invoke(null, new object[] { File.ReadAllText(file) })); }
+            catch (Exception e) { Debug.LogWarning("UniView: couldn't make the Addressables groups: " + (e.InnerException ?? e).Message); }
+        }
+
+        static object[] Arguments(System.Reflection.MethodInfo m, object first)
+        {
+            // first: the first parameter; enums: the URP renderer; the rest: their defaults.
+            var ps = m.GetParameters();
+            var args = new object[ps.Length];
+            for (int i = 0; i < ps.Length; i++)
+            {
+                Type t = ps[i].ParameterType;
+                if (i == 0 && first != null) args[i] = first;
+                else if (t.IsEnum)
+                {
+                    string[] names = Enum.GetNames(t);
+                    string pick = Array.IndexOf(names, "UniversalRenderer") >= 0 ? "UniversalRenderer"
+                        : Array.IndexOf(names, "ForwardRenderer") >= 0 ? "ForwardRenderer" : names[0];
+                    args[i] = Enum.Parse(t, pick);
+                }
+                else if (ps[i].IsOptional) args[i] = ps[i].DefaultValue;
+                else args[i] = t.IsValueType ? Activator.CreateInstance(t) : null;
+            }
+            return args;
+        }
+
+        static void EnsureFolder(string assetPath)
+        {
+            string folder = Path.GetDirectoryName(assetPath).Replace('\\', '/');
+            if (!AssetDatabase.IsValidFolder(folder))
+                AssetDatabase.CreateFolder(Path.GetDirectoryName(folder).Replace('\\', '/'), Path.GetFileName(folder));
+        }
+
+        static ScriptableObject CreateUrpAsset(Type assetType, string path)
+        {
+            EnsureFolder(path);
+            object data = null;
+            try
+            {
+                // URP's own "Create > Rendering > URP Asset (with Universal Renderer)": the renderer asset, then the pipeline asset.
+                var makeData = assetType.GetMethod("CreateRendererAsset", AnyStatic);
+                if (makeData != null) data = makeData.Invoke(null, Arguments(makeData, path));
+            }
+            catch (Exception e) { Debug.LogWarning("UniView: couldn't make the URP renderer asset: " + (e.InnerException ?? e).Message); }
+            System.Reflection.MethodInfo create = null;
+            foreach (var m in assetType.GetMethods(AnyStatic))
+                if (m.Name == "Create" && m.GetParameters().Length == 1) create = m;
+            if (create == null) { Debug.LogWarning("UniView: this URP version has no UniversalRenderPipelineAsset.Create"); return null; }
+            ScriptableObject asset;
+            try { asset = create.Invoke(null, new object[] { data }) as ScriptableObject; }
+            catch (Exception e) { Debug.LogWarning("UniView: couldn't make the URP asset: " + (e.InnerException ?? e).Message); return null; }
+            if (asset == null) return null;
+            AssetDatabase.CreateAsset(asset, path);
+            if (data == null)
+            {
+                // No renderer asset yet: URP's public way to make the default one.
+                var load = assetType.GetMethod("LoadBuiltinRendererData");
+                try { if (load != null) load.Invoke(asset, Arguments(load, null)); }
+                catch (Exception e) { Debug.LogWarning("UniView: couldn't make the URP renderer asset: " + (e.InnerException ?? e).Message); }
+            }
+            return asset;
+        }
+
+        static Type AnyType(string fullName)
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type t = asm.GetType(fullName, false);
+                if (t != null) return t;
+            }
+            return null;
+        }
+
+        static ScriptableObject CreateHdrpAsset(Type assetType, string path)
+        {
+            // HDRP's "Create > Rendering > HDRP Asset": a plain new asset; HDRP makes its global settings asset
+            // itself once the pipeline is in use.
+            EnsureFolder(path);
+            ScriptableObject asset;
+            try { asset = ScriptableObject.CreateInstance(assetType); }
+            catch (Exception e) { Debug.LogWarning("UniView: couldn't make the HDRP asset: " + e.Message); return null; }
+            if (asset == null) return null;
+            asset.name = Path.GetFileNameWithoutExtension(path);
+            AssetDatabase.CreateAsset(asset, path);
+            return asset;
+        }
+
+        static bool SetStatic(Type type, object value, params string[] names)
+        {
+            foreach (string name in names)
+            {
+                var p = type.GetProperty(name, AnyStatic);
+                if (p == null || !p.CanWrite) continue;
+                try { p.SetValue(null, value, null); return true; }
+                catch (Exception e) { Debug.LogWarning("UniView: couldn't set " + type.Name + "." + name + ": " + (e.InnerException ?? e).Message); }
+            }
+            return false;
+        }
+
+        static void ApplyPipeline(Description d)
+        {
+            File.WriteAllText(PipelineMarker, "UniView applied the game's render pipeline (delete this file to apply it again).\n" + d.stamp + "\n");
+            bool hdrp = d.pipeline == "hdrp";
+            if (d.pipeline != "urp" && !hdrp) return;
+            Type assetType = hdrp
+                ? ScriptType("UnityEngine.Rendering.HighDefinition.HDRenderPipelineAsset")
+                  ?? ScriptType("UnityEngine.Experimental.Rendering.HDPipeline.HDRenderPipelineAsset")
+                : ScriptType("UnityEngine.Rendering.Universal.UniversalRenderPipelineAsset");
+            if (assetType == null)
+            {
+                Debug.LogWarning("UniView: the game uses " + (hdrp ? "the High Definition Render Pipeline (HDRP)" : "the Universal Render Pipeline (URP)")
+                                 + ", but its package isn't in the project");
+                return;
+            }
+            var asset = AssetDatabase.LoadAssetAtPath(d.target, assetType) as ScriptableObject;
+            if (asset == null) asset = hdrp ? CreateHdrpAsset(assetType, d.target) : CreateUrpAsset(assetType, d.target);
+            if (asset == null) return;
+            int before = valuesSet, beforeSkip = valuesSkipped;
+            if (d.props != null && d.props.Length > 0)
+            {
+                var so = new SerializedObject(asset);
+                foreach (Prop pr in d.props) SetProp(so, pr, null, null, null);
+                so.ApplyModifiedPropertiesWithoutUndo();
+            }
+            // Graphics settings ("defaultRenderPipeline" since 2021.2) and every quality level.
+            SetStatic(typeof(UnityEngine.Rendering.GraphicsSettings), asset, "defaultRenderPipeline", "renderPipelineAsset");
+            if (typeof(QualitySettings).GetProperty("renderPipeline", AnyStatic) != null)
+            {
+                int current = QualitySettings.GetQualityLevel();
+                for (int i = 0; i < QualitySettings.names.Length; i++)
+                {
+                    QualitySettings.SetQualityLevel(i, false);
+                    SetStatic(typeof(QualitySettings), asset, "renderPipeline");
+                }
+                QualitySettings.SetQualityLevel(current, false);
+            }
+            int game = 0, lit = 0, kept = 0;
+            Shader litShader = Shader.Find(hdrp ? "HDRP/Lit" : "Universal Render Pipeline/Lit");
+            // HDRP materials need its own keyword / pass / stencil setup (what its material inspector does).
+            System.Reflection.MethodInfo resetKeywords = null;
+            if (hdrp)
+            {
+                foreach (string name in new[] { "UnityEditor.Rendering.HighDefinition.HDShaderUtils",
+                                                "UnityEditor.Rendering.HighDefinition.HDEditorUtils" })
+                {
+                    Type t = AnyType(name);
+                    var method = t == null ? null : t.GetMethod("ResetMaterialKeywords", AnyStatic, null, new[] { typeof(Material) }, null);
+                    if (method != null) { resetKeywords = method; break; }
+                }
+            }
+            foreach (MatSwap m in d.materials ?? new MatSwap[0])
+            {
+                var mat = AssetDatabase.LoadAssetAtPath<Material>(m.path);
+                if (mat == null) continue;
+                Shader s = string.IsNullOrEmpty(m.shader) ? null : Shader.Find(m.shader);
+                string[] keywords = m.keywords;
+                int queue = m.queue;
+                if (s != null) game++;
+                else if (m.lit && litShader != null && mat.shader != null && mat.shader.name.StartsWith("Standard"))
+                {
+                    s = litShader;
+                    keywords = m.litKeywords;
+                    queue = m.litQueue;
+                    lit++;
+                }
+                else { kept++; continue; }
+                if (mat.shader == s) continue;
+                mat.shader = s;  // the .mat keeps every property, so the game's values come back with the shader
+                mat.shaderKeywords = keywords ?? new string[0];
+                mat.renderQueue = queue;
+                if (resetKeywords != null)
+                {
+                    try { resetKeywords.Invoke(null, new object[] { mat }); }
+                    catch (Exception e) { Debug.LogWarning("UniView: HDRP setup of " + m.path + ": " + (e.InnerException ?? e).Message); }
+                }
+                EditorUtility.SetDirty(mat);
+            }
+            AssetDatabase.SaveAssets();
+            Debug.Log("UniView: render pipeline " + d.target + " (" + (valuesSet - before) + " of the game's settings, "
+                      + (valuesSkipped - beforeSkip) + " not applicable); materials: " + game + " on the game's " + d.pipeline.ToUpper()
+                      + " shaders, " + lit + " on " + (litShader != null ? litShader.name : "Lit") + ", " + kept + " kept"
+                      + (hdrp ? " (HDRP draws no RenderSettings skybox or fog: add a Volume for those)" : ""));
+        }
+
         static void ApplySettings(Description d)
         {
             int set = 0, skipped = 0;
@@ -867,6 +1504,8 @@ namespace UniView
             }
             if (!string.IsNullOrEmpty(d.product)) PlayerSettings.productName = d.product;
             if (!string.IsNullOrEmpty(d.company)) PlayerSettings.companyName = d.company;
+            if (d.colorSpace == 1 || d.colorSpace == 2)
+                PlayerSettings.colorSpace = d.colorSpace == 2 ? ColorSpace.Linear : ColorSpace.Gamma;
             AssetDatabase.SaveAssets();
             File.WriteAllText(SettingsMarker, "UniView applied the game's project settings (delete this file to apply them again).\n");
             Debug.Log("UniView: project settings applied (" + set + " values set, " + skipped + " not applicable)");
@@ -993,7 +1632,12 @@ namespace UniView
                     {
                         if (pr.s == "GameObject") target = objects[pr.n];
                         else if (pr.s == "Transform") target = objects[pr.n].transform;
-                        else { Component c; if (byNode != null && byNode.TryGetValue(pr.n + "|" + pr.s, out c)) target = c; }
+                        else
+                        {
+                            Component c;
+                            if (byNode != null && byNode.TryGetValue(pr.n + "|" + pr.s, out c)) target = c;
+                            else if (byNode == null) target = objects[pr.n].GetComponent(pr.s);  // scene settings -> a Light
+                        }
                     }
                     else if (pr.t == "m")
                     {
@@ -1226,4 +1870,136 @@ namespace UniView
     }
 }
 #endif
+'''
+
+# A runtime script (in its own assembly, so the game's decompiled scripts can't stop it compiling) that puts
+# a scene's baked lightmaps back: the editor drops renderers' lightmap indices when a scene has no baked
+# lighting data of its own, so they're applied again whenever the scene is loaded, in the editor too.
+LIGHTMAPS_CS = r'''// Written by UniView (Game Asset Viewer): the game's baked lightmaps for this scene.
+using UnityEngine;
+
+namespace UniView
+{
+#if UNITY_2018_3_OR_NEWER
+    [ExecuteAlways]
+#else
+    [ExecuteInEditMode]
+#endif
+    public class SceneLightmaps : MonoBehaviour
+    {
+        public Texture2D[] lightmaps = new Texture2D[0];
+        public Renderer[] renderers = new Renderer[0];
+        public int[] indices = new int[0];
+        public Vector4[] scaleOffsets = new Vector4[0];
+
+        void OnEnable() { Apply(); }
+
+        public void Apply()
+        {
+            var data = new LightmapData[lightmaps.Length];
+            for (int i = 0; i < lightmaps.Length; i++)
+            {
+                data[i] = new LightmapData();
+                data[i].lightmapColor = lightmaps[i];
+            }
+            LightmapSettings.lightmaps = data;
+            for (int i = 0; i < renderers.Length && i < indices.Length && i < scaleOffsets.Length; i++)
+            {
+                if (renderers[i] == null) continue;
+                renderers[i].lightmapIndex = indices[i];
+                renderers[i].lightmapScaleOffset = scaleOffsets[i];
+            }
+        }
+    }
+}
+'''
+
+LIGHTMAPS_ASMDEF = '{\n    "name": "UniView.Runtime"\n}\n'
+
+# The game's Addressables groups (Assets/UniView/Addressables/): its own editor assembly, compiled only when the
+# project has the Addressables package (versionDefines + defineConstraints); UniViewBuilder.cs calls it by reflection.
+ADDRESSABLES_CS = r'''// Written by UniView (Game Asset Viewer): puts the game's assets back in Addressables groups with their
+// addresses and labels, so Addressables.LoadAssetAsync("address") finds them. Run from UniViewBuilder.cs.
+#if UNIVIEW_ADDRESSABLES
+using System;
+using System.Collections.Generic;
+using UnityEditor;
+using UnityEditor.AddressableAssets;
+using UnityEditor.AddressableAssets.Settings;
+using UnityEditor.AddressableAssets.Settings.GroupSchemas;
+using UnityEngine;
+
+namespace UniView
+{
+    [Serializable]
+    public class AddressableEntry
+    {
+        public string asset;    // the asset in this project
+        public string address;
+        public string[] labels;
+        public string group;    // from the bundle it was built into
+    }
+
+    [Serializable]
+    public class AddressablesList
+    {
+        public AddressableEntry[] entries;
+    }
+
+    public static class AddressablesBuilder
+    {
+        public static string Apply(string json)
+        {
+            var list = JsonUtility.FromJson<AddressablesList>(json);
+            if (list == null || list.entries == null || list.entries.Length == 0) return "no entries";
+            var settings = AddressableAssetSettingsDefaultObject.GetSettings(true);
+            if (settings == null) return "couldn't make the Addressables settings";
+            var groups = new Dictionary<string, AddressableAssetGroup>();
+            var changed = new List<AddressableAssetEntry>();
+            int missing = 0;
+            foreach (AddressableEntry e in list.entries)
+            {
+                string guid = AssetDatabase.AssetPathToGUID(e.asset);
+                if (string.IsNullOrEmpty(guid) || AssetDatabase.GUIDToAssetPath(guid) != e.asset) { missing++; continue; }
+                string name = string.IsNullOrEmpty(e.group) ? "Game Assets" : e.group;
+                AddressableAssetGroup group;
+                if (!groups.TryGetValue(name, out group))
+                {
+                    group = settings.FindGroup(name);
+                    if (group == null)
+                        group = settings.CreateGroup(name, false, false, false, null,
+                                                     typeof(BundledAssetGroupSchema), typeof(ContentUpdateGroupSchema));
+                    groups[name] = group;
+                }
+                var entry = settings.CreateOrMoveEntry(guid, group, false, false);
+                if (entry == null) { missing++; continue; }
+                if (!string.IsNullOrEmpty(e.address)) entry.SetAddress(e.address, false);
+                if (e.labels != null)
+                    foreach (string label in e.labels)
+                    {
+                        if (string.IsNullOrEmpty(label)) continue;
+                        settings.AddLabel(label, false);
+                        entry.SetLabel(label, true, true, false);
+                    }
+                changed.Add(entry);
+            }
+            settings.SetDirty(AddressableAssetSettings.ModificationEvent.EntryMoved, changed, true, true);
+            AssetDatabase.SaveAssets();
+            return changed.Count + " entries in " + groups.Count + " group(s)"
+                + (missing > 0 ? ", " + missing + " not in the project" : "");
+        }
+    }
+}
+#endif
+'''
+
+ADDRESSABLES_ASMDEF = '''{
+    "name": "UniView.Addressables.Editor",
+    "references": ["Unity.Addressables", "Unity.Addressables.Editor"],
+    "includePlatforms": ["Editor"],
+    "defineConstraints": ["UNIVIEW_ADDRESSABLES"],
+    "versionDefines": [
+        {"name": "com.unity.addressables", "expression": "1.0.0", "define": "UNIVIEW_ADDRESSABLES"}
+    ]
+}
 '''

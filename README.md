@@ -4,7 +4,7 @@
 
 # UniView - Game Asset Viewer
 
-**Browse the 3D models, maps, textures, sprites, sounds, animations and text inside Unity, Source, Source 2, Unreal and Fallout 1/2 games, including games that have shut down and can't be played anymore. Any other game's loose files open too, and new engines can be added with plugins.**
+**Browse the 3D models, maps, textures, sprites, sounds, animations and text inside Unity, Source, Source 2, Unreal, XNA/FNA (Terraria) and Fallout 1/2 games, including games that have shut down and can't be played anymore. Any other game's loose files open too, and new engines can be added with plugins.**
 
 [![Views](https://hits.sh/github.com/NightHawkHSI/UniView.svg?label=views&color=4c1)](https://hits.sh/github.com/NightHawkHSI/UniView/)
 [![Downloads](https://img.shields.io/github/downloads/NightHawkHSI/UniView/total?label=downloads&color=blue)](https://github.com/NightHawkHSI/UniView/releases)
@@ -35,12 +35,12 @@ Unzip it and run `UniView.exe`. You don't need Python.
 
 | | |
 |---|---|
-| **What it opens** | Unity, Source, Source 2, Unreal and Fallout 1/2 game folders; loose files and zip archives of any game; any engine that has a [plugin](#engine-plugins) |
+| **What it opens** | Unity, Source, Source 2, Unreal, XNA/FNA and Fallout 1/2 game folders; loose files and zip archives of any game; any engine that has a [plugin](#engine-plugins) |
 | **What it shows** | Models and maps (3D), textures, sprites, sounds (built-in player), animations (played on their models), text files; everything else can be exported as-is |
 | **What it exports** | Models as `.obj` + `.mtl` + `.png` or a single `.glb` with their full PBR materials (color, normal, metallic, roughness, AO, emission, height), textures as `.png`, sounds as `.wav`/`.mp3`/`.ogg`, animations as JSON keyframes or a rigged, animated `.glb`, text as-is, or a whole Unity game as a **Unity project** |
 | **Modding** | Swap textures, sprites, text, data, fonts, sounds and models in Unity games with the [Mod Maker](#modding-unity-games) |
 | **Game files** | Only read. The one exception is **Mod Maker → Install into game**, which backs up the originals first and can restore them |
-| **Tested with** | Robocraft, Muck, Valheim (Unity) · Team Fortress 2, Portal (Source) · CS2, Deadlock (Source 2) · Satisfactory, Headliners, Dead as Disco (Unreal) · Fallout 1 & 2 · Project Zomboid, Serious Sam 2 (loose files) |
+| **Tested with** | Robocraft, Muck, Valheim (Unity) · Team Fortress 2, Portal (Source) · CS2, Deadlock (Source 2) · Satisfactory, Headliners, Dead as Disco (Unreal) · Terraria (XNA) · Fallout 1 & 2 · Project Zomboid, Serious Sam 2 (loose files) |
 | **Built with** | [UnityPy](https://github.com/K0lb3/UnityPy) · [PySide6](https://doc.qt.io/qtforpython-6/) · [PyVista](https://pyvista.org/) |
 
 ## Download
@@ -82,6 +82,7 @@ Each game is read by an **engine plugin**. UniView picks the plugin automaticall
 | **Source** | TF2, HL2, Portal, CS:S, L4D2, GMod | ✔ `.mdl` with `.vmt` materials; ✔ **maps** (`.bsp`) with terrain and static props | ✔ `.vtf` | ✔ wav/mp3 | ✔ text |
 | **Source 2** | CS2, Dota 2, Deadlock, HL: Alyx | ✔ `.vmdl_c` with materials | ✔ `.vtex_c` | ✔ `.vsnd_c` | ✔ text |
 | **Unreal 4/5** | Satisfactory, Dead as Disco, Headliners | ✔ static + skeletal meshes, textures found through their materials | ✔ incl. virtual textures | ✔ Ogg/WAV SoundWaves, Wwise `.wem`, FMOD `.bank`* (not Bink Audio yet) | ✔ ini/json/csv...; raw export of the rest |
+| **XNA / FNA** (plugin `plugins/terraria.py`) | Terraria | – | ✔ `.xnb` textures (LZX compressed too), sprite-font sheets | ✔ `.xnb` sound effects, XACT music banks (`.xwb`, MS-ADPCM / PCM) named by their cues | raw `.xnb` export of the rest (shaders, data) |
 | **Fallout 1/2** | Fallout, Fallout 2 | – | ✔ FRM sprites (whole animation strip), RIX images | ✔ ACM* | ✔ MSG text |
 | **Loose files & archives** | any other game (Project Zomboid, Serious Sam 2...) | ✔ `.obj`, DirectX `.x` | ✔ png/jpg/tga/dds/bmp... | ✔ wav/mp3/ogg, plus anything vgmstream* plays | ✔ text; files inside `.zip`/`.gro`/`.pk3` archives |
 
@@ -252,6 +253,7 @@ UniView has no telemetry, accounts or ads. It only goes online for:
 - "Unity" is a registered trademark of Unity Technologies or its affiliates in the U.S. and elsewhere.
 - "Unreal" and "Unreal Engine" are trademarks or registered trademarks of Epic Games, Inc. in the U.S. and elsewhere.
 - "Source", "Steam" and "Valve" are trademarks or registered trademarks of Valve Corporation.
+- "Terraria" is a trademark of Re-Logic. "XNA" is a trademark of Microsoft Corporation.
 - "Fallout" is a trademark or registered trademark of ZeniMax Media Inc.
 - "Oodle" is a trademark of Epic Games Tools LLC.
 - "FMOD" is a trademark of Firelight Technologies Pty Ltd. UniView uses the FMOD Engine, copyright © Firelight Technologies Pty Ltd.

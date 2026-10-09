@@ -1373,6 +1373,14 @@ def _path_closeness(a, b):
     return n + (a.lower() == b.lower())
 
 
+def _deref(pptr):
+    """The ObjectReader a PPtr points at, or None (null or unreadable)."""
+    try:
+        return pptr.deref() if pptr is not None and pptr.path_id else None
+    except Exception:
+        return None
+
+
 def script_class(obj):
     """'Namespace.ClassName' of a MonoBehaviour's script ('PhysicMaterial', 'Shader'... for built-in data), or ''."""
     if getattr(getattr(obj, "type", None), "name", "") in BUILTIN_DATA + ("Shader", "AudioMixerController"):
@@ -1404,6 +1412,10 @@ def json_safe(value):
 # Project settings kept in globalgamemanagers that an editor project can take back as they are.
 SETTINGS_TYPES = ("TagManager", "PhysicsManager", "Physics2DSettings", "InputManager", "TimeManager", "AudioManager",
                   "QualitySettings", "NavMeshProjectSettings")
+# Render pipeline asset fields a new asset keeps its own of: the renderer type and list (its own renderer asset) and the
+# asset versions (an older version would rerun the pipeline's upgrade steps on the new asset's fields).
+PIPELINE_SKIP = re.compile(r"(m_Enabled|m_RendererType|m_RendererDataList|m_RendererData|m_DefaultRendererIndex|k_AssetVersion|"
+                           r"k_AssetPreviousVersion|m_AssetVersion|m_Version)\b")
 BUILTIN_TAGS = {0: "Untagged", 1: "Respawn", 2: "Finish", 3: "EditorOnly", 5: "MainCamera", 6: "Player",
                 7: "GameController"}
 
@@ -1423,6 +1435,7 @@ class UnitySession(GameSession):
         self._sheets = None
         self._skins = {}
         self._terrains = {}
+        self._scene_managers = {}  # scene uid -> render settings read by hierarchy(), until the export takes them
         self._rigs = None        # humanoid Avatars (unity_humanoid.HumanRig)
         self._scene_settings = {}  # id(scene file) -> (RenderSettings tree, lightmaps)
         self._shader_info = {}     # shader key -> shader_info()
@@ -1509,6 +1522,34 @@ class UnitySession(GameSession):
         if ref["image"] is None:
             raise ValueError("This terrain has no painted layers.")
         return ref["image"]
+
+    def terrain_export(self, asset):
+        """unity_terrain.terrain_export() of a terrain model asset (for the Unity project export), or None."""
+        if not (self._is_terrain(asset) and asset.ref["type"] == "terrain"):
+            return None
+        from .unity_terrain import terrain_export
+        with self.lock:
+            return terrain_export(self, asset.ref["obj"])
+
+    def terrain_normal_maps(self, asset):
+        """Keys of the normal map textures a terrain's layers use."""
+        if not (self._is_terrain(asset) and asset.ref["type"] == "terrain"):
+            return set()
+        from .unity_terrain import _deref
+        out = set()
+        with self.lock:
+            obj = asset.ref["obj"]
+            splat = obj.read_typetree().get("m_SplatDatabase") or {}
+            for ptr in splat.get("m_TerrainLayers") or []:
+                layer = _deref(self, obj, ptr)
+                normal = _deref(self, layer, layer.read_typetree().get("m_NormalMapTexture")) if layer else None
+                if normal is not None:
+                    out.add(self._asset_for(normal).key)
+            for p in splat.get("m_Splats") or []:
+                normal = _deref(self, obj, p.get("normalMap"))
+                if normal is not None:
+                    out.add(self._asset_for(normal).key)
+        return out
 
     def image(self, asset):
         if self._is_terrain(asset):
@@ -1674,7 +1715,7 @@ class UnitySession(GameSession):
           built-in components: colliders, rigidbodies, audio sources, cameras, LOD groups..., and
           {"type": "MonoBehaviour", "script": "Namespace.Class", "props"} for script components)}],
         in Unity's own space. Optional keys are missing when they don't apply."""
-        from .unity_components import SKIP_COMPONENTS, flatten
+        from .unity_components import SKIP_COMPONENTS, baked_probe_as_custom, flatten
         from .unity_scene import _components
         nodes = []
         material_cache = {}
@@ -1764,10 +1805,15 @@ class UnitySession(GameSession):
                         renderer = reader.read()
                         node["renderer_enabled"] = bool(getattr(renderer, "m_Enabled", True))
                         node["materials"] = material_uids(renderer)
+                        lightmap = int(getattr(renderer, "m_LightmapIndex", 0xFFFF))
+                        if lightmap < 0xFFFE:  # baked into the scene's lightmap n at this tiling/offset
+                            st = renderer.m_LightmapTilingOffset
+                            node["lightmap"] = [lightmap, float(st.x), float(st.y), float(st.z), float(st.w)]
                         info = getattr(renderer, "m_StaticBatchInfo", None)
                         if info is not None and getattr(info, "subMeshCount", 0):
                             batch = {"first": int(info.firstSubMesh), "count": int(info.subMeshCount),
-                                     "materials": renderer_materials(renderer), "material_uids": node["materials"]}
+                                     "materials": renderer_materials(renderer), "material_uids": node["materials"],
+                                     "lightmap": node.get("lightmap")}
                     elif name == "Light":
                         light = reader.read()
                         c = light.m_Color
@@ -1810,6 +1856,8 @@ class UnitySession(GameSession):
                 try:
                     tree = self._scripts().read(reader)[0] if script else reader.read_typetree()
                     props = flatten(tree, resolver(reader))
+                    if name == "ReflectionProbe":
+                        props = baked_probe_as_custom(props)
                 except Exception as e:
                     log.debug("Component %s of '%s': %s", name, nodes[index]["name"], e)
                     continue
@@ -1817,7 +1865,95 @@ class UnitySession(GameSession):
                 seen = self.__dict__.setdefault("_seen_props", set())
                 seen.update(e["p"] for e in props if "Array" not in e["p"] and len(seen) < 200_000)
                 nodes[index].setdefault("components", []).append(entry)
+            managers = self._render_settings(asset, resolver)
+            if managers:
+                self._scene_managers[asset.uid] = managers
         return nodes
+
+    def _render_settings(self, asset, resolver):
+        """[{"type": "RenderSettings", "props"}] of a scene (sky, ambient light, fog, reflections, sun), else []."""
+        from .unity_components import flatten
+        from .unity_scene import is_scene_file
+        try:
+            root = next(iter(self._scene_roots(asset)), None)
+            if root is None or not is_scene_file(root.assets_file):
+                return []
+            render = self.scene_settings(root.assets_file)[0]
+            if not render:
+                return []
+            # Leave out what the editor works out itself (the skybox's reflection cubemap, its average colour).
+            tree = {k: v for k, v in render.items()
+                    if k not in ("_reader", "m_GeneratedSkyboxReflection", "m_IndirectSpecularColor")}
+            return [{"type": "RenderSettings", "props": flatten(tree, resolver(render["_reader"]))}]
+        except Exception as e:
+            log.debug("Render settings of '%s': %s", asset.name, e)
+            return []
+
+    def scene_lightmaps(self, asset):
+        """[(lightmap texture Asset or None, "hdr" | "rgbm" | "dldr")] of a scene asset, in lightmap index order."""
+        from .unity_scene import is_scene_file
+        with self.lock:
+            root = next(iter(self._scene_roots(asset)), None)
+            if root is None or not is_scene_file(root.assets_file):
+                return []
+            return list(self.scene_settings(root.assets_file)[1])
+
+    def color_space(self):
+        """The game's color space: "linear", "gamma", or "" if unknown."""
+        with self.lock:
+            for obj in self.env.objects:
+                if obj.type.name == "PlayerSettings":
+                    try:
+                        value = obj.read_typetree().get("m_ActiveColorSpace")
+                    except Exception:
+                        return ""
+                    return {0: "gamma", 1: "linear"}.get(value, "")
+        return ""
+
+    def render_pipeline(self):
+        """The game's scriptable render pipeline: {"kind": "urp" | "hdrp", "class", "name" (of the pipeline asset),
+        "props" (unity_components.flatten
+        of the pipeline asset's settings, [] when its fields can't be read)}, or None (built-in renderer)."""
+        from .unity_components import flatten
+        with self.lock:
+            asset = None
+            quality = None
+            for obj in self.env.objects:
+                name = obj.type.name
+                if name not in ("GraphicsSettings", "QualitySettings"):
+                    continue
+                try:
+                    data = obj.read()
+                except Exception as e:
+                    log.debug("%s: %s", name, e)
+                    continue
+                if name == "GraphicsSettings":
+                    asset = _deref(getattr(data, "m_CustomRenderPipeline", None)) or asset
+                else:
+                    levels = list(getattr(data, "m_QualitySettings", None) or [])
+                    current = getattr(data, "m_CurrentQuality", 0) or 0
+                    for level in levels[current:current + 1] + levels:  # the default level first
+                        quality = quality or _deref(getattr(level, "customRenderPipeline", None))
+            asset = asset or quality
+            if asset is None:
+                return None
+            cls = script_class(asset)
+            kind = ("urp" if cls.endswith("UniversalRenderPipelineAsset") else
+                    "hdrp" if cls.endswith("HDRenderPipelineAsset") else None)
+            if kind is None:
+                return None
+            try:
+                tree, _note = self._scripts().read(asset)
+                props = [p for p in flatten(tree or {}, lambda file_id, path_id: None)
+                         if not PIPELINE_SKIP.match(p["p"])]
+            except Exception as e:
+                log.debug("Render pipeline asset fields: %s", e)
+                props = []
+        return {"kind": kind, "class": cls, "name": asset.peek_name() or "", "props": props}
+
+    def scene_managers(self, asset):
+        """The scene-wide settings hierarchy(asset) read: [{"type": "RenderSettings", "props"}] (scenes only)."""
+        return self._scene_managers.pop(asset.uid, [])
 
     def _settings_objects(self):
         return [o for o in self.env.objects if o.type.name in SETTINGS_TYPES + ("BuildSettings", "PlayerSettings")]
@@ -1854,6 +1990,8 @@ class UnitySession(GameSession):
                 return {"asset": self._asset_for(obj, "Sprite").uid, "kind": "sprite"}
             if name == "AnimationClip":
                 return {"asset": self._asset_for(obj, "AnimationClip").uid, "kind": "file"}
+            if name == "TerrainData":  # the exporter writes it as a Unity TerrainData .asset
+                return {"asset": f"terraindata:{obj.assets_file.name}:{obj.path_id}", "kind": "file"}
             if name == "AnimatorController":
                 return {"asset": f"controller:{obj.assets_file.name}:{obj.path_id}", "kind": "file"}
             listed = self.by_key.get(key)
@@ -1960,6 +2098,8 @@ class UnitySession(GameSession):
                     out["scene_order"] = list(tree.get("scenes") or tree.get("m_Scenes") or [])
                 elif name == "PlayerSettings":
                     out["product"], out["company"] = tree.get("productName", ""), tree.get("companyName", "")
+                    if tree.get("m_ActiveColorSpace") in (0, 1):  # 0 gamma, 1 linear
+                        out["color_space"] = int(tree["m_ActiveColorSpace"])
                 else:
                     if name == "TagManager":
                         out["tags"] = list(tree.get("tags") or [])
@@ -3147,6 +3287,21 @@ class UnitySession(GameSession):
                         log.debug("Addressables catalog %s: %s", path, e)
             self._catalog = entries
         return self._catalog
+
+    def addressables(self):
+        """unity_catalog.addressable_assets() of the game's catalog(s): the Addressables entries (address, labels,
+        group, GUID) of assets loaded from bundles, [] for games without Addressables."""
+        import glob
+        from .unity_catalog import addressable_assets, catalog_entries, catalog_locations
+        game = self.path if os.path.isdir(self.path) else os.path.dirname(self.path)
+        out = []
+        for path in glob.glob(os.path.join(game, "*_Data", "StreamingAssets", "aa", "catalog*.*")):
+            if path.lower().endswith((".bin", ".json")):
+                try:
+                    out += addressable_assets(catalog_locations(path), catalog_entries(path))
+                except Exception as e:
+                    log.debug("Addressables catalog %s: %s", path, e)
+        return out
 
     def _registry_material(self, name):
         """The material a game's name for it means through its own registry: a data asset listing

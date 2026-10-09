@@ -15,7 +15,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from types import SimpleNamespace
+
+import numpy as np
 
 from engines.sdk import Material
 from uniview import pbr
@@ -30,10 +33,11 @@ from uniview.export import (
 )
 from uniview.exr import write_exr
 from uniview.search import is_unreadable
-from uniview.unity_builder import BUILDER_CS
+from uniview.unity_builder import ADDRESSABLES_ASMDEF, ADDRESSABLES_CS, BUILDER_CS, LIGHTMAPS_ASMDEF, LIGHTMAPS_CS
 from uniview.unity_layout import KIND_FOLDERS, Layout, collect_usage
 from uniview.unity_layout import target as layout_target
 from uniview.unity_materials import convert, mat_yaml
+from uniview.unity_terrains import data_key, is_terrain, plan_terrains, write_terrain_descriptions
 from uniview.unity_packages import (
     ASSEMBLY_PACKAGES,
     builtin_packages,
@@ -114,7 +118,7 @@ def gltfast_version(version):
 
 # --------------------------------------------------------------------------- project files
 
-def meta_text(guid, texture_type=None, data=None):
+def meta_text(guid, texture_type=None, data=None, cube=False):
     """A minimal .meta; Unity fills in the rest. Textures need serializedVersion, else Unity reads the
     settings as a very old format and imports them as cubemaps.
 
@@ -123,6 +127,8 @@ def meta_text(guid, texture_type=None, data=None):
     text = f"fileFormatVersion: 2\nguid: {guid}\n"
     if texture_type is not None:
         text += f"TextureImporter:\n  serializedVersion: 4\n  textureType: {texture_type}\n"
+        if cube:  # a cubemap saved as a horizontal cross (+Y / -X +Z +X -Z / -Y)
+            text += "  textureShape: 2\n  generateCubemap: 6\n"
         if data is not None:
             wrap = data.get("wrap_mode", 0)
             text += (f"  mipmaps:\n    enableMipMap: {int(bool(data.get('mipmaps')))}\n    sRGBTexture: 0\n"
@@ -134,10 +140,10 @@ def meta_text(guid, texture_type=None, data=None):
     return text
 
 
-def write_meta(path, guid, normal_map=False, data=None):
+def write_meta(path, guid, normal_map=False, data=None, cube=False):
     is_image = path.lower().endswith(IMAGE_EXTS)
     with open(path + ".meta", "w", encoding="utf-8", newline="\n") as f:
-        f.write(meta_text(guid, (1 if normal_map else 0) if is_image else None, data))
+        f.write(meta_text(guid, (1 if normal_map else 0) if is_image else None, data, cube and is_image))
 
 
 def write_folder_metas(assets_dir, folder):
@@ -218,6 +224,7 @@ def write_manifest(root, editor_exe, gltfast, extra=None, version=""):
 
 BUILD_DIR = ("UniView", "Build")        # JSON descriptions, under Assets/
 BUILDER_PATH = ("UniView", "Editor", "UniViewBuilder.cs")
+RUNTIME_DIR = ("UniView", "Runtime")     # scripts scenes use (own assembly)
 # Meshes from Unity's built-in resources that every editor has (Resources.GetBuiltinResource<Mesh>).
 BUILTIN_MESHES = ("Cube", "Sphere", "Capsule", "Cylinder", "Plane", "Quad")
 
@@ -247,8 +254,10 @@ class MaterialLibrary:
     """Writes each game material as a .mat the first time a renderer uses it (next to the one prefab
     that uses it, else Assets/Materials/)."""
 
-    def __init__(self, session, root, assets_dir, texture_paths, layout=None):
+    def __init__(self, session, root, assets_dir, texture_paths, layout=None, pipeline=None):
         self.session, self.root, self.assets_dir = session, root, assets_dir
+        self.pipeline = pipeline            # "urp": materials keep the game's shader settings (see swaps)
+        self.swaps = []                     # [{"path", "shader", "keywords", "queue", "lit", ...}] for the builder
         self.layout = layout or Layout()
         self.texture_paths = texture_paths  # texture asset key -> exported path
         self.paths = {}                     # material uid -> "Assets/..." ('' if it couldn't be written)
@@ -317,10 +326,16 @@ class MaterialLibrary:
         def make_texture(recipe, sources):
             return self.repacked(folder, recipe, sources)
 
+        m = convert(details, self.texture_guid, make_texture, self.pipeline)
         with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(mat_yaml(convert(details, self.texture_guid, make_texture)))
+            f.write(mat_yaml(m))
         write_meta(path, asset_guid(uid))
         write_folder_metas(self.assets_dir, folder)
+        if "game_shader" in m:
+            self.swaps.append({"path": unity_path(self.root, path), "shader": m["game_shader"],
+                               "keywords": m["game_keywords"], "queue": int(m["game_queue"]),
+                               "lit": "lit_keywords" in m, "litKeywords": m.get("lit_keywords", []),
+                               "litQueue": int(m.get("lit_queue", -1))})
         return unity_path(self.root, path)
 
 
@@ -379,7 +394,10 @@ def prefab_description(nodes, target, model_paths, root, builtin_meshes=None, ki
         return entry
 
     for n in nodes:
-        model = model_paths.get(n.get("mesh")) or model_paths.get(n.get("terrain"))
+        terrain = n.get("terrain") or ""
+        # A real Unity terrain replaces the terrain mesh (its Terrain component points at the TerrainData).
+        model = model_paths.get(n.get("mesh")) or (None if data_key(terrain) in model_paths
+                                                   else model_paths.get(terrain))
         if model and not model.lower().endswith((".glb", ".obj")):
             model = None
         builtin = (builtin_meshes or {}).get(n.get("mesh"), "") if not model else ""
@@ -395,6 +413,8 @@ def prefab_description(nodes, target, model_paths, root, builtin_meshes=None, ki
                     "noMaterials": "materials" in n and not n["materials"] and bool(model or builtin),
                     "components": [comp_entry(c) for c in n.get("components") or ()],
                     "layer": int(n.get("layer", 0)), "tag": n.get("tag", "")})
+        if n.get("lightmap") and model:  # [lightmap index, tiling x, y, offset x, y]
+            out[-1]["lightmap"] = [float(v) for v in n["lightmap"]]
         rect = n.get("rect")
         if rect:  # a UI object: RectTransform layout
             out[-1]["rect"] = {"present": True, "anchorMin": [float(v) for v in rect["anchor_min"]],
@@ -435,24 +455,42 @@ def visible_nodes(nodes):
 
 
 def write_static_batches(session, nodes, folder, texture_paths):
-    """One GLB per static-batch combined mesh used in a scene, each submesh with the material of the renderer
-    that owns it; submeshes of hidden objects are left out. Returns [(file written, material uid per submesh)]."""
+    """One GLB per static-batch combined mesh used in a scene (and lightmap: one per lightmap its parts are baked
+    into, with each part's lightmap tiling/offset applied to its second UVs), each submesh with the material of
+    the renderer that owns it; submeshes of hidden objects are left out.
+    Returns [(file written, material uid per submesh, lightmap index or -1)]."""
     by_uid = {a.uid: a for a in session.assets}
     visible = visible_nodes(nodes)
-    owners = {}  # combined mesh uid -> [(first, count, materials)]
+    owners = {}  # (combined mesh uid, lightmap) -> [(first, count, materials, material uids, tiling/offset)]
     for n, vis in zip(nodes, visible):
         batch = n.get("batch")
         if batch and vis and n.get("renderer_enabled", True):
-            owners.setdefault(batch["mesh"], []).append((batch["first"], batch["count"], batch["materials"],
-                                                         batch.get("material_uids") or []))
+            lightmap = batch.get("lightmap")
+            owners.setdefault((batch["mesh"], lightmap[0] if lightmap else -1), []).append(
+                (batch["first"], batch["count"], batch["materials"], batch.get("material_uids") or [],
+                 lightmap[1:] if lightmap else None))
     written = []
     default = Material("Default")
-    for uid, owned in owners.items():
+    for (uid, lightmap), owned in owners.items():
         asset = by_uid.get(uid)
         if asset is None:
             continue
         with session.lock:
             md = session.mesh(asset)
+        if lightmap >= 0 and md.uvs:
+            uv2 = np.array(md.uvs.get("UV1", next(iter(md.uvs.values()))), np.float32)
+            done = np.zeros(len(uv2), bool)
+            for j, tris in enumerate(md.submeshes):
+                slot = md.material_slots[j] if j < len(md.material_slots) else j
+                owner = next((o for o in owned if o[0] <= slot < o[0] + o[1]), None)
+                if owner is None or owner[4] is None:
+                    continue
+                verts = np.unique(np.asarray(tris).ravel())
+                verts = verts[~done[verts]]
+                sx, sy, ox, oy = owner[4]
+                uv2[verts] = uv2[verts] * [sx, sy] + [ox, oy]
+                done[verts] = True
+            md.uvs = {**md.uvs, "UV1": uv2} if "UV0" in md.uvs else {"UV0": uv2, "UV1": uv2}
         materials, index, keep, slots, uids = [], {}, [], [], []
         for j, tris in enumerate(md.submeshes):
             slot = md.material_slots[j] if j < len(md.material_slots) else j
@@ -472,7 +510,7 @@ def write_static_batches(session, nodes, folder, texture_paths):
         md.submeshes, md.material_slots = keep, slots
         base = os.path.join(folder, safe_filename(asset.name) or "Combined Mesh")
         path, n = base + ".glb", 1
-        while path in (w for w, _u in written):
+        while path in (w for w, *_rest in written):
             n += 1
             path = f"{base}_{n}.glb"
         os.makedirs(folder, exist_ok=True)
@@ -482,8 +520,48 @@ def write_static_batches(session, nodes, folder, texture_paths):
             return os.path.relpath(target, folder).replace(os.sep, "/") if target else None
 
         write_glb(session, md, materials, path, image_uri=image_uri)
-        written.append((path, uids))
+        written.append((path, uids, lightmap))
     return written
+
+
+LIGHTMAP_TEXTURE_TYPE = 6  # TextureImporterType.Lightmap
+
+
+def lightmap_linear(rgba, mode, linear):
+    """Linear light (H x W x 3 float32) of a game lightmap's pixels (H x W x 4, 0..1) as its shaders decode them:
+    "hdr" is linear already; RGBM is rgb x 5 x alpha and double-LDR rgb x 2 in gamma space, or the same with
+    5^2.2 and alpha^2.2 (RGBM) in a linear-space game."""
+    rgb, a = rgba[..., :3], rgba[..., 3:4]
+    if mode == "rgbm":
+        return (rgb * (5.0 * a) ** 2.2 if linear else (rgb * a * 5.0) ** 2.2).astype(np.float32)
+    if mode == "dldr":
+        return ((rgb * 2.0) ** 2.2).astype(np.float32)
+    return rgb.astype(np.float32)
+
+
+def write_scene_lightmaps(session, asset, folder, linear):
+    """The scene's lightmaps as linear EXRs (imported as Lightmap textures) in lightmap index order:
+    [file path or "" for one that couldn't be read]."""
+    out = []
+    lightmaps = session.scene_lightmaps(asset) if hasattr(session, "scene_lightmaps") else []
+    for i, (tex, mode) in enumerate(lightmaps):
+        if tex is None:
+            out.append("")
+            continue
+        try:
+            with session.lock:
+                img = session.image(tex)
+            rgba = np.asarray(img.convert("RGBA"), np.float32) / 255.0
+            path = os.path.join(folder, f"Lightmap-{i}_comp_light.exr")
+            os.makedirs(folder, exist_ok=True)
+            write_exr(path, lightmap_linear(rgba, mode, linear))
+            with open(path + ".meta", "w", encoding="utf-8", newline="\n") as f:
+                f.write(meta_text(asset_guid(f"{asset.uid}:lightmap:{i}"), LIGHTMAP_TEXTURE_TYPE))
+            out.append(path)
+        except Exception as e:
+            log.debug("Lightmap %d of '%s': %s", i, asset.name, e)
+            out.append("")
+    return out
 
 
 def write_settings_description(session, root, assets_dir, scene_targets):
@@ -503,7 +581,8 @@ def write_settings_description(session, root, assets_dir, scene_targets):
             by_level[int(m.group(1))] = unity_path(root, target)
     desc = {"version": 1, "kind": "settings", "target": "ProjectSettings/TagManager.asset",
             "managers": settings["managers"], "scenes": [by_level[i] for i in sorted(by_level)],
-            "product": settings.get("product", ""), "company": settings.get("company", ""), "nodes": []}
+            "product": settings.get("product", ""), "company": settings.get("company", ""), "nodes": [],
+            "colorSpace": settings.get("color_space", -1) + 1}  # 0 unknown, 1 gamma, 2 linear
     path = os.path.join(assets_dir, *BUILD_DIR, "ProjectSettings.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
@@ -515,6 +594,111 @@ def write_settings_description(session, root, assets_dir, scene_targets):
     return True
 
 
+URP_PACKAGE = "com.unity.render-pipelines.universal"
+PIPELINE_PACKAGES = {"urp": URP_PACKAGE, "hdrp": "com.unity.render-pipelines.high-definition"}
+
+
+def project_pipeline(session, packages):
+    """session.render_pipeline() when the project can rebuild it (URP or HDRP, with its package in the project),
+    else None."""
+    try:
+        pipeline = session.render_pipeline() if hasattr(session, "render_pipeline") else None
+    except Exception as e:
+        log.warning("Could not read the game's render pipeline: %s", e)
+        return None
+    if pipeline is None or pipeline["kind"] not in PIPELINE_PACKAGES:
+        return None
+    if PIPELINE_PACKAGES[pipeline["kind"]] not in packages:
+        log.info("The game uses %s but its package isn't in the project: materials use the built-in shaders",
+                 pipeline["kind"].upper())
+        return None
+    return pipeline
+
+
+def write_pipeline_description(root, assets_dir, pipeline, swaps):
+    """Assets/UniView/Build/RenderPipeline.json: the game's URP / HDRP asset settings, for a new pipeline asset the builder
+    makes and puts in Graphics / Quality settings, and the materials whose shader it puts back (MaterialLibrary.swaps).
+    "stamp" changes with the contents, so a new export applies again."""
+    name = safe_filename(pipeline.get("name") or "")[:80] or pipeline["class"].rsplit(".", 1)[-1]
+    desc = {"version": 1, "kind": "pipeline", "target": f"Assets/Settings/{name}.asset", "pipeline": pipeline["kind"],
+            "props": pipeline["props"], "materials": swaps, "nodes": []}
+    desc["stamp"] = hashlib.sha1(json.dumps(desc, sort_keys=True).encode("utf-8")).hexdigest()
+    path = os.path.join(assets_dir, *BUILD_DIR, "RenderPipeline.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(desc, f, separators=(",", ":"))
+    write_meta(path, asset_guid("uniview:pipeline"))
+    write_folder_metas(assets_dir, os.path.dirname(path))
+    log.info("Render pipeline: %s asset with %d setting(s), %d material(s) to put back on the game's shaders",
+             pipeline["kind"].upper(), len(pipeline["props"]), len(swaps))
+    return True
+
+
+ADDRESSABLES_DIR = ("UniView", "Addressables")  # the builder's Addressables editor assembly, under Assets/
+# What an address most likely means when several exported assets came from one file (a model's prefab, not its mesh).
+ADDRESS_KINDS = ("prefab", "scene", "data", "texture", "audio", "material", "animation", "controller", "model")
+
+
+def _plain_stem(name):
+    return os.path.splitext(name.split(": ", 1)[-1])[0].lower()
+
+
+def addressable_entries(entries, assets, exported):
+    """session.addressables() entries -> [{"asset": project path, "address", "labels", "group"}] for the ones
+    exported. assets: the session's assets (asset.path = the build's path, often lowercase); exported:
+    {asset uid: "Assets/..." in the project}."""
+    by_path = {}
+    for a in assets:
+        if getattr(a, "path", "") and a.uid in exported:
+            by_path.setdefault(a.path.replace("\\", "/").lower(), []).append(a)
+    out = []
+    for e in entries:
+        found = by_path.get(e["path"].lower())
+        if not found:
+            continue
+        stem = _plain_stem(e["path"].rsplit("/", 1)[-1])
+        best = min(found, key=lambda a: (_plain_stem(a.name) != stem,
+                                         ADDRESS_KINDS.index(a.kind) if a.kind in ADDRESS_KINDS else 99))
+        out.append({"asset": exported[best.uid], "address": e["address"], "labels": list(e.get("labels") or ()),
+                    "group": e.get("group") or ""})
+    return out
+
+
+def write_addressables_description(session, root, assets_dir, exported):
+    """Assets/UniView/Build/Addressables.json + the editor assembly that applies it (ADDRESSABLES_CS): the game's
+    Addressables entries for the exported assets. Returns the number of entries (0: nothing written)."""
+    try:
+        entries = session.addressables() if hasattr(session, "addressables") else []
+    except Exception as e:
+        log.warning("Could not read the game's Addressables catalog: %s", e)
+        return 0
+    out = addressable_entries(entries, session.assets, exported)
+    if not out:
+        if entries:
+            log.info("Addressables: none of the catalog's %d asset(s) were exported", len(entries))
+        return 0
+    desc = {"version": 1, "kind": "addressables", "target": "Assets/AddressableAssetsData/AddressableAssetSettings.asset",
+            "entries": out, "nodes": []}
+    desc["stamp"] = hashlib.sha1(json.dumps(desc, sort_keys=True).encode("utf-8")).hexdigest()
+    path = os.path.join(assets_dir, *BUILD_DIR, "Addressables.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(desc, f, separators=(",", ":"))
+    write_meta(path, asset_guid("uniview:addressables"))
+    write_folder_metas(assets_dir, os.path.dirname(path))
+    for name, text in (("UniViewAddressables.cs", ADDRESSABLES_CS), ("UniView.Addressables.Editor.asmdef",
+                                                                    ADDRESSABLES_ASMDEF)):
+        file = os.path.join(assets_dir, *ADDRESSABLES_DIR, name)
+        os.makedirs(os.path.dirname(file), exist_ok=True)
+        with open(file, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        write_meta(file, asset_guid(f"uniview:addressables:{name}"))
+        write_folder_metas(assets_dir, os.path.dirname(file))
+    groups = {e["group"] for e in out}
+    log.info("Addressables: %d of the catalog's %d asset(s) in %d group(s)", len(out), len(entries), len(groups))
+    return len(out)
+
+
 def write_scene_descriptions(session, root, assets_dir, model_paths, texture_paths, cancelled=None, materials=None,
                              prefab_objects=None, layout=None):
     """One JSON per scene (+ its static-batch GLBs); returns (files written, failed)."""
@@ -524,6 +708,7 @@ def write_scene_descriptions(session, root, assets_dir, model_paths, texture_pat
     build_dir = os.path.join(assets_dir, *BUILD_DIR)
     builtin_meshes = {a.uid: a.name for a in session.assets
                       if a.kind in MODEL_KINDS and a.source in BUILTIN_SOURCES and a.name in BUILTIN_MESHES}
+    color_space = None
     for asset, target in plan_scenes(session.assets, assets_dir, layout):
         if cancelled is not None and cancelled():
             break
@@ -533,20 +718,32 @@ def write_scene_descriptions(session, root, assets_dir, model_paths, texture_pat
                 continue
             desc = prefab_description(nodes, target, model_paths, root, builtin_meshes, kind="scene",
                                       materials=materials, prefab_objects=prefab_objects)
+            # The scene's RenderSettings: skybox, ambient light, fog, reflections, sun.
+            desc["managers"] = [{"type": m["type"], "props": component_props(m["props"], model_paths, root, materials,
+                                                                             prefab_objects)}
+                                for m in (session.scene_managers(asset) if hasattr(session, "scene_managers") else [])]
             batches = write_static_batches(session, nodes, target[:-len(".unity")] + "_StaticBatches", texture_paths)
-            for glb, _uids in batches:
+            for glb, *_rest in batches:
                 write_meta(glb, asset_guid(f"{asset.uid}:batch:{os.path.basename(glb)}"))
                 write_folder_metas(assets_dir, os.path.dirname(glb))
-            desc["batches"] = [{"model": unity_path(root, glb),
+            desc["batches"] = [{"model": unity_path(root, glb), "lightmap": lightmap,
                                 "materials": [materials.path_for(u) for u in uids] if materials is not None else []}
-                               for glb, uids in batches]
+                               for glb, uids, lightmap in batches]
+            if color_space is None:
+                color_space = session.color_space() if hasattr(session, "color_space") else ""
+            lightmaps = write_scene_lightmaps(session, asset, target[:-len(".unity")] + "_Lightmaps",
+                                              color_space == "linear")
+            for lm in lightmaps:
+                if lm:
+                    write_folder_metas(assets_dir, os.path.dirname(lm))
+            desc["lightmaps"] = [unity_path(root, lm) if lm else "" for lm in lightmaps]
             path = os.path.join(build_dir, os.path.relpath(target, assets_dir) + ".json")
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(desc, f, separators=(",", ":"))
             write_meta(path, asset_guid(f"{asset.uid}:description"))
             write_folder_metas(assets_dir, os.path.dirname(path))
-            written += 1 + len(batches)
+            written += 1 + len(batches) + sum(1 for lm in lightmaps if lm)
         except Exception as e:
             failed += 1
             log.warning("Could not describe scene '%s': %s", asset.name, e)
@@ -562,6 +759,71 @@ def write_builder(root, assets_dir):
         f.write(BUILDER_CS)
     write_meta(path, asset_guid("uniview:builder"))
     write_folder_metas(assets_dir, os.path.dirname(path))
+    for name, text in (("UniViewLightmaps.cs", LIGHTMAPS_CS), ("UniView.Runtime.asmdef", LIGHTMAPS_ASMDEF)):
+        path = os.path.join(assets_dir, *RUNTIME_DIR, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        write_meta(path, asset_guid(f"uniview:runtime:{name}"))
+        write_folder_metas(assets_dir, os.path.dirname(path))
+
+
+def streaming_assets_dirs(game_dir):
+    """The build's StreamingAssets folder(s): <game>/*_Data/StreamingAssets, or the folder itself when the game
+    path is the *_Data folder."""
+    found = glob.glob(os.path.join(game_dir, "*_Data", "StreamingAssets"))
+    own = os.path.join(game_dir, "StreamingAssets")
+    if not found and os.path.basename(game_dir.rstrip("\\/")).lower().endswith("_data") and os.path.isdir(own):
+        found = [own]
+    return [p for p in found if os.path.isdir(p)]
+
+
+def _streaming_files(src_root):
+    """(path, relative folder) of every file under src_root except the Addressables build output (aa/)."""
+    for folder, dirs, files in os.walk(src_root):
+        if folder == src_root:
+            dirs[:] = [d for d in dirs if d.lower() != "aa"]
+        rel = os.path.relpath(folder, src_root)
+        for name in files:
+            yield os.path.join(folder, name), rel
+
+
+def streaming_assets_size(game_dir):
+    """Bytes copy_streaming_assets would copy into an empty project."""
+    total = 0
+    for src_root in streaming_assets_dirs(game_dir):
+        for src, _rel in _streaming_files(src_root):
+            with contextlib.suppress(OSError):
+                total += os.path.getsize(src)
+    return total
+
+
+def copy_streaming_assets(game_dir, assets_dir, cancelled=None):
+    """Copy the game's StreamingAssets as-is to Assets/StreamingAssets (config, video, localization the code
+    reads by path). Skipped: aa/ (Addressables build output - the editor loads from the project, a build
+    makes new bundles). Files already there with the same size and time aren't copied again.
+    Returns (files copied, bytes copied)."""
+    copied = size = 0
+    out_root = os.path.join(assets_dir, "StreamingAssets")
+    for src_root in streaming_assets_dirs(game_dir):
+        for src, rel in _streaming_files(src_root):
+            if cancelled is not None and cancelled():
+                return copied, size
+            out = os.path.join(out_root, rel)
+            dst = os.path.join(out, os.path.basename(src))
+            try:
+                st = os.stat(src)
+                with contextlib.suppress(OSError):
+                    old = os.stat(dst)
+                    if old.st_size == st.st_size and int(old.st_mtime) == int(st.st_mtime):
+                        continue
+                os.makedirs(out, exist_ok=True)
+                shutil.copy2(src, dst)
+                copied += 1
+                size += st.st_size
+            except OSError as e:
+                log.warning("Could not copy StreamingAssets file %s: %s", src, e)
+    return copied, size
 
 
 def prefab_object_map(session, root, assets_dir, layout=None):
@@ -893,13 +1155,14 @@ def find_owners(session, layout, cancelled=None, progress=None):
 
 
 def export_unity_project(session, root, version="", progress=None, cancelled=None, editor_exe=None,
-                         scripts=True, notes=None, bundle_packages=True):
+                         scripts=True, notes=None, bundle_packages=True, streaming_assets=True):
     """Write the project; returns (files written, failed, skipped). progress(done, total, text) is called
     now and then; cancelled() -> True stops early. editor_exe: the Unity.exe the project is for (its
     module list goes into the package manifest). scripts: also decompile the game's code (Mono games, needs
     ilspycmd). notes: a list that gets messages for the user (e.g. why there are no scripts).
     bundle_packages: ship the game's Unity packages and their dependencies with the project (.tgz files in
-    LocalPackages/, from Unity's registry) instead of leaving them for Unity to download."""
+    LocalPackages/, from Unity's registry) instead of leaving them for Unity to download.
+    streaming_assets: copy the game's StreamingAssets folder (can be gigabytes)."""
     assets_dir = os.path.join(root, "Assets")
     os.makedirs(assets_dir, exist_ok=True)
     write_project_settings(root, version)
@@ -928,6 +1191,7 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
     if gltf and not write_manifest(root, editor_exe, gltfast_version(version), packages, version):
         log.warning("No Unity editor to read the package list from: models are saved as OBJ")
         gltf = False
+    pipeline = project_pipeline(session, packages) if gltf else None
     layout = Layout(session.assets)
     find_owners(session, layout, cancelled, progress)
     jobs = plan(session.assets, assets_dir, "glb" if gltf else "obj", layout)
@@ -935,6 +1199,12 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
     # Models first: they tell which textures are normal maps (their .meta says so).
     jobs.sort(key=lambda job: job[0].kind not in MODEL_KINDS)
     normal_keys = set()
+    for asset, _path in jobs:  # terrain layers' normal maps aren't used by any model
+        if is_terrain(asset) and hasattr(session, "terrain_normal_maps"):
+            try:
+                normal_keys |= session.terrain_normal_maps(asset)
+            except Exception as e:
+                log.debug("Terrain layers of '%s': %s", asset.name, e)
     log.info("Exporting %d asset(s) as a Unity %s project to %s (models as %s)", len(jobs),
              version or "(unknown version)", root, "GLB" if gltf else "OBJ")
     written = failed = skipped = 0
@@ -961,7 +1231,8 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
                 files = write_asset(session, asset, path)
             for out in files:
                 guid = asset_guid(asset.uid if out == path or len(files) == 1 else f"{asset.uid}:{os.path.basename(out)}")
-                write_meta(out, guid, normal_map=asset.key in normal_keys, data=data)
+                write_meta(out, guid, normal_map=asset.key in normal_keys, data=data,
+                           cube=getattr(getattr(asset.ref, "type", None), "name", "") == "Cubemap")
                 write_folder_metas(assets_dir, os.path.dirname(out))
                 written += 1
         except Exception as e:
@@ -973,11 +1244,19 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
                 log.warning("Could not export %s '%s': %s", asset.kind, asset.name, e)
         if progress is not None and (n % 10 == 0 or n == len(jobs)):
             progress(n, len(jobs), asset.name)
+    if streaming_assets and game_dir and not (cancelled is not None and cancelled()):
+        if progress is not None:
+            progress(len(jobs), len(jobs), "StreamingAssets")
+        streamed, streamed_bytes = copy_streaming_assets(game_dir, assets_dir, cancelled)
+        if streamed:
+            log.info("Unity project: copied %d StreamingAssets file(s), %.1f MB", streamed, streamed_bytes / 1e6)
+        written += streamed
     if not (cancelled is not None and cancelled()):
         if progress is not None:
             progress(len(jobs), len(jobs), "prefabs")
         model_paths = {asset.uid: path for asset, path in jobs if os.path.isfile(path)}  # models, sounds, textures...
-        library = (MaterialLibrary(session, root, assets_dir, texture_paths, layout)
+        library = (MaterialLibrary(session, root, assets_dir, texture_paths, layout,
+                                   pipeline["kind"] if pipeline else None)
                    if hasattr(session, "material_details") else None)
         data_plan = plan_data(session.assets, assets_dir, layout)
         model_paths.update({a.uid: p for a, p in data_plan})  # links to data assets
@@ -988,6 +1267,13 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
         prefab_objects = prefab_object_map(session, root, assets_dir, layout)
         sprite_links = write_sprites_description(session, root, assets_dir, model_paths)
         prefab_objects.update(sprite_links)  # links to sprites
+        if progress is not None:
+            progress(len(jobs), len(jobs), "terrains")
+        terrains, terrain_failed, terrain_links = write_terrain_descriptions(
+            session, root, assets_dir, plan_terrains(jobs), model_paths, prefab_objects, cancelled)
+        model_paths.update(terrain_links)  # Terrain / TerrainCollider -> the TerrainData .asset
+        written += terrains
+        failed += terrain_failed
         prefabs, prefab_failed = write_prefab_descriptions(session, root, assets_dir, model_paths, cancelled, library,
                                                            prefab_objects, layout)
         if progress is not None:
@@ -1004,6 +1290,18 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
         if (prefabs or scenes) and write_settings_description(session, root, assets_dir,
                                                                 plan_scenes(session.assets, assets_dir, layout)):
             written += 1
+        if pipeline and write_pipeline_description(root, assets_dir, pipeline, library.swaps if library else []):
+            written += 1
+        if (prefabs or scenes) and version_tuple(version) >= (2019, 3):  # Addressables' editor needs 2019.3+
+            exported = {uid: unity_path(root, p) for uid, p in model_paths.items()}
+            exported.update({a.uid: unity_path(root, p) for a in session.assets if a.key in texture_paths
+                             for p in [texture_paths[a.key]]})
+            exported.update({a.uid: unity_path(root, p) for a, p in plan_prefabs(session.assets, assets_dir, layout)
+                             + plan_scenes(session.assets, assets_dir, layout)})  # (the builder makes them)
+            if library:
+                exported.update({uid: p for uid, p in library.paths.items() if p})
+            if write_addressables_description(session, root, assets_dir, exported):
+                written += 1
         written += prefabs + scenes + (library.written if library else 0)
         if (scripts and hasattr(session, "script_assemblies") and (prefabs or scenes)
                 and not (cancelled is not None and cancelled())):

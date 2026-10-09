@@ -90,7 +90,7 @@ from uniview.ui.search_dialog import ContentSearchDialog
 from uniview.ui.versions_dialog import VersionsDialog
 from uniview.ui.ui_prefab import has_thumbnail, ui_picture, uid_map
 from uniview.ui.tools_dialog import ToolsDialog
-from uniview.ui.unity_export import ask_project_folder, choose_editor_version, run_export
+from uniview.ui.unity_export import ask_project_folder, ask_streaming_assets, choose_editor_version, run_export
 from uniview.unity_project import installed_editors, target_version, unity_version
 from uniview.util import blank_icon, fmt_size, norm_path, open_path, pil_to_pixmap, safe_filename
 from uniview.workers import Loader, StatsWorker, ThumbnailWorker, meshdata_to_polydata
@@ -418,7 +418,10 @@ class MainWindow(QMainWindow):
             version = choose_editor_version(self, game_version, version)
             if not version:
                 return
-        run_export(self, session, root, version, editors.get(version), game_version)
+        streaming = ask_streaming_assets(self, path if os.path.isdir(path) else os.path.dirname(path), root)
+        if streaming is None:
+            return
+        run_export(self, session, root, version, editors.get(version), game_version, streaming)
 
     def edit_current_notes(self):
         project = self.current_project()

@@ -49,3 +49,12 @@ def test_component_gizmos_by_type():
 def test_join_offsets_segments():
     pts, segs = join(box_lines((0, 0, 0), (1, 1, 1)), box_lines((5, 0, 0), (1, 1, 1)))
     assert len(pts) == 16 and segs.min() == 0 and segs.max() == 15
+
+
+def test_lod_hidden_keeps_renderers_shared_with_the_shown_level():
+    from engines.unity_scene import lod_hidden
+    levels = [{"a", "shared"}, {"b", "shared"}, {"c"}]
+    assert lod_hidden(levels, 0) == {"b", "c"}
+    assert lod_hidden(levels, 1) == {"a", "c"}
+    assert lod_hidden(levels, 2) == {"a", "b", "shared"}
+    assert lod_hidden([{"only"}], 0) == set()

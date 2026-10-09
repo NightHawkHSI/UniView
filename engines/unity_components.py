@@ -8,16 +8,15 @@ before their elements). References become either another object of the same pref
 asset the exporter wrote.
 """
 
-# Handled elsewhere (the tree itself, renderers, terrains) or needing the game's code (scripts).
-SKIP_COMPONENTS = {"Transform", "RectTransform", "MeshFilter", "MeshRenderer", "SkinnedMeshRenderer",
-                   "Terrain", "TerrainCollider"}
+# Handled elsewhere (the tree itself, renderers) or needing the game's code (scripts).
+SKIP_COMPONENTS = {"Transform", "RectTransform", "MeshFilter", "MeshRenderer", "SkinnedMeshRenderer"}
 # Bookkeeping fields every object has; they describe the file, not the component.
 SKIP_FIELDS = {"m_GameObject", "m_ObjectHideFlags", "m_CorrespondingSourceObject", "m_PrefabInstance",
                "m_PrefabAsset", "m_PrefabParentObject", "m_PrefabInternal", "m_Script", "m_EditorHideFlags",
                "m_EditorClassIdentifier", "m_Name"}
 MAX_ENTRIES = 50_000  # per component (a huge ParticleSystem is ~5k)
 ASSET_KINDS = {"Mesh": "mesh", "Material": "material", "Texture2D": "file", "AudioClip": "file", "Font": "file",
-               "VideoClip": "file", "TextAsset": "file"}
+               "VideoClip": "file", "TextAsset": "file", "Cubemap": "file"}
 
 
 def flatten(tree, resolve):
@@ -67,3 +66,14 @@ def flatten(tree, resolve):
 
     walk(tree, "", 0)
     return out
+
+
+def baked_probe_as_custom(props):
+    """A baked ReflectionProbe's cubemap lives in the game's lighting data, which an editor project doesn't have:
+    turn it into a Custom probe (m_Mode 2) showing that cubemap, until the scene is baked again."""
+    mode = next((e for e in props if e["p"] == "m_Mode"), None)
+    baked = next((e for e in props if e["p"] == "m_BakedTexture" and e["t"] == "ref"), None)
+    if mode is None or mode.get("v") != 0 or baked is None:
+        return props
+    out = [({**e, "v": 2} if e is mode else e) for e in props if e["p"] not in ("m_BakedTexture", "m_CustomBakedTexture")]
+    return out + [{**baked, "p": "m_CustomBakedTexture"}]

@@ -16,6 +16,7 @@ Older catalog.json files keep it base64-packed (m_KeyDataString / m_BucketDataSt
 
 import base64
 import json
+import re
 import struct
 
 BIN_MAGIC = 0x0DE38942
@@ -108,10 +109,127 @@ def json_entries(doc):
     return out
 
 
-def catalog_entries(path):
-    """{key: [internal ids]} of a catalog.bin / catalog.json file ({} if it can't be read)."""
+def json_locations(doc):
+    """[(internal id, primary key (the address), provider, [internal ids of its dependencies (bundles)])] of a
+    catalog.json - one per location."""
+    ids = doc.get("m_InternalIds") or []
+    prefixes = doc.get("m_InternalIdPrefixes") or []
+    if prefixes:  # newer catalogs shorten ids to "<prefix index>#<rest>"
+        full = []
+        for i in ids:
+            head, sep, rest = i.partition("#")
+            full.append(prefixes[int(head)] + rest if sep and head.isdigit() and int(head) < len(prefixes) else i)
+        ids = full
+    providers = doc.get("m_ProviderIds") or []
+    keys_raw = base64.b64decode(doc.get("m_KeyDataString") or "")
+    buckets = base64.b64decode(doc.get("m_BucketDataString") or "")
+    entries = base64.b64decode(doc.get("m_EntryDataString") or "")
+    entry_count = struct.unpack_from("<i", entries, 0)[0] if len(entries) >= 4 else 0
+    rows = [struct.unpack_from("<7i", entries, 4 + 28 * e) for e in range(entry_count)]
+    key_offsets, key_targets = [], []
+    pos, count = 4, (struct.unpack_from("<i", buckets, 0)[0] if len(buckets) >= 4 else 0)
+    for _ in range(count):
+        data_offset, n = struct.unpack_from("<ii", buckets, pos)
+        key_offsets.append(data_offset)
+        key_targets.append(struct.unpack_from(f"<{n}i", buckets, pos + 8))
+        pos += 8 + 4 * n
+
+    def key_text(index):
+        if not 0 <= index < len(key_offsets):
+            return ""
+        p = key_offsets[index]
+        if p >= len(keys_raw) or keys_raw[p] not in (0, 1):
+            return ""
+        n = struct.unpack_from("<i", keys_raw, p + 1)[0]
+        return keys_raw[p + 5:p + 5 + n].decode("ascii" if keys_raw[p] == 0 else "utf-16-le", "replace")
+
+    def internal(entry):
+        return ids[rows[entry][0]] if 0 <= entry < len(rows) and 0 <= rows[entry][0] < len(ids) else ""
+
+    out = []
+    for e, (internal_id, provider, dep_key, _hash, _data, primary, _type) in enumerate(rows):
+        deps = [internal(t) for t in key_targets[dep_key]] if 0 <= dep_key < len(key_targets) else []
+        out.append((internal(e), key_text(primary),
+                    providers[provider] if 0 <= provider < len(providers) else "", [d for d in deps if d]))
+    return out
+
+
+def binary_locations(cat):
+    """json_locations() for a BinaryCatalog: location = (primary key, internal id, provider, dependency set, ...)."""
+    out, seen = [], set()
+    size = cat._u32(cat.keys_offset - 4)
+
+    def location(loc):
+        primary, internal, provider, dep_set = struct.unpack_from("<4I", cat.d, loc)
+        return cat.text(primary, "/"), cat.text(internal, "/"), cat.text(provider, "."), dep_set
+
+    for i in range(size // 8):
+        try:
+            _key, loc_set = struct.unpack_from("<II", cat.d, cat.keys_offset + 8 * i)
+            n = cat._u32(loc_set - 4) // 4
+            for loc in struct.unpack_from(f"<{min(n, 256)}I", cat.d, loc_set):
+                if loc in seen:
+                    continue
+                seen.add(loc)
+                primary, internal, provider, dep_set = location(loc)
+                deps = []
+                if dep_set != NONE and 4 <= dep_set < len(cat.d):
+                    m = cat._u32(dep_set - 4) // 4
+                    deps = [location(d)[1] for d in struct.unpack_from(f"<{min(m, 256)}I", cat.d, dep_set)]
+                out.append((internal, primary, provider, [d for d in deps if d]))
+        except (struct.error, IndexError):
+            continue
+    return out
+
+
+def _read(path):
     with open(path, "rb") as f:
         data = f.read()
     if path.lower().endswith(".bin"):
-        return BinaryCatalog(data).entries()
-    return json_entries(json.loads(data.decode("utf-8-sig")))
+        return BinaryCatalog(data)
+    return json.loads(data.decode("utf-8-sig"))
+
+
+def catalog_entries(path):
+    """{key: [internal ids]} of a catalog.bin / catalog.json file ({} if it can't be read)."""
+    cat = _read(path)
+    return cat.entries() if isinstance(cat, BinaryCatalog) else json_entries(cat)
+
+
+def catalog_locations(path):
+    """json_locations() of a catalog.bin / catalog.json file."""
+    cat = _read(path)
+    return binary_locations(cat) if isinstance(cat, BinaryCatalog) else json_locations(cat)
+
+
+BUNDLE_GROUP = re.compile(r"^(.+?)_(?:assets|scenes)_.*\.bundle$", re.I)
+GUID_KEY = re.compile(r"^[0-9a-f]{32}$")
+
+
+def bundle_group(internal_id):
+    """The Addressables group a bundle was built from ('initialmaps' for .../initialmaps_assets_all.bundle), or ''."""
+    m = BUNDLE_GROUP.match(internal_id.replace("\\", "/").rsplit("/", 1)[-1])
+    return m.group(1) if m else ""
+
+
+def addressable_assets(locations, entries):
+    """[{"path", "address", "guid", "labels", "group"}] for the project assets (Assets/...) loaded from bundles,
+    one per path: what an Addressables group entry needs. locations: catalog_locations(); entries: catalog_entries()
+    (every key - address, GUID, labels - pointing at each path)."""
+    keys = {}
+    for key, ids in entries.items():
+        for i in ids:
+            keys.setdefault(i, []).append(key)
+    out, seen = [], set()
+    for internal, address, provider, deps in locations:
+        if (not provider.endswith("BundledAssetProvider") or internal in seen
+                or not internal.replace("\\", "/").lower().startswith("assets/")):
+            continue
+        seen.add(internal)
+        mine = list(dict.fromkeys(keys.get(internal, [])))
+        guid = next((k for k in mine if GUID_KEY.match(k)), "")
+        labels = [k for k in mine if k not in (address, guid, internal)]
+        group = next((g for g in map(bundle_group, deps) if g and not g.endswith("unitybuiltinshaders")), "")
+        out.append({"path": internal.replace("\\", "/"), "address": address or internal, "guid": guid,
+                    "labels": labels, "group": group})
+    return out

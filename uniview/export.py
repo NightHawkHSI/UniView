@@ -216,6 +216,11 @@ def write_glb(session, md, materials, path, rig=None, animation=None, image_uri=
         uv = next(iter(md.uvs.values())).copy()
         uv[:, 1] = 1.0 - uv[:, 1]  # glTF's UV origin is top-left
         attributes["TEXCOORD_0"] = add_accessor(uv, "VEC2")
+        second = md.uvs.get("UV1") if next(iter(md.uvs)) != "UV1" else None
+        if second is not None and len(second) == count:  # lightmap UVs (Unity's uv2)
+            second = np.asarray(second, np.float32)[:, :2].copy()
+            second[:, 1] = 1.0 - second[:, 1]
+            attributes["TEXCOORD_1"] = add_accessor(second, "VEC2")
     if md.colors is not None and len(md.colors) == count:
         attributes["COLOR_0"] = add_accessor(np.clip(md.colors, 0, 1).astype(np.float32), "VEC4")
     if rig is not None:

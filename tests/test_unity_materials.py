@@ -148,3 +148,85 @@ def test_export_surface_uses_shader_render():
     assert surface(d) == "opaque"
     assert surface({**d, "shader_render": (3000, {"RenderType": "Transparent"}, (1, 10))}) == "transparent"
     assert surface({**d, "queue": 2000, "shader_render": (3000, {"RenderType": "Transparent"}, None)}) == "opaque"
+
+
+def cube(name):
+    return SimpleNamespace(uid=f"tex:{name}", key=name, name=name, ref=SimpleNamespace(type=SimpleNamespace(name="Cubemap")))
+
+
+def test_sky_shaders():
+    assert um.pick_shader(details("Skybox/Procedural")) == ("Skybox/Procedural", True)  # Unity's own: kept
+    assert um.pick_shader(details("Nature/Terrain/Standard")) == ("Nature/Terrain/Standard", True)
+    m = um.convert(details("Funly/Sky Studio/Skybox", textures=[("_MainTex", tex("t"), (1, 1), (0, 0)),
+                                                                ("_StarsCube", cube("c"), (1, 1), (0, 0))],
+                           floats={"_Exposure": 0.8}, colors={"_Tint": (1, 0, 0, 1)}), guid)
+    assert m["shader"] == "Skybox/Cubemap" and m["shader_id"] == 103
+    assert m["textures"]["_Tex"] == ("a" * 32, (1, 1), (0, 0))
+    assert m["floats"]["_Exposure"] == 0.8 and m["colors"]["_Tint"] == (1, 0, 0, 1)
+    m = um.convert(details("Custom/Gradient Sky", colors={"_TopColor": (0, 0, 1, 1), "_BottomColor": (0, 1, 0, 1)}),
+                   guid)
+    assert m["shader_id"] == 106 and m["colors"] == {"_SkyTint": (0, 0, 1, 1), "_GroundColor": (0, 1, 0, 1)}
+
+
+def test_convert_urp_keeps_game_shader_and_props():
+    d = details("Universal Render Pipeline/Lit", floats={"_Surface": 1, "_Smoothness": 0.7, "_QueueOffset": 2},
+                textures=[("_BaseMap", tex("albedo"), (2, 2), (0.5, 0)), ("_BumpMap", tex("n"), (1, 1), (0, 0))],
+                colors={"_BaseColor": (1, 0.5, 0, 0.4)}, keywords=["_NORMALMAP", "_SURFACE_TYPE_TRANSPARENT"],
+                queue=3002, tags={"RenderType": "Transparent", "Custom": "x"})
+    m = um.convert(d, guid, pipeline="urp")
+    assert m["shader_id"] == 46  # the .mat still opens on Standard; the builder puts the URP shader back
+    assert m["game_shader"] == "Universal Render Pipeline/Lit" and m["game_queue"] == 3002
+    assert m["game_keywords"] == ["_NORMALMAP", "_SURFACE_TYPE_TRANSPARENT"]
+    assert m["textures"]["_BaseMap"] == ("a" * 32, (2, 2), (0.5, 0)) and "_MainTex" in m["textures"]
+    assert m["floats"]["_QueueOffset"] == 2 and m["floats"]["_Smoothness"] == 0.7 and m["floats"]["_Mode"] == 2
+    assert m["colors"]["_BaseColor"] == (1, 0.5, 0, 0.4) and m["tags"]["Custom"] == "x"
+    assert set(m["lit_keywords"]) == {"_NORMALMAP", "_SURFACE_TYPE_TRANSPARENT"} and m["lit_queue"] == 3000
+
+
+def test_convert_urp_fallback_lit_names():
+    d = details("Shader Graphs/Rock", textures=[("_Albedo", tex("a"), (1, 1), (0, 0)),
+                                                ("_MetallicGlossMap", tex("m"), (1, 1), (0, 0))],
+                colors={"_Tint": (0.5, 0.5, 0.5, 1)}, floats={"_Glossiness": 0.4})
+    m = um.convert(d, guid, pipeline="urp")
+    assert m["textures"]["_BaseMap"] == m["textures"]["_MainTex"] == m["textures"]["_Albedo"]
+    assert m["colors"]["_BaseColor"] == (0.5, 0.5, 0.5, 1) and m["floats"]["_Smoothness"] == 0.4
+    assert m["floats"]["_Surface"] == 0 and m["floats"]["_WorkflowMode"] == 1
+    assert "_METALLICSPECGLOSSMAP" in m["lit_keywords"] and "_METALLICGLOSSMAP" not in m["lit_keywords"]
+
+
+def test_convert_urp_unlit_builtin_has_no_lit_fallback():
+    m = um.convert(details("Universal Render Pipeline/Particles/Unlit", textures=[("_BaseMap", tex("a"), (1, 1),
+                                                                                    (0, 0))]), guid, pipeline="urp")
+    assert m["shader"].startswith("Legacy Shaders/Particles") and "lit_keywords" not in m
+    assert m["game_shader"] == "Universal Render Pipeline/Particles/Unlit"
+
+
+def test_convert_without_pipeline_unchanged():
+    m = um.convert(details("Universal Render Pipeline/Lit"), guid)
+    assert "game_shader" not in m and "_BaseColor" not in m["colors"]
+
+
+def test_convert_hdrp_fallback_lit_names():
+    d = details("Custom/Metal", textures=[("_MainTex", tex("a"), (1, 1), (0, 0)), ("_BumpMap", tex("n"), (1, 1), (0, 0)),
+                                         ("_MetallicGlossMap", tex("m"), (1, 1), (0, 0)),
+                                         ("_EmissionMap", tex("e"), (1, 1), (0, 0))],
+                colors={"_Color": (1, 0, 0, 1), "_EmissionColor": (2, 2, 2, 1)}, floats={"_Glossiness": 0.6},
+                keywords=["_ALPHATEST_ON"], queue=2450)
+    m = um.convert(d, guid, pipeline="hdrp")
+    t, f = m["textures"], m["floats"]
+    assert t["_BaseColorMap"] == t["_MainTex"] and t["_NormalMap"] == t["_BumpMap"] and "_MaskMap" in t
+    assert t["_EmissiveColorMap"] == t["_EmissionMap"] and m["colors"]["_EmissiveColor"] == (2, 2, 2, 1)
+    assert m["colors"]["_BaseColor"] == (1, 0, 0, 1) and f["_Smoothness"] == 0.6
+    assert f["_AORemapMin"] == f["_AORemapMax"] == 1.0 and f["_SurfaceType"] == 0
+    kw = m["lit_keywords"]
+    assert {"_NORMALMAP", "_NORMALMAP_TANGENT_SPACE", "_MASKMAP", "_EMISSIVE_COLOR_MAP"} <= set(kw)
+    assert "_METALLICGLOSSMAP" not in kw and "_EMISSION" not in kw
+
+
+def test_convert_hdrp_keeps_game_mask_map_remaps():
+    d = details("HDRP/Lit", textures=[("_BaseColorMap", tex("a"), (1, 1), (0, 0)), ("_MaskMap", tex("m"), (1, 1),
+                                                                                       (0, 0))],
+                floats={"_AORemapMin": 0.2, "_SurfaceType": 1}, keywords=["_MASKMAP"])
+    m = um.convert(d, guid, pipeline="hdrp")
+    assert m["floats"]["_AORemapMin"] == 0.2 and m["floats"]["_SurfaceType"] == 1
+    assert m["game_shader"] == "HDRP/Lit" and m["game_keywords"] == ["_MASKMAP"]

@@ -2,6 +2,7 @@
 
 import os
 import re
+import shutil
 import threading
 import time
 import webbrowser
@@ -10,7 +11,7 @@ from PySide6.QtCore import QEventLoop, QObject, Qt, Signal
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
 
 from uniview.constants import log
-from uniview.unity_project import export_unity_project, version_tuple
+from uniview.unity_project import export_unity_project, streaming_assets_size, version_tuple
 from uniview.util import open_path, safe_filename
 
 
@@ -60,13 +61,46 @@ def choose_editor_version(parent, game_version, fallback):
     return fallback if box.clickedButton() is use else None
 
 
+STREAMING_ASK_BYTES = 200_000_000  # ask before copying a StreamingAssets folder bigger than this
+
+
+def ask_streaming_assets(parent, game_dir, root):
+    """Copy the game's StreamingAssets into the project? True/False, None = cancel the export.
+    Small folders are copied without asking."""
+    size = streaming_assets_size(game_dir)
+    if size < STREAMING_ASK_BYTES:
+        return True
+    probe = root
+    while probe and not os.path.isdir(probe) and os.path.dirname(probe) != probe:
+        probe = os.path.dirname(probe)
+    try:
+        free = shutil.disk_usage(probe).free
+    except OSError:
+        free = None
+    fits = free is None or free > size * 1.1
+    box = QMessageBox(parent)
+    box.setWindowTitle("Export as Unity project")
+    box.setIcon(QMessageBox.Question if fits else QMessageBox.Warning)
+    box.setText(f"Copy the game's StreamingAssets folder ({size / 1e9:.1f} GB)?")
+    box.setInformativeText(
+        "The game's code reads videos, music, config and extra asset bundles from it by path, so scripts "
+        "need it to run in the editor. Not needed just to look at the models and scenes."
+        + (f"\n\nOnly {free / 1e9:.1f} GB free on that drive." if free is not None else ""))
+    copy = box.addButton("Copy it", QMessageBox.AcceptRole)
+    skip = box.addButton("Leave it out", QMessageBox.AcceptRole)
+    box.addButton(QMessageBox.Cancel)
+    box.setDefaultButton(copy if fits else skip)
+    box.exec()
+    return True if box.clickedButton() is copy else False if box.clickedButton() is skip else None
+
+
 class _Relay(QObject):
     """Carries the worker thread's progress and result to the UI thread."""
     progress = Signal(int, int, str)
     finished = Signal(object, object)  # (written, failed, skipped) or None, exception or None
 
 
-def run_export(parent, session, root, version, editor_exe=None, game_version=""):
+def run_export(parent, session, root, version, editor_exe=None, game_version="", streaming_assets=True):
     """Export with a cancellable progress dialog, then offer to open the folder.
 
     The export runs on a worker thread (decompiling one assembly can take a minute), so the window
@@ -109,7 +143,8 @@ def run_export(parent, session, root, version, editor_exe=None, game_version="")
 
     def work():
         try:
-            result = export_unity_project(session, root, version, progress, stop.is_set, editor_exe, notes=notes)
+            result = export_unity_project(session, root, version, progress, stop.is_set, editor_exe, notes=notes,
+                                          streaming_assets=streaming_assets)
             relay.finished.emit(result, None)
         except Exception as e:
             log.exception("Exporting the Unity project failed")

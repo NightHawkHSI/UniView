@@ -31,6 +31,12 @@ BUILTIN_SHADERS = {
     "Particles/Standard Unlit": 211,
     "Sprites/Default": 10753,
     "UI/Default": 10770,
+    "Skybox/Procedural": 106,
+    "Skybox/Cubemap": 103,
+    "Skybox/6 Sided": 104,
+    "Skybox/Panoramic": 108,
+    "Mobile/Skybox": 10700,
+    "Nature/Terrain/Standard": 10623,
 }
 
 ALBEDO = ("_MainTex", "_BaseMap", "_BaseColorMap", "_Albedo", "_BaseColorTexture", "_Diffuse", "_DiffuseMap")
@@ -66,6 +72,8 @@ def pick_shader(details):
         return name, True
     low = name.lower()
     floats = details.get("floats") or {}
+    if re.search(r"\bsky(box|dome|sphere)?\b", low):  # a custom sky shader
+        return ("Skybox/Cubemap" if _cube(details) else "Skybox/Procedural"), False
     additive = "additive" in low or (floats.get("_SrcBlend") in (1, 5) and floats.get("_DstBlend") == 1)
     if "particle" in low or additive:
         return ("Legacy Shaders/Particles/Additive" if additive else "Legacy Shaders/Particles/Alpha Blended"), False
@@ -103,11 +111,98 @@ def channels(details, textures):
     return found, assets
 
 
-def convert(details, texture_guid, make_texture=None):
+def _cube(details):
+    """(property, (guid...)) key of the material's first cubemap texture, or None."""
+    for prop, asset, *_rest in details.get("textures") or ():
+        if getattr(getattr(getattr(asset, "ref", None), "type", None), "name", "") == "Cubemap":
+            return prop
+    return None
+
+
+def convert(details, texture_guid, make_texture=None, pipeline=None):
     """Unity material settings for a game material: {"name", "shader_id", "textures": {prop: (guid, scale, offset)},
     "floats", "colors", "keywords", "queue", "tags"}. texture_guid(texture Asset) -> guid or None (not exported).
     make_texture(recipe, [(pbr channel, texture Asset)]) -> guid or None: a texture repacked for Unity's layout
-    ("metal_gloss": R metallic + A smoothness, "ao": occlusion), for maps the Standard shader can't read as they are."""
+    ("metal_gloss": R metallic + A smoothness, "ao": occlusion), for maps the Standard shader can't read as they are.
+    pipeline: "urp" / "hdrp" for a project on a scriptable render pipeline - see for_pipeline()."""
+    out = _convert(details, texture_guid, make_texture)
+    if pipeline in LIT_NAMES:
+        for_pipeline(out, details, texture_guid, pipeline)
+    return out
+
+
+# Standard -> the pipelines' Lit shaders: property names (the others are the same) and keywords.
+LIT_NAMES = {
+    "urp": {"_MainTex": "_BaseMap", "_Color": "_BaseColor", "_Glossiness": "_Smoothness"},
+    "hdrp": {"_MainTex": "_BaseColorMap", "_Color": "_BaseColor", "_Glossiness": "_Smoothness",
+             "_BumpMap": "_NormalMap", "_BumpScale": "_NormalScale", "_MetallicGlossMap": "_MaskMap",
+             "_EmissionMap": "_EmissiveColorMap", "_EmissionColor": "_EmissiveColor", "_Cutoff": "_AlphaCutoff"},
+}
+LIT_KEYWORDS = {
+    "urp": {"_METALLICGLOSSMAP": ["_METALLICSPECGLOSSMAP"], "_SPECGLOSSMAP": ["_METALLICSPECGLOSSMAP", "_SPECULAR_SETUP"],
+            "_ALPHABLEND_ON": ["_SURFACE_TYPE_TRANSPARENT"]},
+    "hdrp": {"_NORMALMAP": ["_NORMALMAP", "_NORMALMAP_TANGENT_SPACE"], "_METALLICGLOSSMAP": ["_MASKMAP"],
+             "_SPECGLOSSMAP": [], "_PARALLAXMAP": [], "_DETAIL_MULX2": [], "_EMISSION": [],
+             "_ALPHABLEND_ON": ["_SURFACE_TYPE_TRANSPARENT", "_BLENDMODE_ALPHA"]},
+}
+
+
+def _lit_floats(f, keywords, textures, pipeline):
+    """The pipeline Lit shader's own switches for a Standard material's surface type and maps."""
+    transparent, cutout = "_ALPHABLEND_ON" in keywords, "_ALPHATEST_ON" in keywords
+    if pipeline == "urp":
+        f.setdefault("_Surface", 1 if transparent else 0)
+        f.setdefault("_AlphaClip", 1 if cutout else 0)
+        f.setdefault("_WorkflowMode", 0 if "_SPECGLOSSMAP" in keywords else 1)
+        return ["_OCCLUSIONMAP"] if "_OcclusionMap" in textures else []
+    f.setdefault("_SurfaceType", 1 if transparent else 0)
+    f.setdefault("_BlendMode", 0)
+    f.setdefault("_AlphaCutoffEnable", 1 if cutout else 0)
+    if "_MaskMap" in textures:  # Standard's map: R metallic, A smoothness; its G isn't occlusion
+        f.setdefault("_AORemapMin", 1.0)
+        f.setdefault("_AORemapMax", 1.0)
+        f.setdefault("_MetallicRemapMin", 0.0)
+        f.setdefault("_MetallicRemapMax", 1.0)
+        f.setdefault("_SmoothnessRemapMin", 0.0)
+        f.setdefault("_SmoothnessRemapMax", f.get("_GlossMapScale", 1.0))
+    if "_EmissiveColor" in f or "_EmissiveColorMap" in textures:
+        f.setdefault("_UseEmissiveIntensity", 0)
+    return ["_EMISSIVE_COLOR_MAP"] if "_EmissiveColorMap" in textures else []
+
+
+def for_pipeline(out, details, texture_guid, pipeline="urp"):
+    """Make convert()'s result fit a URP / HDRP project: the game's own textures, floats and colors are kept beside
+    the built-in shader's, so the builder can put the game's shader back ("game_shader", "game_keywords",
+    "game_queue") when the project has it (the pipeline's own shaders), and a Standard material also gets the
+    pipeline Lit shader's property names, with "lit_keywords" / "lit_queue" for when it doesn't (Standard draws
+    pink on a scriptable pipeline; unlit built-ins draw fine)."""
+    game = {}
+    for prop, asset, scale, offset in details.get("textures") or ():
+        guid = texture_guid(asset)
+        if guid:
+            game[prop] = (guid, scale, offset)
+    t, f, c = out["textures"], out["floats"], out["colors"]
+    if out["shader"].startswith("Standard"):
+        for std, lit in LIT_NAMES[pipeline].items():
+            for mine in (t, f, c):
+                if std in mine:
+                    mine.setdefault(lit, mine[std])
+        kw = []
+        for k in out["keywords"]:
+            kw += LIT_KEYWORDS[pipeline].get(k, [k])
+        kw += _lit_floats(f, out["keywords"], t, pipeline)
+        out["lit_keywords"], out["lit_queue"] = list(dict.fromkeys(kw)), out["queue"]
+    out["textures"] = {**t, **game}
+    out["floats"] = {**f, **(details.get("floats") or {})}
+    out["colors"] = {**c, **(details.get("colors") or {})}
+    out["tags"] = {**out["tags"], **(details.get("tags") or {})}
+    out["game_shader"] = details.get("shader") or ""
+    out["game_keywords"] = list(details.get("keywords") or ())
+    out["game_queue"] = details.get("queue", -1)
+    return out
+
+
+def _convert(details, texture_guid, make_texture):
     shader, copy_all = pick_shader(details)
     textures = {}
     for prop, asset, scale, offset in details.get("textures") or ():
@@ -203,6 +298,21 @@ def convert(details, texture_guid, make_texture=None):
         f["_Glossiness"] = gloss if gloss is not None else 0.2
         f["_Cutoff"] = floats.get("_Cutoff", floats.get("_AlphaClipThreshold", 0.5))
         c["_Color"] = color or (1.0, 1.0, 1.0, 1.0)
+    elif shader == "Skybox/Cubemap":
+        cube = textures.get(_cube(details))
+        if cube:
+            t["_Tex"] = cube
+        c["_Tint"] = color or (0.5, 0.5, 0.5, 0.5)
+        f["_Exposure"] = floats.get("_Exposure", 1.0)
+        f["_Rotation"] = floats.get("_Rotation", 0.0)
+    elif shader == "Skybox/Procedural":
+        sky = _first(colors, ("_SkyTint", "_SkyColor", "_TopColor", "_UpperColor", "_Color1", "_HorizonColor"))
+        ground = _first(colors, ("_GroundColor", "_BottomColor", "_LowerColor", "_Color3"))
+        if sky:
+            c["_SkyTint"] = sky
+        if ground:
+            c["_GroundColor"] = ground
+        f["_Exposure"] = floats.get("_Exposure", 1.3)
     elif shader.startswith("Legacy Shaders/Particles"):
         c["_TintColor"] = colors.get("_TintColor") or (tuple(color[:3]) + (color[3] * 0.5,) if color else (0.5, 0.5, 0.5, 0.5))
     else:  # Unlit

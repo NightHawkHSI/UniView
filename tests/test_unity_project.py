@@ -5,9 +5,11 @@ import os
 import struct
 import threading
 
+import numpy as np
 from PIL import Image
 
 from engines.sdk import ALBEDO, NORMAL, Asset, Material, MeshData, TextureRef
+from tests.test_glb import accessor, parse_glb
 from uniview import unity_project as up
 
 
@@ -569,3 +571,190 @@ def test_identical_components_share_one_prop_list():
     assert set(desc["nodes"][0]["components"][0]) <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_comp))
     cs_list = re.search(r"public class PropList\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
     assert set(desc["shared"][0]) <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_list))
+
+
+def test_copy_streaming_assets(tmp_path):
+    sa = tmp_path / "game" / "Game_Data" / "StreamingAssets"
+    (sa / "Config").mkdir(parents=True)
+    (sa / "aa" / "StandaloneWindows64").mkdir(parents=True)
+    (sa / "Config" / "settings.json").write_text("{}")
+    (sa / "intro.mp4").write_bytes(b"x" * 10)
+    (sa / "aa" / "catalog.json").write_text("{}")
+    (sa / "aa" / "StandaloneWindows64" / "a.bundle").write_bytes(b"b")
+    assets = tmp_path / "proj" / "Assets"
+    assert up.copy_streaming_assets(str(tmp_path / "game"), str(assets)) == (2, 12)
+    out = assets / "StreamingAssets"
+    assert (out / "Config" / "settings.json").read_text() == "{}"
+    assert (out / "intro.mp4").stat().st_size == 10
+    assert not (out / "aa").exists()  # Addressables build output stays behind
+    assert up.copy_streaming_assets(str(tmp_path / "game"), str(assets)) == (0, 0)  # unchanged: not copied again
+    # The game path can be the *_Data folder itself; no StreamingAssets at all copies nothing.
+    assert up.streaming_assets_dirs(str(tmp_path / "game" / "Game_Data")) == [str(sa)]
+    assert up.copy_streaming_assets(str(tmp_path / "proj"), str(assets)) == (0, 0)
+
+
+def test_cubemap_meta():
+    text = up.meta_text("a" * 32, 0, cube=True)
+    assert "textureShape: 2" in text and "generateCubemap: 6" in text and "serializedVersion: 4" in text
+    assert "textureShape" not in up.meta_text("a" * 32, 0)
+
+
+class LitSession(SceneSession):
+    """The scene with baked lighting: Wall and Floor in different lightmaps, a skybox and fog."""
+
+    def mesh(self, a):
+        md = super().mesh(a)
+        if a.uid == "combined":
+            md.uvs = {"UV0": np.zeros((9, 2), np.float32), "UV1": np.full((9, 2), 1.0, np.float32)}
+        return md
+
+    def hierarchy(self, asset):
+        nodes = super().hierarchy(asset)
+        nodes[1]["batch"]["lightmap"] = [0, 0.5, 0.5, 0.0, 0.0]
+        nodes[2]["batch"]["lightmap"] = [1, 0.25, 0.25, 0.5, 0.5]
+        return nodes
+
+    def scene_lightmaps(self, asset):
+        return [(Asset("texture", "Lightmap-0_comp_light", "lm0", uid="lm0"), "dldr"), (None, "")]
+
+    def image(self, asset):
+        return Image.new("RGBA", (4, 4), (128, 64, 0, 255))
+
+    def color_space(self):
+        return "gamma"
+
+    def scene_managers(self, asset):
+        return [{"type": "RenderSettings", "props": [{"p": "m_Fog", "t": "b", "v": 1},
+                                                     {"p": "m_Sun", "t": "ref", "node": 4, "cls": "Light"}]}]
+
+
+def test_export_scene_lightmaps_and_render_settings(tmp_path):
+    from uniview.unity_builder import BUILDER_CS
+    import re
+    combined = Asset("model", "Combined Mesh (root: scene) 1", "cm", uid="combined", source="level0")
+    scene = Asset("scene", "Scene: Main", ("scene", 1), uid="scene:level0", source="level0")
+    root = tmp_path / "proj"
+    _w, failed, _s = up.export_unity_project(LitSession([combined, scene]), str(root), "6000.5.4f1",
+                                             editor_exe=fake_editor(tmp_path))
+    assert failed == 0
+    desc = json.load(open(root / "Assets" / "UniView" / "Build" / "Scenes" / "Main.unity.json"))
+    assert desc["managers"] == [{"type": "RenderSettings", "props": [{"p": "m_Fog", "t": "b", "v": 1},
+                                                                     {"p": "m_Sun", "t": "n", "n": 4, "s": "Light"}]}]
+    assert desc["lightmaps"] == ["Assets/Scenes/Main_Lightmaps/Lightmap-0_comp_light.exr", ""]
+    exr = root / desc["lightmaps"][0]
+    assert exr.exists() and "textureType: 6" in open(str(exr) + ".meta").read()
+    by_lightmap = {b["lightmap"]: b for b in desc["batches"]}
+    assert set(by_lightmap) == {0, 1}  # one GLB per lightmap the batch's parts are baked into
+    for index, expected in ((0, [0.5, 1 - 0.5]), (1, [0.75, 1 - 0.75])):  # uv * tiling + offset, V flipped
+        gltf, buf = parse_glb(root / by_lightmap[index]["model"])
+        prim = gltf["meshes"][0]["primitives"][0]
+        used = sorted(set(np.asarray(accessor(gltf, buf, prim["indices"])).ravel().tolist()))
+        np.testing.assert_allclose(accessor(gltf, buf, prim["attributes"]["TEXCOORD_1"])[used], [expected] * len(used))
+    # Every key written exists in the C# classes (JsonUtility ignores unknown ones).
+    fields = {cls: set(re.findall(r"public \w+(?:\[\])? (\w+)",
+                                  re.search(r"public class " + cls + r"\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)))
+              for cls in ("Description", "BatchRef", "Manager")}
+    assert set(desc) <= fields["Description"] and set(desc["batches"][0]) <= fields["BatchRef"]
+    assert set(desc["managers"][0]) <= fields["Manager"]
+
+
+def test_lightmap_linear():
+    px = np.array([[[0.5, 0.25, 0.0, 0.2]]], np.float32)
+    np.testing.assert_allclose(up.lightmap_linear(px, "dldr", False), [[[1.0, 0.5 ** 2.2, 0.0]]], rtol=1e-5)
+    np.testing.assert_allclose(up.lightmap_linear(px, "rgbm", False), [[[0.5 ** 2.2, 0.25 ** 2.2, 0.0]]], rtol=1e-5)
+    np.testing.assert_allclose(up.lightmap_linear(px, "rgbm", True), [[[0.5, 0.25, 0.0]]], rtol=1e-5)
+    np.testing.assert_allclose(up.lightmap_linear(px, "hdr", True), [[[0.5, 0.25, 0.0]]])
+
+
+def test_baked_probe_becomes_custom():
+    from engines.unity_components import baked_probe_as_custom
+    props = [{"p": "m_Mode", "t": "i", "v": 0}, {"p": "m_BakedTexture", "t": "ref", "asset": "cube", "kind": "file"},
+             {"p": "m_Intensity", "t": "f", "v": 1.0}]
+    out = baked_probe_as_custom(props)
+    assert {"p": "m_Mode", "t": "i", "v": 2} in out and not any(e["p"] == "m_BakedTexture" for e in out)
+    assert {"p": "m_CustomBakedTexture", "t": "ref", "asset": "cube", "kind": "file"} in out
+    realtime = [{"p": "m_Mode", "t": "i", "v": 1}] + props[1:]
+    assert baked_probe_as_custom(realtime) == realtime
+
+
+# ---------------------------------------------------------------------------- render pipeline
+
+class PipelineSession:
+    def __init__(self, pipeline):
+        self.pipeline = pipeline
+
+    def render_pipeline(self):
+        return self.pipeline
+
+
+URP = {"kind": "urp", "class": "UnityEngine.Rendering.Universal.UniversalRenderPipelineAsset",
+       "name": "Sky:High", "props": [{"p": "m_ShadowDistance", "t": "f", "v": 160.0}]}
+
+
+def test_project_pipeline_needs_urp_and_its_package():
+    assert up.project_pipeline(PipelineSession(URP), {up.URP_PACKAGE: "17.0.0"}) is URP
+    assert up.project_pipeline(PipelineSession(URP), {}) is None
+    assert up.project_pipeline(PipelineSession({**URP, "kind": "hdrp"}), {up.URP_PACKAGE: "1"}) is None
+    hdrp = {**URP, "kind": "hdrp"}
+    assert up.project_pipeline(PipelineSession(hdrp), {up.PIPELINE_PACKAGES["hdrp"]: "17.0.0"}) is hdrp
+    assert up.project_pipeline(PipelineSession(None), {up.URP_PACKAGE: "1"}) is None
+    assert up.project_pipeline(object(), {up.URP_PACKAGE: "1"}) is None
+
+
+def test_pipeline_description(tmp_path):
+    import re
+    from uniview.unity_builder import BUILDER_CS
+    assets = tmp_path / "Assets"
+    swaps = [{"path": "Assets/Materials/Rock.mat", "shader": "Universal Render Pipeline/Lit", "keywords": ["_NORMALMAP"],
+              "queue": -1, "lit": True, "litKeywords": ["_NORMALMAP"], "litQueue": -1}]
+    assert up.write_pipeline_description(str(tmp_path), str(assets), URP, swaps)
+    path = assets / "UniView" / "Build" / "RenderPipeline.json"
+    desc = json.loads(path.read_text(encoding="utf-8"))
+    assert desc["kind"] == "pipeline" and desc["pipeline"] == "urp" and desc["materials"] == swaps
+    assert desc["target"].startswith("Assets/Settings/Sky") and desc["target"].endswith(".asset")
+    assert ":" not in desc["target"] and desc["props"] == URP["props"] and len(desc["stamp"]) == 40
+    assert os.path.isfile(str(path) + ".meta")
+    cs_desc = re.search(r"public class Description\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
+    assert set(desc) <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_desc))
+    cs_swap = re.search(r"public class MatSwap\s*\{(.*?)\}", BUILDER_CS, re.S).group(1)
+    assert set(swaps[0]) <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_swap))
+    up.write_pipeline_description(str(tmp_path), str(assets), URP, [])
+    assert json.loads(path.read_text(encoding="utf-8"))["stamp"] != desc["stamp"]
+
+
+# ---------------------------------------------------------------------------- Addressables
+
+def test_addressable_entries_pick_the_main_asset():
+    from types import SimpleNamespace as NS
+    assets = [NS(uid="mesh", name="Ship", kind="model", path="assets/ships/ship.prefab"),
+              NS(uid="pf", name="Prefab: Ship", kind="prefab", path="assets/ships/ship.prefab"),
+              NS(uid="tex", name="hull", kind="texture", path="assets/art/hull.png"),
+              NS(uid="gone", name="x", kind="texture", path="assets/art/x.png")]
+    exported = {"mesh": "Assets/Ships/Ship/Ship.glb", "pf": "Assets/Ships/Ship.prefab", "tex": "Assets/Art/hull.png"}
+    entries = [{"path": "Assets/Ships/Ship.prefab", "address": "Ship", "labels": ["Map"], "group": "maps"},
+               {"path": "Assets/Art/hull.png", "address": "Assets/Art/hull.png", "labels": [], "group": ""},
+               {"path": "Assets/Art/x.png", "address": "x", "labels": [], "group": ""}]
+    out = up.addressable_entries(entries, assets, exported)
+    assert out == [{"asset": "Assets/Ships/Ship.prefab", "address": "Ship", "labels": ["Map"], "group": "maps"},
+                   {"asset": "Assets/Art/hull.png", "address": "Assets/Art/hull.png", "labels": [], "group": ""}]
+
+
+def test_addressables_description(tmp_path):
+    import re
+    from types import SimpleNamespace as NS
+    from uniview.unity_builder import ADDRESSABLES_ASMDEF, ADDRESSABLES_CS
+    session = NS(assets=[NS(uid="pf", name="Ship", kind="prefab", path="Assets/Ships/Ship.prefab")],
+                 addressables=lambda: [{"path": "Assets/Ships/Ship.prefab", "address": "Ship", "labels": ["Map"],
+                                        "group": "maps", "guid": ""}])
+    assets = tmp_path / "Assets"
+    assert up.write_addressables_description(session, str(tmp_path), str(assets), {"pf": "Assets/Ships/Ship.prefab"}) == 1
+    desc = json.loads((assets / "UniView" / "Build" / "Addressables.json").read_text(encoding="utf-8"))
+    assert desc["kind"] == "addressables" and len(desc["stamp"]) == 40 and desc["entries"][0]["address"] == "Ship"
+    cs_entry = re.search(r"public class AddressableEntry\s*\{(.*?)\}", ADDRESSABLES_CS, re.S).group(1)
+    assert set(desc["entries"][0]) <= set(re.findall(r"public \w+(?:\[\])? (\w+)", cs_entry))
+    asmdef = json.loads(ADDRESSABLES_ASMDEF)
+    assert asmdef["defineConstraints"] == [asmdef["versionDefines"][0]["define"]]
+    assert "#if " + asmdef["defineConstraints"][0] in ADDRESSABLES_CS
+    folder = assets / "UniView" / "Addressables"
+    assert (folder / "UniViewAddressables.cs").is_file() and (folder / "UniView.Addressables.Editor.asmdef.meta").is_file()
+    assert up.write_addressables_description(session, str(tmp_path), str(assets), {}) == 0

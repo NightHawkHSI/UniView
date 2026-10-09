@@ -18,6 +18,12 @@ You don't need to change UniView itself.
 As shipped, the template is a working "loose files" engine that shows images, text files and
 `.obj` models found in a folder, so you can try it before changing anything.
 
+For a complete real-world example, read [`plugins/terraria.py`](plugins/terraria.py): the Terraria
+(XNA / FNA) plugin that ships with UniView. It's one self-contained file - its own binary formats
+(LZX decompression, `.xnb` textures and sounds, XACT music banks) using only numpy and Pillow -
+with detection, game info, stats, info rows, images and sounds. Delete it and Terraria opens only as
+loose files again; that's all there is to a plugin.
+
 ### Type checking (optional)
 
 `engines/sdk.py` is fully type-annotated. The dicts your plugin returns have named shapes
@@ -160,6 +166,7 @@ texture2ddecoder, brotli) are guaranteed to be available in the packaged exe.
 | Unity | models with materials, textures, sprites, text, AudioClips, AnimationClips (generic and humanoid clips play on skinned models; rigged/animated GLB export) | IK goals and twist distribution for humanoid clips |
 | Source | .mdl models, .bsp maps with props, .vtf textures, .vmt materials, sounds, text | model animations, map entities/lighting |
 | Source 2 | .vmdl_c models + materials, .vtex_c textures, .vsnd_c sounds, text | animations, maps (.vmap_c / world nodes) |
+| Terraria / XNA / FNA (`plugins/terraria.py`) | Content/*.xnb (LZX), Texture2D, SoundEffect, sprite-font sheets, XACT .xwb music (PCM / MS-ADPCM) named from .xsb cues | XMA/xWMA banks, compact wave banks, Stardew-style data (.xnb dictionaries) as text, tModLoader .tmod |
 | Fallout 1/2 | .dat archives (DAT1 LZSS / DAT2 zlib), FRM sprites, RIX images, ACM sounds, MSG text | maps, critter art sets as animations |
 | Loose files & archives | any folder or zip-style archive: images, sounds, text, .obj/.x models | more archive types (e.g. id .pak, GoldSrc .wad) |
 | Unreal | .pak (v3-12) and IoStore with AES keys; textures incl. virtual textures, static and skeletal meshes, Ogg/WAV sounds | Bink Audio and Wwise sounds, animations, DataTables (need property mappings), UE3 .upk |

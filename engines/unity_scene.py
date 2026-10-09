@@ -411,6 +411,16 @@ def _ptr_key(ptr):
         return None
 
 
+def lod_hidden(levels, keep):
+    """Renderer keys to hide when an LODGroup shows level `keep`: those of the other levels, except any the
+    shown level lists too (Valheim's fire_pit_iron has its one mesh in LOD0 and LOD1)."""
+    hidden = set()
+    for level, keys in enumerate(levels):
+        if level != keep:
+            hidden |= keys
+    return hidden - levels[keep]
+
+
 def _components(go):
     out = []
     for c in getattr(go, "m_Component", None) or getattr(go, "m_Components", None) or []:
@@ -954,13 +964,8 @@ class SceneBuilder:
                         lods = list(reader.read().m_LODs)
                         self.lod_count = max(self.lod_count, len(lods))
                         keep = min(self.lod_level, len(lods) - 1)  # groups with fewer levels show their last
-                        for level, lod in enumerate(lods):
-                            if level == keep:
-                                continue
-                            for lr in lod.renderers:
-                                found = _ptr_key(lr.renderer)
-                                if found:
-                                    self.lod_skip.add(found[0])
+                        self.lod_skip |= lod_hidden([{found[0] for lr in lod.renderers
+                                                      if (found := _ptr_key(lr.renderer))} for lod in lods], keep)
                     except Exception:
                         pass
             for name, reader in comps:

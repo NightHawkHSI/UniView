@@ -267,9 +267,10 @@ def build_release(version, test_game=None):
     step("Collecting third-party licences")
     made = collect_licenses(out_dir, os.path.join(WORK, "build", APP_NAME, "PYZ-00.toc"))
     print(f"  {len(made)} packages -> licenses/")
-    # User plugins live next to the exe: ship the template and the guide.
+    # User plugins live next to the exe: ship the template, the Terraria plugin (a full example) and the guide.
     os.makedirs(os.path.join(out_dir, "plugins"), exist_ok=True)
-    for name, target in (("plugins/_template.py", "plugins/_template.py"), ("PLUGINS.md", "PLUGINS.md")):
+    for name, target in (("plugins/_template.py", "plugins/_template.py"), ("plugins/terraria.py", "plugins/terraria.py"),
+                         ("PLUGINS.md", "PLUGINS.md")):
         src = os.path.join(ROOT, name)
         if os.path.isfile(src):
             shutil.copy2(src, os.path.join(out_dir, target))
