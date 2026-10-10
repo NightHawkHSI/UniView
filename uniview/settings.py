@@ -42,6 +42,8 @@ class Settings:
     blender_path: str = ""
     check_tools: bool = True  # startup check for missing optional tools
     fast_gpu: bool = True     # ask Windows for the high-performance GPU on two-GPU laptops (uniview/gpu.py)
+    loading_sounds: bool = True   # loading screen sound effects (Sounds/); each one can be muted via options
+    sound_volume: float = 0.02    # 0..1, loading screen sounds
     options: dict = field(default_factory=dict)  # Options menu (VIEW_OPTION_ITEMS): {key: bool}, missing = on
     path: str = SETTINGS_FILE
     extra: dict = field(default_factory=dict)  # keys this version doesn't know, written back unchanged
@@ -56,8 +58,8 @@ class Settings:
             raise TypeError(f"Setting '{name}' must be {kind.__name__}, not {type(value).__name__}")
         if name in SETTING_CHOICES and value not in SETTING_CHOICES[name]:
             raise ValueError(f"Setting '{name}' must be one of {SETTING_CHOICES[name]}, not {value!r}")
-        if name == "volume" and not 0.0 <= value <= 1.0:
-            raise ValueError(f"Setting 'volume' must be 0..1, not {value}")
+        if name in ("volume", "sound_volume") and not 0.0 <= value <= 1.0:
+            raise ValueError(f"Setting '{name}' must be 0..1, not {value}")
         object.__setattr__(self, name, value)
 
     @classmethod

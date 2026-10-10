@@ -285,10 +285,23 @@ def asset_image(asset):
 CUBE_FACES = ("+X", "-X", "+Y", "-Y", "+Z", "-Z")  # Unity's face order
 
 
+def _crn_face_size(data, pos):
+    """Byte size of the single-face crunch (.crn) file starting at data[pos]. Raises ValueError for
+    anything texture2ddecoder can't unpack safely - a bad header, a cut-off file or several faces in
+    one file (it only gives one face's buffer) crash the whole app instead of raising."""
+    head = bytes(data[pos:pos + 19])
+    if len(head) < 19 or head[:2] != b"Hx":
+        raise ValueError("Unsupported crunched cubemap layout.")
+    size = int.from_bytes(head[6:10], "big")  # CRN header: data_size = whole file, faces at byte 17
+    if head[17] != 1 or size < 19 or pos + size > len(data):
+        raise ValueError("Unsupported crunched cubemap layout.")
+    return size
+
+
 def cubemap_faces(cube, max_side=1024, alpha=False):
     """The 6 faces of a parsed Cubemap as PIL images in Unity's order (+X, -X, +Y, -Y, +Z, -Z), at most
     max_side pixels wide. Unity stores the faces one after another (each with its mipmaps)."""
-    from UnityPy.enums import BuildTarget
+    from UnityPy.enums import BuildTarget, TextureFormat
     from UnityPy.export.Texture2DConverter import parse_image_data
     data = cube.get_image_data() if hasattr(cube, "get_image_data") else cube.image_data
     w, h = int(cube.m_Width), int(cube.m_Height)
@@ -296,9 +309,13 @@ def cubemap_faces(cube, max_side=1024, alpha=False):
         raise ValueError("Empty cubemap - it's made while the game runs (e.g. a reflection probe).")
     size = int(getattr(cube, "m_CompleteImageSize", 0) or 0) or len(data) // 6
     reader = getattr(cube, "object_reader", None)
-    faces = []
+    crunched = "Crunched" in TextureFormat(int(cube.m_TextureFormat)).name
+    faces, pos = [], 0
     for i in range(6):
-        chunk = bytes(data[i * size:(i + 1) * size])
+        if crunched:  # checked first: the native crunch decoder crashes the app on bad data
+            size = _crn_face_size(data, pos)
+        chunk = bytes(data[pos:pos + size])
+        pos += size
         if len(chunk) < size:
             raise ValueError("This cubemap has fewer than 6 faces.")
         img = parse_image_data(chunk, w, h, cube.m_TextureFormat, getattr(reader, "version", (0, 0, 0, 0)),

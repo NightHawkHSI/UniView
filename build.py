@@ -39,7 +39,7 @@ SOURCE_FILES = [
     "unity_viewer.py", "uniview", "requirements.txt", "run.bat", "build.bat", "build.py",
     "Icon.png", "README.md", "LICENSE", "CREDITS.md", ".gitignore", "ScreenShots", "compat.json",
     "engines", "plugins", "PLUGINS.md", "tests", "third_party_licenses",
-    ".github", "ruff.toml", "requirements-dev.txt",
+    ".github", "ruff.toml", "requirements-dev.txt", "Sounds",
 ]
 
 
@@ -226,6 +226,9 @@ def build_release(version, test_game=None):
         icon_args += ["--add-data", f"{compat}{os.pathsep}."]
     else:
         print("  Icon.png not found - building without an icon")
+    sounds = os.path.join(ROOT, "Sounds")
+    if os.path.isdir(sounds):
+        icon_args += ["--add-data", f"{sounds}{os.pathsep}Sounds"]
     splash = os.path.join(WORK, "splash.png")
     make_splash(icon_png, splash, version)
     icon_args += ["--splash", splash]

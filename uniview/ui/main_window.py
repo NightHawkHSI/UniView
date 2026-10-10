@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QSlider,
     QLineEdit,
     QListView,
     QListWidget,
@@ -36,6 +37,7 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 import engines
@@ -78,7 +80,7 @@ from uniview.ui.asset_tree import AssetTree
 from uniview.ui.console import ConsoleDock
 from uniview.ui.dialogs import ExportDialog, PluginsDialog, edit_project_notes, open_plugins_folder
 from uniview.ui.home import HomePage
-from uniview.ui.loading_screen import LoadingScreen
+from uniview.ui.loading_screen import SOUNDS, LoadingScreen, sound_config
 from uniview.ui.media import AnimationView, AudioView, ImageView, ImageWindow, VideoView
 from uniview.ui import canvas_render
 from uniview.ui.controller_view import ControllerView
@@ -94,7 +96,8 @@ from uniview.ui.tools_dialog import ToolsDialog
 from uniview.ui.unity_export import ask_project_folder, ask_streaming_assets, choose_editor_version, run_export
 from uniview.unity_project import installed_editors, target_version, unity_version
 from uniview.util import blank_icon, fmt_size, norm_path, open_path, pil_to_pixmap, safe_filename
-from uniview.workers import Loader, StatsWorker, ThumbnailWorker, meshdata_to_polydata
+from uniview.perf import THROTTLE, FreezeWatch, SystemStats, stats_text
+from uniview.workers import Loader, PreviewWorker, StatsWorker, ThumbnailWorker, meshdata_to_polydata
 from uniview.ui import theme
 from uniview.ui.theme import role
 
@@ -149,6 +152,21 @@ class MainWindow(QMainWindow):
         self.filter_timer.timeout.connect(self.apply_filter)
         self.resort_timer = QTimer(self, singleShot=True, interval=1500)
         self.resort_timer.timeout.connect(self.resort)
+        self.preview_worker = PreviewWorker()
+        self.preview_worker.ready.connect(self.on_preview_ready)
+        self._preview_id = 0
+        self._preview_pending = None  # (request id, session, asset) being decoded on the preview thread
+
+        # responsiveness: a heartbeat that notices lag (and eases off background work), title bar stats
+        self.freeze_watch = FreezeWatch()
+        self.system_stats = SystemStats()
+        self._beat_at = time.monotonic()
+        self.heartbeat = QTimer(self, interval=100)
+        self.heartbeat.timeout.connect(self._heartbeat)
+        self.heartbeat.start()
+        self.stats_timer = QTimer(self, interval=2000)
+        self.stats_timer.timeout.connect(self._update_stats)
+        self.stats_timer.start()
 
         # left: buttons, search, type/view, list or grid
         back = theme.set_icon(QPushButton("All games"), "back")
@@ -320,6 +338,10 @@ class MainWindow(QMainWindow):
         self.engine_label = QLabel()
         self.engine_label.setContentsMargins(6, 0, 6, 0)
         self.statusBar().addPermanentWidget(self.engine_label)
+        self.strain_label = role(QLabel(), "muted")  # shown while background work is slowed down
+        self.strain_label.setContentsMargins(6, 0, 6, 0)
+        self.strain_label.hide()
+        self.statusBar().addPermanentWidget(self.strain_label)
 
         self.console = None
         if log_handler is not None:
@@ -516,6 +538,13 @@ class MainWindow(QMainWindow):
         fast.setStatusTip(fast.toolTip())
         fast.toggled.connect(self._set_fast_gpu)
         options.addAction(fast)
+        stats = QAction("Show RAM / CPU / GPU use in the title bar", self, checkable=True)
+        stats.setChecked(self.settings.option("title_stats"))
+        stats.setToolTip("Memory, processor and graphics card use, updated every 2 seconds.")
+        stats.setStatusTip(stats.toolTip())
+        stats.toggled.connect(self._set_title_stats)
+        options.addAction(stats)
+        self._add_sound_menu(options)
         options.setToolTipsVisible(True)
 
         help_menu = self.menuBar().addMenu("&Help")
@@ -555,6 +584,58 @@ class MainWindow(QMainWindow):
         if self.current is not None and self.current.kind in MODEL_KINDS:
             self.show_asset(self.current)  # rebuild the map / scene with the new setting
 
+    def _add_sound_menu(self, options):
+        sounds = options.addMenu("Loading screen sounds")
+        play = QAction("Play sounds", self, checkable=True)
+        play.setChecked(self.settings.loading_sounds)
+        sounds.addAction(play)
+        sounds.addSeparator()
+        each = []
+        for _name, _file, key, text in SOUNDS:
+            act = QAction(text, self, checkable=True)
+            act.setChecked(self.settings.option(key))
+            act.setEnabled(self.settings.loading_sounds)
+            act.toggled.connect(lambda on, key=key: self._set_sound(key, on))
+            sounds.addAction(act)
+            each.append(act)
+        play.toggled.connect(lambda on: self._set_sound("loading_sounds", on, each))
+        sounds.addSeparator()
+        # Volume slider inside the menu; live while dragging, saved (and a pop played to hear it) on release
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(12, 4, 12, 4)
+        lay.addWidget(QLabel("Volume"))
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(0, 100)
+        slider.setValue(round(self.settings.sound_volume * 100))
+        slider.setMinimumWidth(140)
+        value = QLabel(f"{slider.value()}%")
+        value.setMinimumWidth(34)
+        lay.addWidget(slider)
+        lay.addWidget(value)
+        slider.valueChanged.connect(lambda v: (value.setText(f"{v}%"), self._set_sound("sound_volume", v / 100, save=False)))
+        slider.sliderReleased.connect(self._save_sound_volume)
+        slider.actionTriggered.connect(  # keys / wheel / clicks on the track (drags save on release)
+            lambda _a: None if slider.isSliderDown() else QTimer.singleShot(0, self._save_sound_volume))
+        volume = QWidgetAction(self)
+        volume.setDefaultWidget(row)
+        sounds.addAction(volume)
+
+    def _set_sound(self, key, value, dependents=(), save=True):
+        if key in ("loading_sounds", "sound_volume"):
+            setattr(self.settings, key, value)
+        else:
+            self.settings.set_option(key, value)
+        if save:
+            self.settings.save()
+        for act in dependents:
+            act.setEnabled(value)
+        self.loading_screen.set_sounds(sound_config(self.settings))
+
+    def _save_sound_volume(self):
+        self.settings.save()
+        self.loading_screen.preview_sound()
+
     def _set_fast_gpu(self, on):
         from uniview import gpu
         self.settings.fast_gpu = on
@@ -592,6 +673,7 @@ class MainWindow(QMainWindow):
     def hide_progress(self):
         self.progress.hide()
         self.load_bar.hide()
+        self._watch(True)
         if self.loading_screen.is_active():
             self.loading_screen.stop()
             if self.pages.currentWidget() is self.loading_screen:
@@ -646,6 +728,8 @@ class MainWindow(QMainWindow):
                                 + ", ".join(p.name for p in engines.plugins())
                                 + "\n\nSee Help \u2192 Engine plugins to add one.")
             return
+        self._watch(False)  # no Python timers while the loader holds the GIL (they'd stall the loading screen)
+        self.loading_screen.set_sounds(sound_config(self.settings))
         self.loading_screen.start(os.path.basename(os.path.normpath(path)) or path)
         self.pages.setCurrentWidget(self.loading_screen)
         self.show_busy()
@@ -980,20 +1064,95 @@ class MainWindow(QMainWindow):
         self.audio_view.stop()
         self.video_view.stop()
         self.flipbook_timer.stop()
+        THROTTLE.user_active()  # thumbnails/stats wait, so the preview gets the session first
+        if asset.kind == "scene" and asset.key != getattr(self, "_lod_scene", None):
+            VIEW_LEVELS["lod_level"] = 0  # another scene starts at the most detailed level
+            self._lod_scene = asset.key
+        prepare = self._preview_job(session, asset)
+        if prepare is not None:
+            # Decode on the preview thread; the window stays responsive and shows the result when it's ready.
+            self._preview_id += 1
+            self._preview_pending = (self._preview_id, session, asset)
+            self.preview_worker.request(self._preview_id, session, prepare)
+            self.stack.setCursor(Qt.BusyCursor)
+            self.statusBar().showMessage(f"Loading {asset.name}...")
+            QTimer.singleShot(400, lambda rid=self._preview_id: self._show_preview_wait(rid))
+            return
+        self._preview_pending = None  # shown right here: drop any result still on its way
+        self.stack.unsetCursor()
+        self._show_now(asset)
+
+    def _preview_job(self, session, asset):
+        """The slow part of previewing this asset as a function for the preview thread, or None to
+        preview it on the UI thread (quick kinds, or ones whose widgets need the session directly)."""
+        if asset.kind in MODEL_KINDS:
+            def prepare():
+                ui = asset.kind == "scene" and hasattr(session, "is_ui") and session.is_ui(asset)
+                if ui:
+                    return {"ui": True, "mesh": None}
+                try:
+                    return {"ui": False, "mesh": (self._prepare_mesh(session, asset), None)}
+                except Exception as e:  # shown by _show_now, which has the fallbacks for meshless prefabs
+                    return {"ui": False, "mesh": (None, e)}
+            return prepare
+        if asset.kind in IMAGE_KINDS:
+            return lambda: session.image(asset)
+        if asset.kind == "font":
+            return lambda: session.font(asset)
+        if asset.kind == "data":
+            return lambda: session.text(asset)
+        return None
+
+    def _show_preview_wait(self, request_id):
+        """A preview taking a while: say so instead of leaving the previous asset on screen."""
+        pending = self._preview_pending
+        if pending is None or pending[0] != request_id:
+            return
+        self.load_bar.hide()
+        self.placeholder.setText(f"Loading {pending[2].name}...")
+        self.stack.setCurrentWidget(self.placeholder_page)
+
+    def on_preview_ready(self, request_id, result, error):
+        pending = self._preview_pending
+        if pending is None or pending[0] != request_id:
+            return  # the user moved on; a newer request is (or was) running
+        _rid, session, asset = pending
+        self._preview_pending = None
+        self.stack.unsetCursor()
+        self.statusBar().clearMessage()
+        if self.session is not session or self.current is not asset:
+            return
+        self._show_now(asset, (result, error))
+
+    @staticmethod
+    def _take(prep, compute):
+        """A preview thread result (result, error) - re-raising its error - or compute() when there's none."""
+        if prep is None:
+            return compute()
+        result, error = prep
+        if error is not None:
+            raise error
+        return result
+
+    def _show_now(self, asset, prep=None):
+        """Put the asset on screen. prep = (result, error) of its _preview_job, None = decode it here."""
+        session = self.session
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             with session.lock:
-                if asset.kind == "scene" and hasattr(session, "is_ui") and session.is_ui(asset) and                         self.show_structure(asset, ui=True):
+                pre = self._take(prep, lambda: None)
+                if asset.kind == "scene" and (pre["ui"] if pre else hasattr(session, "is_ui") and session.is_ui(asset)) \
+                        and self.show_structure(asset, ui=True):
                     pass  # a UI prefab: drawn as a 2D picture
                 elif asset.kind in MODEL_KINDS:
                     try:
-                        self.show_mesh(asset)
+                        self.show_mesh(asset, pre["mesh"] if pre else None)
                     except ValueError as e:
                         # Nothing to draw (a sound or logic-only prefab): show what it's made of instead.
                         if asset.kind != "scene" or not self.show_structure(asset, str(e)):
                             raise
                 elif asset.kind in IMAGE_KINDS:
-                    self.show_texture(asset, session.image(asset))
+                    self.show_texture(asset, self._take(prep, lambda: session.image(asset)))
                 elif asset.kind == "audio":
                     self.stack.setCurrentWidget(self.audio_view)
                     rows = list(session.describe(asset)) + [("Size", fmt_size(asset.size))]
@@ -1005,7 +1164,7 @@ class MainWindow(QMainWindow):
                             log.exception("Couldn't decode the sound '%s'", asset.name)
                         self.audio_view.show_error(asset.name, str(e), rows)
                 elif asset.kind == "font":
-                    self.show_texture(asset, session.font(asset))
+                    self.show_texture(asset, self._take(prep, lambda: session.font(asset)))
                 elif asset.kind == "video":
                     self.stack.setCurrentWidget(self.video_view)
                     try:
@@ -1016,7 +1175,7 @@ class MainWindow(QMainWindow):
                             log.exception("Couldn't read the video '%s'", asset.name)
                         self.video_view.show_error(asset.name, str(e))
                 elif asset.kind == "data":
-                    self.text_view.setPlainText(session.text(asset)[:MAX_TEXT_CHARS])
+                    self.text_view.setPlainText(self._take(prep, lambda: session.text(asset))[:MAX_TEXT_CHARS])
                     self.stack.setCurrentWidget(self.text_view)
                 elif asset.kind == "animation":
                     text = session.text(asset)
@@ -1143,9 +1302,6 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
-    def _materials(self, asset):
-        return session_materials(self.session, asset)
-
     def _lod_requested(self, level):
         """LOD picker: a scene/prefab rebuilds with that level of every LOD group; a model jumps to that LOD mesh."""
         if self.current is None:
@@ -1159,7 +1315,7 @@ class MainWindow(QMainWindow):
         if level < len(models) and models[level] is not None and models[level].key != self.current.key:
             self.goto_asset(models[level].key)
 
-    def _sky_images(self, env):
+    def _sky_images(self, env, session):
         """The scene environment with its textured sky's images loaded ("sky_images": (kind, [PIL images])) -
         a copy; the environment unchanged if it has none or they fail to load."""
         sky = (env or {}).get("sky_texture")
@@ -1169,28 +1325,22 @@ class MainWindow(QMainWindow):
             if sky["kind"] == "gradient":  # drawn from its colour stops, nothing to load
                 images = []
             elif sky["kind"] in ("cube", "clouds"):
-                images = self.session.cube_faces(sky["assets"][0], alpha=sky["kind"] == "clouds")
+                images = session.cube_faces(sky["assets"][0], alpha=sky["kind"] == "clouds")
             else:
-                images = [self.session.image(a) for a in sky["assets"]]
+                images = [session.image(a) for a in sky["assets"]]
         except Exception as e:
             log.info("Sky texture not shown: %s", e)
             return env
         return {**env, "sky_images": (sky["kind"], images)}
 
-    def show_mesh(self, asset):
-        session = self.session
-        if asset.kind == "scene" and asset.key != getattr(self, "_lod_scene", None):
-            VIEW_LEVELS["lod_level"] = 0  # another scene starts at the most detailed level
-            self._lod_scene = asset.key
+    def _prepare_mesh(self, session, asset):
+        """Everything slow about showing a model - reading it, its materials, textures, bones, sky, LODs and
+        objects - with no widgets touched, so it runs on the preview thread (under session.lock)."""
         md = session.mesh(asset)
         poly = meshdata_to_polydata(md)
-        materials = []
-        if not session.materials_ready():
-            # Still indexing in the background: show the bare model now, textures once it's done.
-            self.statusBar().showMessage("Finding materials and textures (first time for this game)...")
-            self._retry_when_indexed(self.current)
-        else:
-            materials = self._materials(asset)
+        indexed = session.materials_ready()
+        # Still indexing in the background: show the bare model now, textures once it's done.
+        materials = session_materials(session, asset) if indexed else []
         groups = texture_groups(md, materials)
         image_of = texture_loader(session, len(groups))
         tex = image_of(display_texture(md, materials))
@@ -1200,7 +1350,7 @@ class MainWindow(QMainWindow):
                  for tex_asset, color, tris, alpha, _fx, uv, lm in groups]
         effect_parts = {i for i, g in enumerate(groups) if g[4]}
         bones = getattr(md, "bones", None)
-        if bones is None and session.materials_ready():
+        if bones is None and indexed:
             try:
                 bones = session.bones(asset)
             except Exception:
@@ -1210,22 +1360,37 @@ class MainWindow(QMainWindow):
                     for e, (tex_asset, color, alpha), trail
                     in zip(getattr(md, "emitters", None) or [], emitter_looks(md, materials),
                            emitter_looks(md, materials, trails=True))]
+        lod_models = []
+        if asset.kind != "scene" and indexed:
+            try:
+                lod_models = session.lod_siblings(asset)
+            except Exception:
+                log.exception("Finding the LOD levels of '%s' failed", asset.name)
+        nodes = self._structure_nodes(asset, session)
+        return {"md": md, "poly": poly, "indexed": indexed, "materials": materials, "tex": tex, "parts": parts,
+                "effect_parts": effect_parts, "bones": bones, "emitters": emitters,
+                "environment": self._sky_images(getattr(md, "environment", None), session),
+                "lod_models": lod_models, "nodes": nodes, "entries": self._game_entries(asset, nodes, session)}
+
+    def show_mesh(self, asset, prep=None):
+        """Show a model; prep = (result, error) of _prepare_mesh from the preview thread, None = prepare it here."""
+        session = self.session
+        p = self._take(prep, lambda: self._prepare_mesh(session, asset))
+        md, poly, materials, tex = p["md"], p["poly"], p["materials"], p["tex"]
+        if not p["indexed"]:
+            self.statusBar().showMessage("Finding materials and textures (first time for this game)...")
+            self._retry_when_indexed(self.current)
         self.stack.setCurrentWidget(self.mesh_view)
         flat = bool(getattr(md, "view_2d", False))
-        environment = self._sky_images(getattr(md, "environment", None))
-        self.mesh_view.show_mesh(poly, tex, parts, flat=flat, gizmos=getattr(md, "gizmos", None),
+        self.mesh_view.show_mesh(poly, tex, p["parts"], flat=flat, gizmos=getattr(md, "gizmos", None),
                                  gizmos_only=bool(getattr(md, "gizmos_only", False)),
-                                 owners=getattr(md, "owners", None), emitters=emitters, effect_parts=effect_parts,
-                                 bones=bones, environment=environment)
+                                 owners=getattr(md, "owners", None), emitters=p["emitters"],
+                                 effect_parts=p["effect_parts"], bones=p["bones"], environment=p["environment"])
         self.mesh_view.set_fly(is_place(asset) and not flat)
-        self._lod_models = []
+        self._lod_models = p["lod_models"]
         if asset.kind == "scene":
             self.mesh_view.set_lods(getattr(md, "lod_count", 0), VIEW_LEVELS["lod_level"])
         else:
-            try:
-                self._lod_models = session.lod_siblings(asset) if session.materials_ready() else []
-            except Exception:
-                log.exception("Finding the LOD levels of '%s' failed", asset.name)
             here = next((i for i, m in enumerate(self._lod_models) if m is not None and m.key == asset.key), 0)
             self.mesh_view.set_lods(len(self._lod_models), here)
         n_tex = sum(len(m.textures) for m in materials)
@@ -1238,17 +1403,16 @@ class MainWindow(QMainWindow):
                                favorite=asset.uid in self.favorites)
         jobs = self.mesh_view.panel.set_info(asset.name, "<br>".join(rows), materials, self.blank_big)
         self._request_icons(jobs, self.mesh_view.panel.set_icon)
-        nodes = self._structure_nodes(asset)
-        self.mesh_view.panel.set_structure(nodes, uid_map(session), self._game_entries(asset, nodes))
+        self.mesh_view.panel.set_structure(p["nodes"], uid_map(session), p["entries"])
 
-    def _game_entries(self, asset, nodes):
+    def _game_entries(self, asset, nodes, session):
         """Game data entries that name a prefab, each with its code links (see uniview.game_data)."""
         if not nodes or asset.ref.get("type") == "scene":
             return []
         try:
-            entries = game_data.entries_for(self.session, asset.name, nodes)
+            entries = game_data.entries_for(session, asset.name, nodes)
             for entry in entries:
-                entry["links"] = code_links.links(self.session.path, [r[:2] for r in entry["rows"]])
+                entry["links"] = code_links.links(session.path, [r[:2] for r in entry["rows"]])
             return entries
         except Exception:
             log.exception("Looking up game data for '%s' failed", asset.name)
@@ -1281,12 +1445,12 @@ class MainWindow(QMainWindow):
         view.show()
         log.info("Showing decompiled %s.%s", type_name, method)
 
-    def _structure_nodes(self, asset):
+    def _structure_nodes(self, asset, session):
         """hierarchy() nodes of a prefab or scene for the info panel's Objects & scripts tab, or None."""
-        if asset.kind != "scene" or not hasattr(self.session, "hierarchy"):
+        if asset.kind != "scene" or not hasattr(session, "hierarchy"):
             return None
         try:
-            return self.session.hierarchy(asset)
+            return session.hierarchy(asset)
         except Exception:
             log.exception("Reading the objects of '%s' failed", asset.name)
             return None
@@ -1794,7 +1958,76 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Exported {ok} item(s) ({fail} failed) to {folder}")
         log.info("Exported %d item(s), %d failed", ok, fail)
 
+    # ---- responsiveness
+    def _watch(self, on):
+        """Heartbeat + stats timers on/off (off while a game loads)."""
+        self.freeze_watch.paused = not on
+        if on and not self.heartbeat.isActive():
+            self._beat_at = time.monotonic()
+            self.freeze_watch.beat()
+            self.heartbeat.start()
+            self.stats_timer.start()
+        elif not on:
+            self.heartbeat.stop()
+            self.stats_timer.stop()
+
+    def _heartbeat(self):
+        """Runs every 100 ms; firing late means the window was blocked that long."""
+        now = time.monotonic()
+        lag_ms = (now - self._beat_at) * 1000 - self.heartbeat.interval()
+        self._beat_at = now
+        self.freeze_watch.beat()
+        if lag_ms >= THROTTLE.LAG_HIGH_MS:
+            log.debug("Window blocked for %.0f ms", lag_ms)
+        if THROTTLE.report_lag(lag_ms):
+            self._show_strain()
+
+    def _update_stats(self):
+        stats = self.system_stats.latest()
+        if "sys_ram_pct" in stats:
+            if THROTTLE.report_memory(stats["sys_ram_pct"]):
+                self._show_strain()
+                if THROTTLE.level >= 2:
+                    self._free_memory()
+        text = stats_text(stats) if self.settings.option("title_stats") else ""
+        if THROTTLE.level:
+            text = ("⚠ Slowed down to stay responsive" + (" · " if text else "")) + text
+        title = f"{APP_TITLE}   |   {text}" if text else APP_TITLE
+        if self.windowTitle() != title:
+            self.setWindowTitle(title)
+
+    def _show_strain(self):
+        """Status bar note while background work (thumbnails, sorting stats) is slowed down."""
+        reason = THROTTLE.reason()
+        if reason:
+            self.strain_label.setText(f"⚠ Slowed down: {reason}")
+            self.strain_label.setToolTip(
+                "UniView is easing off background work (thumbnails, sort/search stats) so the window keeps\n"
+                "responding. It speeds up again by itself once things are calm.")
+            if self.strain_label.isHidden():
+                log.info("Slowing down background work: %s", reason)
+        self.strain_label.setVisible(bool(reason))
+        self._update_stats()
+
+    def _free_memory(self):
+        """Memory almost full: drop the thumbnail cache's older half and collect garbage."""
+        import gc
+        for key in list(self.thumb_cache)[:len(self.thumb_cache) // 2]:
+            del self.thumb_cache[key]
+        gc.collect()
+        log.warning("Memory is almost full - freed cached thumbnails. Closing other games/programs helps.")
+
+    def _set_title_stats(self, on):
+        self.settings.set_option("title_stats", on)
+        self.settings.save()
+        self._update_stats()
+
     def closeEvent(self, event):
+        self.heartbeat.stop()
+        self.stats_timer.stop()
+        self.freeze_watch.stop()
+        self.system_stats.stop()
+        self.preview_worker.clear()
         self.thumbs.clear()
         self.stats_worker.start([])
         self.settings.last_dir = self.last_dir

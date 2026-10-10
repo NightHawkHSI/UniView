@@ -115,3 +115,18 @@ def test_project_store_corrupt_file_kept(tmp_path):
     store = projects.ProjectStore(path)
     assert store.projects == []
     assert open(path + ".bad").read() == '[{"path": "C:/x"'
+
+
+def test_loading_screen_sound_config(tmp_path):
+    from uniview.ui.loading_screen import sound_config
+    s = settings.Settings.load(str(tmp_path / "none.json"))
+    files = sound_config(s)["files"]
+    assert set(files) == {"pop", "drop", "bits"} and all(files.values())  # Sounds/ ships with the app
+    s.set_option("sound_bits", False)
+    assert sound_config(s)["files"]["bits"] == "" and sound_config(s)["files"]["pop"]
+    s.loading_sounds = False
+    assert not any(sound_config(s)["files"].values())
+    s.sound_volume = 1
+    assert sound_config(s)["volume"] == 1.0
+    with pytest.raises(ValueError):
+        s.sound_volume = 1.5

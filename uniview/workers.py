@@ -1,4 +1,4 @@
-"""Background workers: game loading, list thumbnails and asset stats."""
+"""Background workers: game loading, list thumbnails, asset stats and asset previews."""
 
 import threading
 import time
@@ -13,6 +13,7 @@ from PySide6.QtGui import QImage
 from engines.sdk import KIND_LABELS, Progress
 from uniview.constants import log
 from uniview.jobs import JobQueue
+from uniview.perf import THROTTLE
 from uniview.util import pil_to_qimage
 
 
@@ -159,6 +160,7 @@ class ThumbnailWorker(QObject):
     def _run(self):
         while True:
             _gen, [(key, session, asset)] = self._jobs.take()
+            THROTTLE.pause()  # the window first when it's busy or lagging
             try:
                 qimg = pil_to_qimage(make_thumbnail(session, asset, self.size))
             except Exception as e:
@@ -189,6 +191,7 @@ class StatsWorker(QObject):
             gen, batch_jobs = self._jobs.take(40)
             batch = []
             for key, session, asset in batch_jobs:
+                THROTTLE.pause()
                 try:
                     with session.lock:
                         stats = session.stats(asset)
@@ -198,11 +201,44 @@ class StatsWorker(QObject):
                 except Exception as e:
                     log.debug("No stats for %s '%s': %s", asset.kind, asset.name, e)
                     batch.append((key, {"size": asset.size, "info": "?", "sort": -1}))
-                time.sleep(0)  # hand the GIL to the window thread if it's waiting (keeps the UI smooth)
             remaining = self._jobs.pending_if_current(gen)
             if remaining is None:
                 continue  # a different game was opened meanwhile
             try:
                 self.ready.emit(batch, remaining)
+            except RuntimeError:
+                return  # window closed
+
+
+class PreviewWorker(QObject):
+    """Background thread that decodes the asset being previewed (the slow part: reading the files,
+    decompressing textures, building meshes), so the window keeps responding. Only the newest request
+    matters: one still waiting is replaced, and the window ignores results it no longer wants."""
+
+    ready = Signal(int, object, object)  # request id, result, exception (None if it worked)
+
+    def __init__(self):
+        super().__init__()
+        self._jobs = JobQueue()
+        threading.Thread(target=self._run, daemon=True, name="preview").start()
+
+    def request(self, request_id, session, prepare):
+        """Run prepare() under session.lock; ready(request_id, result, error) reports back."""
+        self._jobs.replace([(request_id, session, prepare)])
+
+    def clear(self):
+        self._jobs.clear()
+
+    def _run(self):
+        while True:
+            _gen, [(request_id, session, prepare)] = self._jobs.take()
+            result = error = None
+            try:
+                with session.lock:
+                    result = prepare()
+            except Exception as e:
+                error = e
+            try:
+                self.ready.emit(request_id, result, error)
             except RuntimeError:
                 return  # window closed

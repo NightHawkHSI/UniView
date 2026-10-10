@@ -38,6 +38,7 @@ else:
     RESOURCE_DIR = APP_DIR
 
 ICON_FILE = os.path.join(RESOURCE_DIR, "Icon.png")
+SOUNDS_DIR = os.path.join(RESOURCE_DIR, "Sounds")  # loading screen sound effects
 
 LOG_FILE = os.path.join(APP_DIR, "viewer.log")
 

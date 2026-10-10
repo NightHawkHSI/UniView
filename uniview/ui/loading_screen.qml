@@ -37,7 +37,7 @@ Rectangle {
         var t = Date.now() / 1000
         return {title: title, stages: [], icons: [], names: [], sizes: [], realFiles: false, at: 0, done: 0, total: 0,
                 pulse: -10, lastDive: t, started: t, lastFrame: t, chips: {}, sparks: [], crumbs: [], crumbDue: 0,
-                crumbSeq: 0}
+                crumbSeq: 0, reading: null, lastFind: -10}
     }
 
     // ---- events from Python
@@ -50,7 +50,11 @@ Rectangle {
             } else if (name === "start") {
                 root.st = fresh(payload); addStage("Starting ..."); root.running = true; canvas.requestPaint()
             } else if (name === "stop") {
-                root.running = false; st.icons = []
+                root.running = false; st.icons = []; setBits(false)
+            } else if (name === "sounds") {
+                setSounds(payload)
+            } else if (name === "preview") {
+                playSfx("pop")
             } else if (name === "queue") {
                 st.realFiles = true
                 makeIcons(payload.map(function (e) { var l = fileLabel(e[0]); return [e[0], e[1], l[0], l[1]] }))
@@ -141,6 +145,74 @@ Rectangle {
         return null
     }
 
+    // ---- sounds (bridge "sounds"). Players are made from a string so a Qt without QtMultimedia just stays silent.
+    property var sfx: ({})               // name -> {url, players, next, last}
+    property real sfxVolume: 0.02
+    readonly property var sfxGap: ({pop: 0.08, drop: 0.06})  // seconds; fast loads would otherwise machine-gun
+    readonly property real bitsPitchMin: 0.8   // the 1s-and-0s loop gets a new pitch each time round (tape style:
+    readonly property real bitsPitchMax: 1.25  // playbackRate with pitch compensation off, so speed moves with it)
+
+    function makePlayer(url, loop) {
+        try {
+            var p = Qt.createQmlObject("import QtMultimedia; MediaPlayer { audioOutput: AudioOutput {} loops: "
+                                       + (loop ? "MediaPlayer.Infinite" : "1") + " }", root, "sfx")
+            p.audioOutput.volume = sfxVolume
+            if (loop && "pitchCompensation" in p) p.pitchCompensation = false  // Qt 6.10+; older ones never compensate
+            p.source = url
+            return p
+        } catch (e) {
+            console.warn("Loading screen sound unavailable: " + e)
+            return null
+        }
+    }
+
+    function setSounds(cfg) {
+        sfxVolume = cfg.volume
+        for (var name in cfg.files) {
+            var url = cfg.files[name], old = sfx[name], i
+            if (old && old.url === url) {
+                for (i = 0; i < old.players.length; i++) old.players[i].audioOutput.volume = sfxVolume
+                continue
+            }
+            if (old) { for (i = 0; i < old.players.length; i++) { old.players[i].stop(); old.players[i].destroy() } }
+            delete sfx[name]
+            if (!url) continue
+            var players = []
+            for (i = 0; i < (name === "bits" ? 1 : 4); i++) {  // a few each so quick repeats overlap
+                var p = makePlayer(url, name === "bits")
+                if (p) players.push(p)
+            }
+            if (players.length) sfx[name] = {url: url, players: players, next: 0, last: -10, lastPos: 0}
+        }
+    }
+
+    function playSfx(name) {
+        var s = sfx[name]
+        if (!s) return
+        var t = now()
+        if (t - s.last < (sfxGap[name] || 0.05)) return
+        s.last = t
+        var p = s.players[s.next]
+        s.next = (s.next + 1) % s.players.length
+        p.setPosition(0)
+        p.play()
+    }
+
+    function setBits(on, newFile) {
+        var s = sfx.bits
+        if (!s) return
+        var p = s.players[0], playing = p.playbackState === 1  // MediaPlayer.PlayingState
+        if (on) {
+            var pos = p.position
+            if (newFile || !playing || pos < s.lastPos)  // a new file, or the clip just looped round
+                p.playbackRate = bitsPitchMin + Math.random() * (bitsPitchMax - bitsPitchMin)
+            s.lastPos = pos
+            if (!playing) p.play()
+        } else if (playing) {
+            p.pause()
+        }
+    }
+
     function hash(s) {  // small stable hash (FNV-1a)
         var h = 2166136261
         for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = (h * 16777619) >>> 0 }
@@ -161,6 +233,7 @@ Rectangle {
             var delta = n - chip.target
             chip.target = n
             if (delta <= 0) continue
+            st.lastFind = t
             var spray = Math.min(8, 1 + Math.floor(Math.log(delta + 1) / Math.LN2))
             for (var j = 0; j < spray && st.sparks.length < maxSparks; j++)
                 st.sparks.push({chip: chip, born: t + j * 0.06, bend: ((hash(kind + n + "/" + j) % 200) - 100) / 100})
@@ -201,6 +274,11 @@ Rectangle {
             ctx.fillRect(0, 0, width, height)
             var scale = Math.max(0.4, Math.min(1.0, width / 700, height / 780))
             var cx = width / 2, cy = Math.max(height * 0.36, 230 * scale)
+            var reading = root.current()
+            var newFile = reading !== st.reading
+            if (newFile) { if (reading !== null) root.playSfx("pop"); st.reading = reading }
+            var indexing = t - st.lastFind < sparkTime + 0.5  // finds still flying out (+ a hold over short gaps)
+            root.setBits((reading !== null && reading.x !== null) || indexing, newFile)
             drawIcons(ctx, t, dt, cx, cy, scale)
             drawCrumbs(ctx, t, dt, cx, cy, scale)
             var bump = Math.exp(-(t - st.pulse) * 6)
@@ -244,6 +322,7 @@ Rectangle {
                 var px = root.iconPx(ic.size, scale), alpha = 1, tilt = 0, extra = 1
                 if (ic.dive !== null && t >= ic.dive) {
                     if (ic.diveFrom === null) {
+                        root.playSfx("drop")
                         var sx = ic.x === null ? cx : ic.x, sy = ic.y === null ? cy : ic.y
                         ic.diveFrom = [Math.hypot(sx - cx, (sy - cy) / 0.82), Math.atan2((sy - cy) / 0.82, sx - cx)]
                     }

@@ -155,7 +155,7 @@ Unreal notes:
 - **Catalog your library**: tag games (right-click → Tags..., e.g. `lowpoly`, `fps`, `dead game`), then search, filter by tag, group by tag / engine / engine version / compatibility / loaded, and sort by name, engine version or asset count. The search box takes filters like `tag:lowpoly engine:unity version:2019 il2cpp`.
 - **Pin** favorite games to the top. The most recently opened games come next.
 - **Notes** for each game (right-click → Notes, or the Notes button in the viewer) for quirks and where the good stuff is.
-- **Loading screen** in the style of the old Garry's Mod one: the game's real files float around (one icon per file, sized by how big it is), the one being read sheds bits into the middle, and finished files get swallowed. While UniView indexes, the assets it finds fly out to a counter per kind (Models, Textures, Audio...). It stays smooth on huge games, with an elapsed timer and how many files and gigabytes are left.
+- **Loading screen** in the style of the old Garry's Mod one: the game's real files float around (one icon per file, sized by how big it is), the one being read sheds bits into the middle, and finished files get swallowed. While UniView indexes, the assets it finds fly out to a counter per kind (Models, Textures, Audio...). It stays smooth on huge games, with an elapsed timer and how many files and gigabytes are left. Optional sound effects (a pop, a drop, and a pitch-shifting 1s-and-0s loop) with a volume slider under Options > Loading screen sounds.
 - A **console**, `viewer.log` and `crash.log` for when something goes wrong.
 
 ## How to use

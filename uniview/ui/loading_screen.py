@@ -8,17 +8,28 @@ game loads: attach() connects the Loader's signals straight to the QML side (sig
 between). A Python paintEvent used to stutter with 250-1000 ms hitches.
 
 Plugins announce their files with progress.files() / progress.file() and their finds with progress.found()
-(engines/sdk.py). Plugins that only report done/total get that many anonymous icons instead."""
+(engines/sdk.py). Plugins that only report done/total get that many anonymous icons instead.
 
+Sounds (Sounds/ folder, settings in Options > Loading screen sounds): a pop when a file starts being read, a drop
+when it's swallowed, and a looping 1s-and-0s hum while its bits stream into the centre. QML plays them itself."""
+
+import ctypes
+import glob
 import os
 
+import PySide6
 from PySide6.QtCore import QObject, QUrl, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtQuick import QQuickWindow, QSGRendererInterface
 from PySide6.QtQuickWidgets import QQuickWidget
 
+try:  # only used from QML, but importing it here makes PyInstaller bundle the multimedia plugins (ffmpeg backend)
+    from PySide6 import QtMultimedia  # noqa: F401
+except ImportError:  # no sound then; the QML copes
+    pass
+
 from engines.sdk import KIND_LABELS, KINDS
-from uniview.constants import ICON_FILE, log
+from uniview.constants import ICON_FILE, SOUNDS_DIR, log
 from uniview.ui import theme
 
 QML_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "loading_screen.qml")
@@ -29,6 +40,32 @@ KIND_STYLE = {  # kind -> (icon label, colour)
     "text": ("TXT", "#a0a7b4"), "audio": ("WAV", "#d29922"), "file": ("FILE", "#8b9099"),
 }
 THEME_TOKENS = ("BG", "TEXT", "MUTED", "FAINT", "ACCENT", "RAISED", "BORDER_STRONG")
+SOUNDS = (  # QML name, file in Sounds/, settings option key, menu text
+    ("pop", "pop.mp3", "sound_pop", "File starts loading (pop)"),
+    ("drop", "Drop.mp3", "sound_drop", "File pulled into the centre (drop)"),
+    ("bits", "1And0s.mp3", "sound_bits", "Reading 1s and 0s (loop)"),
+)
+
+
+def sound_config(settings):
+    """{"volume": 0..1, "files": {name: file URL or ""}} for the QML side; "" = muted or missing."""
+    files = {}
+    for name, filename, key, _text in SOUNDS:
+        path = os.path.join(SOUNDS_DIR, filename)
+        on = settings.loading_sounds and settings.option(key) and os.path.isfile(path)
+        files[name] = QUrl.fromLocalFile(path).toString() if on else ""
+    return {"volume": settings.sound_volume, "files": files}
+
+
+def _quiet_ffmpeg():
+    """Qt plays the mp3s through its bundled FFmpeg, which prints decoder chatter ("[mp3float @ ...] Could not update
+    timestamps for skipped samples.") straight to stderr. Turn its log down to nothing - Qt reports real errors itself."""
+    for dll in glob.glob(os.path.join(os.path.dirname(PySide6.__file__), "*avutil*")):
+        try:
+            ctypes.CDLL(dll).av_log_set_level(-8)  # AV_LOG_QUIET; same module Qt loads, so it applies to Qt's decoding
+            return
+        except (OSError, AttributeError) as e:
+            log.debug("Couldn't quieten FFmpeg (%s): %s", dll, e)
 
 
 class _Bridge(QObject):
@@ -44,6 +81,7 @@ class LoadingScreen(QQuickWidget):
         # composite both. Must be set before the first Qt Quick window exists.
         QQuickWindow.setGraphicsApi(QSGRendererInterface.GraphicsApi.OpenGL)
         super().__init__(parent)
+        _quiet_ffmpeg()
         self._active = False
         self.bridge = _Bridge(self)
         self.rootContext().setContextProperty("bridge", self.bridge)
@@ -74,6 +112,14 @@ class LoadingScreen(QQuickWidget):
         })
         self._active = True
         self.bridge.event.emit("start", title)
+
+    def set_sounds(self, config):
+        """Apply sound_config(settings); safe to call mid-load."""
+        self.bridge.event.emit("sounds", config)
+
+    def preview_sound(self):
+        """Play the pop once at the current volume (after the volume slider moves)."""
+        self.bridge.event.emit("preview", None)
 
     def stop(self):
         self._active = False
