@@ -65,6 +65,9 @@ def surface(details):
     return {"mask": "cutout", "blend": "transparent", "add": "transparent"}.get(mode, "opaque")
 
 
+TMP_SHADER_PREFIX = "TextMeshPro/"  # TextMeshPro's shaders (TMP Essential Resources, imported by the builder)
+
+
 def pick_shader(details):
     """(built-in shader name, copy_all): the game's own shader if it's a built-in, else the closest built-in."""
     name = details.get("shader") or ""

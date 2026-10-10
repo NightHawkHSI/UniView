@@ -36,6 +36,20 @@ def test_flatten_map_pairs():
                        {"p": "m_Map.Array.data[0].second", "t": "i", "v": 1}]
 
 
+def test_flatten_animation_curve_is_one_entry():
+    key = {"serializedVersion": 3, "time": 0.0, "value": 1.0, "inSlope": 0.5, "outSlope": -0.5,
+           "tangentMode": 0, "weightedMode": 1, "inWeight": 0.25, "outWeight": 0.75}
+    tree = {"m_Size": {"minMaxState": 1, "maxCurve": {"serializedVersion": 2, "m_Curve": [key, dict(key, time=1.0)],
+                                                       "m_PreInfinity": 2, "m_PostInfinity": 1,
+                                                       "m_RotationOrder": 4}}}
+    out = flatten(tree, resolve)
+    assert out == [{"p": "m_Size.minMaxState", "t": "i", "v": 1},
+                   {"p": "m_Size.maxCurve", "t": "c", "v": 2, "n": 1,
+                    "k": [0.0, 1.0, 0.5, -0.5, 1.0, 0.25, 0.75, 1.0, 1.0, 0.5, -0.5, 1.0, 0.25, 0.75]}]
+    vector_keys = {"m_Curve": [{"time": 0.0, "value": {"x": 1.0, "y": 2.0, "z": 3.0}}], "m_PreInfinity": 2}
+    assert all(e["t"] != "c" for e in flatten({"pos": vector_keys}, resolve))  # only float curves
+
+
 class Library:
     def path_for(self, uid):
         return "Assets/x/Materials/M.mat" if uid == "material:x:1" else ""

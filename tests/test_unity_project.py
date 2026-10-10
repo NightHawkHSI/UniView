@@ -474,7 +474,76 @@ def test_data_assets_and_prefab_links(tmp_path):
     fields = lambda cls: set(re.findall(r"public \w+(?:\[\])? (\w+)",  # noqa: E731
                                         re.search(rf"public class {cls}\s*\{{(.*?)\}}", BUILDER_CS, re.S).group(1)))
     assert set(desc) <= fields("Description")
-    assert {"p", "t", "v", "s", "n", "c", "q"} <= fields("Prop")
+    assert {"p", "t", "v", "s", "n", "c", "q", "k"} <= fields("Prop")
+
+
+def test_physics_materials_are_data_assets():
+    from types import SimpleNamespace
+    assets = [Asset("data", name, name, uid=f"d:{i}", source="sharedassets0.assets",
+                    ref=SimpleNamespace(type=SimpleNamespace(name=cls)))
+              for i, (name, cls) in enumerate([("Ice", "PhysicMaterial"), ("Bouncy", "PhysicsMaterial2D"),
+                                               ("Rubber", "PhysicsMaterial"), ("Lit", "Shader"),
+                                               ("Item", "MonoBehaviour")])]
+    planned = [a.name for a, _ in up.plan_data(assets, "Assets")]
+    assert planned == ["Ice", "Bouncy", "Rubber", "Item"]
+
+
+class MixerSession(PrefabSession):
+    def mixer_info(self, reader):
+        return {"name": "MainMixer", "snapshots": ["Default", "Muffled"], "start": "Muffled",
+                "exposed": ["MusicVolume", "#1234abcd"],
+                "exposed_params": [{"name": "MusicVolume", "group": 1, "param": "volume"},
+                                   {"name": "#1234abcd", "group": -1, "param": ""}],
+                "groups": [{"name": "Master", "parent": -1, "volumes": {"Default": 0.0, "Muffled": -6.0},
+                            "pitches": {"Default": 1.0, "Muffled": 1.0}, "mute": False, "solo": False,
+                            "bypass": False, "effects": 1, "sources": []},
+                           {"name": "Music", "parent": 0, "volumes": {"Default": -3.0, "Muffled": -20.0},
+                            "pitches": {"Default": 1.0, "Muffled": 0.8}, "mute": True, "solo": False,
+                            "bypass": True, "effects": 1, "sources": ["Radio"]}]}
+
+
+def test_mixer_descriptions_match_builder_classes(tmp_path):
+    from types import SimpleNamespace
+    import re
+    from uniview.unity_builder import BUILDER_CS
+    mixer = Asset("data", "MainMixer", "m", uid="d:9", source="resources.assets",
+                  ref=SimpleNamespace(type=SimpleNamespace(name="AudioMixerController")))
+    prefab = Asset("scene", "Prefab: Crate", ("root", 1, 1), uid="prefab:crate", source="sharedassets1.assets")
+    root = tmp_path / "proj"
+    written, failed, _ = up.export_unity_project(MixerSession([mixer, prefab]), str(root), "6000.5.4f1",
+                                                 editor_exe=fake_editor(tmp_path))
+    assert failed == 0
+    desc = json.load(open(root / "Assets" / "UniView" / "Build" / "Data" / "MainMixer.mixer.json"))
+    assert desc["kind"] == "mixer" and desc["target"] == "Assets/Data/MainMixer.mixer"
+    m = desc["mixer"]
+    assert m["snapshots"] == ["Default", "Muffled"] and m["start"] == 1
+    assert m["groups"][1] == {"name": "Music", "parent": 0, "mute": 1, "solo": 0, "bypass": 1,
+                              "volumes": [-3.0, -20.0], "pitches": [1.0, 0.8]}
+    assert m["exposed"] == [{"name": "MusicVolume", "group": 1, "param": "volume"}]  # unknown targets left out
+    fields = lambda cls: set(re.findall(r"public \w+(?:\[\])? (\w+)",  # noqa: E731
+                                        re.search(rf"public class {cls}\s*\{{(.*?)\}}", BUILDER_CS, re.S).group(1)))
+    assert set(m) <= fields("MixerInfo")
+    assert set(m["groups"][0]) <= fields("MixerGroup")
+    assert set(m["exposed"][0]) <= fields("MixerParam")
+    # references: the mixer itself, or one of its groups by name
+    paths = {"d:9": str(root / "Assets" / "Data" / "MainMixer.mixer")}
+    props = up.component_props([{"p": "OutputAudioMixerGroup", "t": "ref", "asset": "d:9", "kind": "mixer",
+                                 "cls": "AudioMixerGroup", "sub": "Music"},
+                                {"p": "mixer", "t": "ref", "asset": "d:9", "kind": "mixer"}], paths, str(root))
+    assert props == [{"p": "OutputAudioMixerGroup", "t": "a", "s": "Assets/Data/MainMixer.mixer",
+                      "c": "AudioMixerGroup", "q": "Music"},
+                     {"p": "mixer", "t": "a", "s": "Assets/Data/MainMixer.mixer"}]
+
+
+def test_textmeshpro_description(tmp_path):
+    root = tmp_path / "proj"
+    assets = root / "Assets"
+    assert not up.write_textmeshpro_description(str(root), str(assets), [])
+    mats = [{"path": "Assets/Materials/Font Atlas Material.mat", "shader": "TextMeshPro/Distance Field"}]
+    assert up.write_textmeshpro_description(str(root), str(assets), mats)
+    desc = json.load(open(assets / "UniView" / "Build" / "TextMeshPro.json"))
+    assert desc["kind"] == "textmeshpro" and desc["materials"] == mats and desc["stamp"]
+    assert desc["target"] == "ProjectSettings/UniViewTextMeshPro.txt"
 
 
 def test_clip_description_matches_builder_classes(tmp_path):

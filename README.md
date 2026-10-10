@@ -179,7 +179,7 @@ Is there a game UniView can't read? You can teach it a new engine without touchi
 2. Fill in how to recognize the game's folder and how to read its models and textures.
 3. Restart UniView. **Help → Engine plugins** shows what loaded.
 
-The template is already a working "loose files" plugin (images, text and `.obj` models), so you can start from something that runs. [**PLUGINS.md**](PLUGINS.md) explains the API: assets, mesh conventions, materials and the helpers for Valve VPK and Unreal pak archives. A plugin with the same id as a built-in one replaces it, so you can also fix or extend the built-in engines. Pull requests for new engines are welcome.
+The template is already a working "loose files" plugin (images, text and `.obj` models), so you can start from something that runs. [**PLUGINS.md**](PLUGINS.md) explains the API: assets, mesh conventions, materials and the helpers for Valve VPK and Unreal pak archives. A plugin with the same id as a built-in one replaces it, so you can also fix or extend the built-in engines. Pull requests for new engines are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Run from source
 

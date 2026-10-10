@@ -39,7 +39,7 @@ SOURCE_FILES = [
     "unity_viewer.py", "uniview", "requirements.txt", "run.bat", "build.bat", "build.py",
     "Icon.png", "README.md", "LICENSE", "CREDITS.md", ".gitignore", "ScreenShots", "compat.json",
     "engines", "plugins", "PLUGINS.md", "tests", "third_party_licenses",
-    ".github", "ruff.toml", "requirements-dev.txt", "Sounds",
+    ".github", "ruff.toml", "requirements-dev.txt", "Sounds", "CONTRIBUTING.md",
 ]
 
 

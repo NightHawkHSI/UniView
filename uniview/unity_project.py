@@ -36,7 +36,7 @@ from uniview.search import is_unreadable
 from uniview.unity_builder import ADDRESSABLES_ASMDEF, ADDRESSABLES_CS, BUILDER_CS, LIGHTMAPS_ASMDEF, LIGHTMAPS_CS
 from uniview.unity_layout import KIND_FOLDERS, Layout, collect_usage
 from uniview.unity_layout import target as layout_target
-from uniview.unity_materials import convert, mat_yaml
+from uniview.unity_materials import TMP_SHADER_PREFIX, convert, mat_yaml
 from uniview.unity_terrains import data_key, is_terrain, plan_terrains, write_terrain_descriptions
 from uniview.unity_packages import (
     ASSEMBLY_PACKAGES,
@@ -258,6 +258,7 @@ class MaterialLibrary:
         self.session, self.root, self.assets_dir = session, root, assets_dir
         self.pipeline = pipeline            # "urp": materials keep the game's shader settings (see swaps)
         self.swaps = []                     # [{"path", "shader", "keywords", "queue", "lit", ...}] for the builder
+        self.tmp = []                       # [{"path", "shader"}]: TextMeshPro materials (TMP's shaders put back)
         self.layout = layout or Layout()
         self.texture_paths = texture_paths  # texture asset key -> exported path
         self.paths = {}                     # material uid -> "Assets/..." ('' if it couldn't be written)
@@ -331,6 +332,8 @@ class MaterialLibrary:
             f.write(mat_yaml(m))
         write_meta(path, asset_guid(uid))
         write_folder_metas(self.assets_dir, folder)
+        if (details.get("shader") or "").startswith(TMP_SHADER_PREFIX):
+            self.tmp.append({"path": unity_path(self.root, path), "shader": details["shader"]})
         if "game_shader" in m:
             self.swaps.append({"path": unity_path(self.root, path), "shader": m["game_shader"],
                                "keywords": m["game_keywords"], "queue": int(m["game_queue"]),
@@ -358,6 +361,11 @@ def component_props(props, asset_paths, root, materials=None, prefab_objects=Non
             found = (prefab_objects or {}).get(e["asset"])
             if found:
                 out.append({"p": e["p"], "t": "a", "s": found[0], "c": e.get("cls") or "GameObject", "q": found[1]})
+        elif e.get("kind") == "mixer":  # the mixer, or one of its groups / snapshots (c = class, q = its name)
+            path = asset_paths.get(e.get("asset"))
+            if path:
+                out.append({"p": e["p"], "t": "a", "s": unity_path(root, path), **(
+                    {"c": e["cls"], "q": e.get("sub", "")} if e.get("cls") else {})})
         elif e.get("kind") == "material":
             path = materials.path_for(e["asset"]) if materials is not None else ""
             if path:
@@ -615,6 +623,24 @@ def project_pipeline(session, packages):
     return pipeline
 
 
+def write_textmeshpro_description(root, assets_dir, materials):
+    """Assets/UniView/Build/TextMeshPro.json: the builder imports TMP Essential Resources (TextMeshPro's shaders and
+    settings) and puts the game's TMP shader back on these materials ([{"path", "shader"}]). Applied once per
+    "stamp" (marker ProjectSettings/UniViewTextMeshPro.txt)."""
+    if not materials:
+        return False
+    desc = {"version": 1, "kind": "textmeshpro", "target": "ProjectSettings/UniViewTextMeshPro.txt",
+            "materials": materials, "nodes": []}
+    desc["stamp"] = hashlib.sha1(json.dumps(desc, sort_keys=True).encode("utf-8")).hexdigest()
+    path = os.path.join(assets_dir, *BUILD_DIR, "TextMeshPro.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(desc, f, separators=(",", ":"))
+    write_meta(path, asset_guid("uniview:textmeshpro"))
+    write_folder_metas(assets_dir, os.path.dirname(path))
+    return True
+
+
 def write_pipeline_description(root, assets_dir, pipeline, swaps):
     """Assets/UniView/Build/RenderPipeline.json: the game's URP / HDRP asset settings, for a new pipeline asset the builder
     makes and puts in Graphics / Quality settings, and the materials whose shader it puts back (MaterialLibrary.swaps).
@@ -840,18 +866,79 @@ def prefab_object_map(session, root, assets_dir, layout=None):
     return out
 
 
+PHYSICS_MATERIALS = ("PhysicMaterial", "PhysicsMaterial", "PhysicsMaterial2D")  # built-in data assets
+
+
 def plan_data(assets, assets_dir, layout=None):
-    """[(data asset, target .asset path)]: the game's ScriptableObjects (item stats, loot tables...)."""
+    """[(data asset, target .asset path)]: the game's ScriptableObjects (item stats, loot tables...) and physics
+    materials."""
     layout = layout or Layout(assets)
     out, used = [], set()
     for asset in assets:
         if asset.kind != "data" or asset.source in BUILTIN_SOURCES:
             continue
-        if getattr(getattr(asset.ref, "type", None), "name", "") != "MonoBehaviour":
+        if getattr(getattr(asset.ref, "type", None), "name", "") not in ("MonoBehaviour",) + PHYSICS_MATERIALS:
             continue
         folder, stem, _how = layout.place(asset, KIND_FOLDERS["data"])
         out.append((asset, layout_target(assets_dir, folder, stem or "Data", "asset", used)))
     return out
+
+
+def plan_mixers(session, assets_dir, layout=None):
+    """[(AudioMixer asset, target .mixer path)]; empty if the session can't describe mixers."""
+    if not hasattr(session, "mixer_info"):
+        return []
+    layout = layout or Layout(session.assets)
+    out, used = [], set()
+    for asset in session.assets:
+        if asset.kind != "data" or asset.source in BUILTIN_SOURCES:
+            continue
+        if getattr(getattr(asset.ref, "type", None), "name", "") != "AudioMixerController":
+            continue
+        folder, stem, _how = layout.place(asset, KIND_FOLDERS["data"])
+        out.append((asset, layout_target(assets_dir, folder, stem or "Mixer", "mixer", used)))
+    return out
+
+
+def mixer_description(info, target):
+    """The JSON description UniViewBuilder.cs turns into an AudioMixer: groups (parent first), snapshots with each
+    group's volume / pitch, the start snapshot and exposed parameters."""
+    snapshots = info["snapshots"] or ["Snapshot"]
+    groups = []
+    for g in info["groups"]:
+        groups.append({"name": g["name"], "parent": g["parent"], "mute": int(g["mute"]), "solo": int(g["solo"]),
+                       "bypass": int(g["bypass"]),
+                       "volumes": [float(g["volumes"].get(s, 0.0)) for s in snapshots],
+                       "pitches": [float(g.get("pitches", {}).get(s, 1.0)) for s in snapshots]})
+    exposed = [{"name": e["name"], "group": e["group"], "param": e["param"]}
+               for e in info.get("exposed_params") or [] if e["group"] >= 0 and e["param"]]
+    start = snapshots.index(info["start"]) if info.get("start") in snapshots else 0
+    return {"version": 1, "kind": "mixer", "target": target, "nodes": [],
+            "mixer": {"name": info["name"], "snapshots": snapshots, "start": start, "groups": groups,
+                      "exposed": exposed}}
+
+
+def write_mixer_descriptions(session, root, assets_dir, mixer_plan, cancelled=None):
+    """One JSON per AudioMixer (built by UniViewBuilder.cs before the prefabs, which route sounds into its groups);
+    returns (written, failed)."""
+    written = failed = 0
+    build_dir = os.path.join(assets_dir, *BUILD_DIR)
+    for asset, target in mixer_plan:
+        if cancelled is not None and cancelled():
+            break
+        try:
+            desc = mixer_description(session.mixer_info(asset.ref), unity_path(root, target))
+            path = os.path.join(build_dir, os.path.relpath(target, assets_dir) + ".json")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(desc, f, separators=(",", ":"))
+            write_meta(path, asset_guid(f"{asset.uid}:description"))
+            write_folder_metas(assets_dir, os.path.dirname(path))
+            written += 1
+        except Exception as e:
+            failed += 1
+            log.warning("Could not describe audio mixer '%s': %s", asset.name, e)
+    return written, failed
 
 
 def write_sprites_description(session, root, assets_dir, model_paths):
@@ -1260,6 +1347,8 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
                    if hasattr(session, "material_details") else None)
         data_plan = plan_data(session.assets, assets_dir, layout)
         model_paths.update({a.uid: p for a, p in data_plan})  # links to data assets
+        mixer_plan = plan_mixers(session, assets_dir, layout)
+        model_paths.update({a.uid: p for a, p in mixer_plan})  # links to audio mixers (and their groups)
         clip_plan = plan_clips(session.assets, assets_dir, layout)
         model_paths.update({a.uid: p for a, p in clip_plan})  # links to animation clips
         controller_plan = plan_controllers(session, assets_dir, layout)
@@ -1285,8 +1374,9 @@ def export_unity_project(session, root, version="", progress=None, cancelled=Non
         clips, clip_failed = write_clip_descriptions(session, root, assets_dir, clip_plan, sprite_links, cancelled)
         ctrls, ctrl_failed = write_controller_descriptions(session, root, assets_dir, controller_plan, model_paths,
                                                            cancelled)
-        written += data + clips + ctrls
-        failed += data_failed + clip_failed + ctrl_failed
+        mixers, mixer_failed = write_mixer_descriptions(session, root, assets_dir, mixer_plan, cancelled)
+        written += data + clips + ctrls + mixers
+        failed += data_failed + clip_failed + ctrl_failed + mixer_failed
         if (prefabs or scenes) and write_settings_description(session, root, assets_dir,
                                                                 plan_scenes(session.assets, assets_dir, layout)):
             written += 1

@@ -25,6 +25,9 @@ TYPE_KINDS = {"Mesh": "model", "Texture2D": "texture", "Sprite": "sprite", "Text
               "AnimatorController": "controller", "AnimatorOverrideController": "controller", "Shader": "data",
               "AudioMixerController": "data"}
 BUILTIN_DATA = ("PhysicMaterial", "PhysicsMaterial", "PhysicsMaterial2D")  # data assets that aren't scripts
+# AudioMixer objects -> the class a reference to them has in the editor ("" = the mixer itself)
+MIXER_PARTS = {"AudioMixerController": "", "AudioMixerGroupController": "AudioMixerGroup",
+               "AudioMixerSnapshotController": "AudioMixerSnapshot"}
 ALBEDO_PROPS = ("_MainTex", "_BaseMap", "_BaseColorMap", "_Albedo", "_BaseColorTexture")
 NORMAL_PROPS = ("_BumpMap", "_NormalMap")
 
@@ -2026,8 +2029,10 @@ class UnitySession(GameSession):
                 return {"asset": f"terraindata:{obj.assets_file.name}:{obj.path_id}", "kind": "file"}
             if name == "AnimatorController":
                 return {"asset": f"controller:{obj.assets_file.name}:{obj.path_id}", "kind": "file"}
+            if name in MIXER_PARTS:
+                return self._mixer_ref(obj, name)
             listed = self.by_key.get(key)
-            if name == "MonoBehaviour" and listed is not None and listed.kind == "data":
+            if name in ("MonoBehaviour",) + BUILTIN_DATA and listed is not None and listed.kind == "data":
                 return {"asset": listed.uid, "kind": "data"}
             try:  # a component (Transform, Rigidbody, a script...) of another prefab: its GameObject + type
                 go = obj.read_typetree().get("m_GameObject") or {}
@@ -2067,6 +2072,19 @@ class UnitySession(GameSession):
             for root in self._scene_roots(asset):
                 visit(root, None, 0)
         return out
+
+    def _mixer_ref(self, obj, name):
+        """A reference to an AudioMixer ({"asset": mixer uid, "kind": "mixer"}) or to one of its groups / snapshots
+        (+ "cls": "AudioMixerGroup" / "AudioMixerSnapshot", "sub": its name), or None."""
+        mixer, extra = obj, {}
+        if name != "AudioMixerController":
+            tree = obj.read_typetree()
+            mixer = self._ptr_reader(obj, tree.get("m_AudioMixer"))
+            if mixer is None:
+                return None
+            extra = {"cls": MIXER_PARTS[name], "sub": tree.get("m_Name", "")}
+        listed = self.by_key.get(obj_key(mixer.assets_file, mixer.path_id))
+        return {"asset": listed.uid, "kind": "mixer", **extra} if listed is not None else None
 
     def data_asset(self, asset):
         """(script class, unity_components.flatten() props) of a ScriptableObject data asset, or None."""
@@ -2327,8 +2345,11 @@ class UnitySession(GameSession):
             volumes = {snap_names[i]: float(s["values"][vol]) for i, s in enumerate(snaps)
                        if 0 <= vol < len(s.get("values") or [])}
             guid = next((k for k, v in guid_index.items() if v == n), None)
+            pitch = g.get("pitchIndex", -1)
+            pitches = {snap_names[i]: float(s["values"][pitch]) for i, s in enumerate(snaps)
+                       if 0 <= pitch < len(s.get("values") or [])}
             groups.append({"name": group_names[n] if n < len(group_names) and group_names[n] else f"Group {n}",
-                           "parent": int(g.get("parentConstantIndex", -1)), "volumes": volumes,
+                           "parent": int(g.get("parentConstantIndex", -1)), "volumes": volumes, "pitches": pitches,
                            "mute": bool(g.get("mute")), "solo": bool(g.get("solo")),
                            "bypass": bool(g.get("bypassEffects")), "effects": effects[n],
                            "sources": sources.get(guid, [])})
@@ -2336,9 +2357,18 @@ class UnitySession(GameSession):
         names = self._crc_names()
         exposed = [names.get(int(h) & 0xFFFFFFFF, f"#{int(h) & 0xFFFFFFFF:08x}")
                    for h in mc.get("exposedParameterNames") or []]
+        # What each exposed parameter drives: a group's volume or pitch (effect parameters aren't named).
+        targets = {}
+        for n, g in enumerate(mc.get("groups") or []):
+            targets[g.get("volumeIndex", -1)] = (n, "volume")
+            targets[g.get("pitchIndex", -1)] = (n, "pitch")
+        exposed_params = []
+        for name, index in zip(exposed, mc.get("exposedParameterIndices") or []):
+            group, param = targets.get(index, (-1, ""))
+            exposed_params.append({"name": name, "group": group, "param": param})
         return {"name": tree.get("m_Name", "Mixer"), "snapshots": snap_names,
                 "start": start.peek_name() if start is not None else (snap_names[0] if snap_names else ""),
-                "exposed": exposed, "groups": groups}
+                "exposed": exposed, "exposed_params": exposed_params, "groups": groups}
 
     def _crc_names(self):
         """{CRC32: text} of the strings in the game's own code (its .NET assemblies, or IL2CPP's

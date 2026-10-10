@@ -60,6 +60,8 @@ def prop_value(entry, nodes, by_uid):
         return "true" if entry["v"] else "false"
     if t == "f":
         return f"{entry['v']:g}"
+    if t == "c":
+        return f"curve ({len(entry['k']) // 7} keys)"
     return str(entry["v"])
 
 

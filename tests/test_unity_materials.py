@@ -230,3 +230,4 @@ def test_convert_hdrp_keeps_game_mask_map_remaps():
     m = um.convert(d, guid, pipeline="hdrp")
     assert m["floats"]["_AORemapMin"] == 0.2 and m["floats"]["_SurfaceType"] == 1
     assert m["game_shader"] == "HDRP/Lit" and m["game_keywords"] == ["_MASKMAP"]
+

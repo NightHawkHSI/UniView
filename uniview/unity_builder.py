@@ -54,6 +54,8 @@ namespace UniView
         public int n;
         public string c;   // "a" into another prefab: the object's class (GameObject, Transform, a component)
         public string q;   // ...and its child path in that prefab ("" = root)
+        public float[] k;  // t "c": an AnimationCurve, 7 floats per key (time value inSlope outSlope weightedMode
+                           // inWeight outWeight); v = pre-wrap mode, n = post-wrap mode
     }
 
     [Serializable]
@@ -312,6 +314,37 @@ namespace UniView
         public string pipeline;      // kind "pipeline": "urp" or "hdrp" (props: the pipeline asset's settings)
         public MatSwap[] materials;  // kind "pipeline": materials to put back on the game's shaders
         public string stamp;         // kind "pipeline": changes with the contents (applied again after a new export)
+        public MixerInfo mixer;      // kind "mixer"
+    }
+
+    [Serializable]
+    public class MixerGroup
+    {
+        public string name;
+        public int parent;       // index into groups, -1 = the master group
+        public int mute;
+        public int solo;
+        public int bypass;
+        public float[] volumes;  // dB, per snapshot
+        public float[] pitches;  // per snapshot
+    }
+
+    [Serializable]
+    public class MixerParam
+    {
+        public string name;
+        public int group;
+        public string param;  // "volume" or "pitch"
+    }
+
+    [Serializable]
+    public class MixerInfo
+    {
+        public string name;
+        public string[] snapshots;
+        public int start;
+        public MixerGroup[] groups;
+        public MixerParam[] exposed;
     }
 
     [Serializable]
@@ -341,6 +374,7 @@ namespace UniView
         const string SpritesMarker = "ProjectSettings/UniViewSpritesApplied.txt";
         const string PipelineMarker = "ProjectSettings/UniViewPipelineApplied.txt";
         const string AddressablesMarker = "ProjectSettings/UniViewAddressablesApplied.txt";
+        const string TextMeshProMarker = "ProjectSettings/UniViewTextMeshPro.txt";
         const string ScriptsParked = "Assets/UniView/GameScripts~";   // ignored by Unity
         const string ScriptsActive = "Assets/GameScripts";
         const string RebuildMarker = "ProjectSettings/UniViewRebuildAfterScripts.txt";
@@ -362,7 +396,8 @@ namespace UniView
             {
                 Description d = Load(file);
                 if (d != null && (d.kind == "pipeline" ? !PipelineApplied(d)
-                                  : d.kind == "addressables" ? !Stamped(AddressablesMarker, d) : !File.Exists(d.target)))
+                                  : d.kind == "addressables" ? !Stamped(AddressablesMarker, d)
+                                  : d.kind == "textmeshpro" ? !Stamped(TextMeshProMarker, d) : !File.Exists(d.target)))
                 { BuildMissing(); return; }
             }
         }
@@ -489,6 +524,7 @@ namespace UniView
             var clips = new List<Description>();
             var controllers = new List<Description>();
             var terrains = new List<Description>();
+            var mixers = new List<Description>();
             string addressables = null;
             foreach (string file in Descriptions())
             {
@@ -519,6 +555,17 @@ namespace UniView
                     if (!onlyMissing || !File.Exists(d.target)) data.Add(d);
                     continue;
                 }
+                if (d != null && d.kind == "textmeshpro")
+                {
+                    // After the pipeline (whose material swap can't find TMP's shaders yet), before any TMP text.
+                    if (!onlyMissing || !Stamped(TextMeshProMarker, d)) ApplyTextMeshPro(d);
+                    continue;
+                }
+                if (d != null && d.kind == "mixer")
+                {
+                    if (!onlyMissing || !File.Exists(d.target)) mixers.Add(d);
+                    continue;
+                }
                 if (d != null && d.kind == "settings")
                 {
                     // First: tags and layers must exist before objects can use them.
@@ -544,6 +591,8 @@ namespace UniView
             int clipsMade = BuildClips(clips);  // before prefabs: Animation components point at clips
             int controllersMade = BuildControllers(controllers);  // Animators point at controllers
             int dataMade = CreateDataAssets(data);
+            int mixersMade = BuildMixers(mixers);  // AudioSources and scripts point at mixer groups
+            if (mixers.Count > 0) Debug.Log("UniView: " + mixersMade + " of " + mixers.Count + " audio mixer(s) built");
             int terrainsMade = 0;
             bool terrainsBuilt = false;
             if (todo.Count == 0)
@@ -1220,6 +1269,21 @@ namespace UniView
             int made = 0;
             foreach (Description d in data)
             {
+                Type native = NativeDataType(d.script);
+                if (native != null)
+                {
+                    if (AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(d.target) != null) { made++; continue; }
+                    try
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(d.target));
+                        var asset = (UnityEngine.Object)Activator.CreateInstance(native);
+                        asset.name = Path.GetFileNameWithoutExtension(d.target);
+                        AssetDatabase.CreateAsset(asset, d.target);
+                        made++;
+                    }
+                    catch (Exception e) { Debug.LogWarning("UniView: couldn't create " + d.target + ": " + e.Message); }
+                    continue;
+                }
                 Type type = string.IsNullOrEmpty(d.script) ? null : ScriptType(d.script);
                 if (type == null || !typeof(ScriptableObject).IsAssignableFrom(type))
                 {
@@ -1244,12 +1308,284 @@ namespace UniView
         {
             foreach (Description d in data)
             {
+                if (NativeDataType(d.script) != null)
+                {
+                    var native = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(d.target);
+                    if (native != null && d.props != null) { SetNativeData(native, d.props); EditorUtility.SetDirty(native); }
+                    continue;
+                }
                 var obj = AssetDatabase.LoadAssetAtPath<ScriptableObject>(d.target);
                 if (obj == null || d.props == null) continue;
                 var so = new SerializedObject(obj);
                 foreach (Prop pr in d.props) SetProp(so, pr, null, null, new Dictionary<string, Renderer>());
                 so.ApplyModifiedPropertiesWithoutUndo();
                 EditorUtility.SetDirty(obj);
+            }
+        }
+
+        // ---- TextMeshPro
+        static void ApplyTextMeshPro(Description d)
+        {
+            File.WriteAllText(TextMeshProMarker, "UniView imported TMP Essential Resources and put TextMeshPro's shaders back (delete this file to do it again).\n" + d.stamp + "\n");
+            if (Shader.Find("TextMeshPro/Distance Field") == null)
+            {
+                string package = null;
+                foreach (string name in new[] { "com.unity.ugui", "com.unity.textmeshpro" })
+                {
+                    var info = UnityEditor.PackageManager.PackageInfo.FindForAssetPath("Packages/" + name);
+                    string file = info == null ? null : Path.Combine(info.resolvedPath, "Package Resources/TMP Essential Resources.unitypackage");
+                    if (file != null && File.Exists(file)) { package = file; break; }
+                }
+                if (package == null)
+                {
+                    Debug.LogWarning("UniView: the game uses TextMeshPro, but TMP Essential Resources weren't found (add the TextMeshPro package, then Window > TextMeshPro > Import TMP Essential Resources)");
+                    return;
+                }
+                AssetDatabase.ImportPackage(package, false);
+                AssetDatabase.Refresh();
+            }
+            int restored = 0, missing = 0;
+            foreach (MatSwap m in d.materials ?? new MatSwap[0])
+            {
+                var mat = AssetDatabase.LoadAssetAtPath<Material>(m.path);
+                if (mat == null) continue;
+                Shader shader = Shader.Find(m.shader) ?? Shader.Find("TextMeshPro/Distance Field");
+                if (shader == null) { missing++; continue; }
+                mat.shader = shader;  // the game's TMP settings were kept in the .mat
+                EditorUtility.SetDirty(mat);
+                restored++;
+            }
+            AssetDatabase.SaveAssets();
+            Debug.Log("UniView: TextMeshPro: " + restored + " material(s) back on TMP shaders" + (missing > 0 ? ", " + missing + " without one" : ""));
+        }
+
+        // A TMP font's atlas comes out as a PNG next to it; TMP needs it readable (dynamic fonts add glyphs at run time)
+        // and in the font asset itself, like TMP's own fonts. The PNG's alpha is the signed distance field.
+        static void FontAtlasAsSubAsset(Description d)
+        {
+            var font = AssetDatabase.LoadAssetAtPath<ScriptableObject>(d.target);
+            if (font == null) return;
+            var so = new SerializedObject(font);
+            SerializedProperty atlases = so.FindProperty("m_AtlasTextures");
+            SerializedProperty width = so.FindProperty("m_AtlasWidth"), height = so.FindProperty("m_AtlasHeight");
+            if (atlases == null || !atlases.isArray) return;
+            var existing = new Dictionary<string, Texture2D>();
+            foreach (UnityEngine.Object o in AssetDatabase.LoadAllAssetsAtPath(d.target))
+                if (o is Texture2D) existing[o.name] = (Texture2D)o;
+            Texture2D first = null;
+            for (int i = 0; i < atlases.arraySize; i++)
+            {
+                SerializedProperty item = atlases.GetArrayElementAtIndex(i);
+                var source = item.objectReferenceValue as Texture2D;
+                if (source != null && AssetDatabase.GetAssetPath(source) == d.target) { if (first == null) first = source; continue; }
+                int w = width != null && width.intValue > 0 ? width.intValue : (source != null ? source.width : 1024);
+                int h = height != null && height.intValue > 0 ? height.intValue : (source != null ? source.height : 1024);
+                string name = font.name + " Atlas" + (i > 0 ? " " + i : "");
+                Texture2D atlas;
+                if (existing.TryGetValue(name, out atlas) && (atlas.width != w || atlas.height != h))
+                {
+                    AssetDatabase.RemoveObjectFromAsset(atlas);
+                    UnityEngine.Object.DestroyImmediate(atlas, true);
+                    atlas = null;
+                }
+                bool added = atlas == null;
+                if (added) atlas = new Texture2D(w, h, TextureFormat.Alpha8, false) { name = name };
+                var pixels = new Color32[w * h];
+                string png = source != null ? AssetDatabase.GetAssetPath(source) : null;
+                if (!string.IsNullOrEmpty(png) && File.Exists(png))
+                {
+                    var read = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+                    if (read.LoadImage(File.ReadAllBytes(png)) && read.width == w && read.height == h) pixels = read.GetPixels32();
+                    UnityEngine.Object.DestroyImmediate(read);
+                }
+                atlas.SetPixels32(pixels);
+                atlas.Apply(false, false);  // stays readable
+                if (added) AssetDatabase.AddObjectToAsset(atlas, font);
+                item.objectReferenceValue = atlas;
+                if (first == null) first = atlas;
+            }
+            so.ApplyModifiedPropertiesWithoutUndo();
+            SerializedProperty material = so.FindProperty("m_Material");
+            var mat = material != null ? material.objectReferenceValue as Material : null;
+            if (mat != null && first != null && mat.HasProperty("_MainTex"))
+            {
+                mat.SetTexture("_MainTex", first);
+                EditorUtility.SetDirty(mat);
+            }
+            EditorUtility.SetDirty(font);
+        }
+
+        // ---- audio mixers. AudioMixerController is an internal editor class, so it's driven by reflection.
+        static int BuildMixers(List<Description> mixers)
+        {
+            if (mixers.Count == 0) return 0;
+            System.Reflection.Assembly editor = typeof(Editor).Assembly;
+            Type controllerType = editor.GetType("UnityEditor.Audio.AudioMixerController");
+            Type groupType = editor.GetType("UnityEditor.Audio.AudioMixerGroupController");
+            Type paramType = editor.GetType("UnityEditor.Audio.ExposedAudioParameter");
+            if (controllerType == null || groupType == null || paramType == null)
+            {
+                Debug.LogWarning("UniView: this editor's AudioMixer classes aren't the ones UniView knows - mixers skipped");
+                return 0;
+            }
+            int made = 0;
+            foreach (Description d in mixers)
+            {
+                if (d.mixer == null) continue;
+                try
+                {
+                    if (File.Exists(d.target)) AssetDatabase.DeleteAsset(d.target);
+                    Directory.CreateDirectory(Path.GetDirectoryName(d.target));
+                    BuildMixer(d.mixer, d.target, controllerType, groupType, paramType);
+                    made++;
+                }
+                catch (Exception e)
+                {
+                    Exception inner = e is System.Reflection.TargetInvocationException && e.InnerException != null ? e.InnerException : e;
+                    Debug.LogWarning("UniView: couldn't build the audio mixer " + d.target + ": " + inner.Message);
+                }
+            }
+            AssetDatabase.SaveAssets();
+            return made;
+        }
+
+        const System.Reflection.BindingFlags AnyMember = System.Reflection.BindingFlags.Public
+            | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Static;
+
+        static object Call(object target, Type type, string method, params object[] args)
+        {
+            System.Reflection.MethodInfo m = type.GetMethod(method, AnyMember);
+            if (m == null) throw new MissingMethodException(type.Name, method);
+            return m.Invoke(target, args);
+        }
+
+        static object Get(object target, string property)
+        {
+            return target.GetType().GetProperty(property, AnyMember).GetValue(target, null);
+        }
+
+        static void Set(object target, string property, object value)
+        {
+            target.GetType().GetProperty(property, AnyMember).SetValue(target, value, null);
+        }
+
+        static void BuildMixer(MixerInfo info, string path, Type controllerType, Type groupType, Type paramType)
+        {
+            // A new mixer has a Master group and one snapshot ("Snapshot").
+            object controller = Call(null, controllerType, "CreateMixerControllerAtPath", path);
+            var snapshots = new List<object>((IEnumerable<object>)Get(controller, "snapshots"));
+            for (int i = 1; i < info.snapshots.Length; i++)
+            {
+                Set(controller, "TargetSnapshot", snapshots[0]);
+                Call(controller, controllerType, "CloneNewSnapshotFromTarget", false);
+                snapshots = new List<object>((IEnumerable<object>)Get(controller, "snapshots"));
+            }
+            for (int i = 0; i < snapshots.Count && i < info.snapshots.Length; i++)
+                ((UnityEngine.Object)snapshots[i]).name = info.snapshots[i];
+            if (info.start >= 0 && info.start < snapshots.Count) Set(controller, "startSnapshot", snapshots[info.start]);
+            Set(controller, "TargetSnapshot", snapshots[info.start >= 0 && info.start < snapshots.Count ? info.start : 0]);
+
+            // Groups in the game's order (a parent always comes before its children); the game's root is Master.
+            var made = new object[info.groups.Length];
+            object master = Get(controller, "masterGroup");
+            for (int i = 0; i < info.groups.Length; i++)
+            {
+                MixerGroup g = info.groups[i];
+                object group;
+                if (g.parent < 0)
+                {
+                    group = master;
+                    ((UnityEngine.Object)group).name = g.name;
+                }
+                else
+                {
+                    group = Call(controller, controllerType, "CreateNewGroup", g.name, false);
+                    object parent = g.parent < i && made[g.parent] != null ? made[g.parent] : master;
+                    Call(controller, controllerType, "AddChildToParent", group, parent);
+                }
+                made[i] = group;
+                Set(group, "mute", g.mute != 0);
+                Set(group, "solo", g.solo != 0);
+                Set(group, "bypassEffects", g.bypass != 0);
+                for (int s = 0; s < snapshots.Count; s++)
+                {
+                    if (g.volumes != null && s < g.volumes.Length)
+                        Call(group, groupType, "SetValueForVolume", controller, snapshots[s], g.volumes[s]);
+                    if (g.pitches != null && s < g.pitches.Length)
+                        Call(group, groupType, "SetValueForPitch", controller, snapshots[s], g.pitches[s]);
+                }
+            }
+
+            // Exposed parameters: the game's names on the same group volume / pitch.
+            var exposed = new List<object>();
+            foreach (MixerParam e in info.exposed ?? new MixerParam[0])
+            {
+                if (e.group < 0 || e.group >= made.Length || made[e.group] == null) continue;
+                object guid = Call(made[e.group], groupType, e.param == "pitch" ? "GetGUIDForPitch" : "GetGUIDForVolume");
+                object item = Activator.CreateInstance(paramType);
+                paramType.GetField("guid").SetValue(item, guid);
+                paramType.GetField("name").SetValue(item, e.name);
+                exposed.Add(item);
+            }
+            if (exposed.Count > 0)
+            {
+                Array array = Array.CreateInstance(paramType, exposed.Count);
+                for (int i = 0; i < exposed.Count; i++) array.SetValue(exposed[i], i);
+                Set(controller, "exposedParameters", array);
+                Call(controller, controllerType, "OnChangedExposedParameter");
+            }
+            ((UnityEngine.Object)controller).name = Path.GetFileNameWithoutExtension(path);
+            EditorUtility.SetDirty((UnityEngine.Object)controller);
+            AssetDatabase.SaveAssets();
+        }
+
+        // A group or snapshot of an exported mixer, by name.
+        static UnityEngine.Object MixerPart(string mixerPath, string name, string cls)
+        {
+            foreach (UnityEngine.Object o in AssetDatabase.LoadAllAssetsAtPath(mixerPath))
+                if (o != null && o.name == name && (cls == "AudioMixerGroup" ? o is UnityEngine.Audio.AudioMixerGroup
+                                                                              : o is UnityEngine.Audio.AudioMixerSnapshot))
+                    return o;
+            return null;
+        }
+
+        // Built-in data assets that aren't ScriptableObjects: physics materials (PhysicMaterial was renamed
+        // PhysicsMaterial in Unity 6, so the type is looked up by name).
+        static Type NativeDataType(string script)
+        {
+            if (script == "PhysicsMaterial2D")
+                return Type.GetType("UnityEngine.PhysicsMaterial2D, UnityEngine.Physics2DModule")
+                       ?? Type.GetType("UnityEngine.PhysicsMaterial2D, UnityEngine");
+            if (script == "PhysicMaterial" || script == "PhysicsMaterial")
+                return Type.GetType("UnityEngine.PhysicsMaterial, UnityEngine.PhysicsModule")
+                       ?? Type.GetType("UnityEngine.PhysicMaterial, UnityEngine.PhysicsModule")
+                       ?? Type.GetType("UnityEngine.PhysicMaterial, UnityEngine");
+            return null;
+        }
+
+        // Saved fields (dynamicFriction, m_Bounciness...) -> the C# properties of the same name, whatever the
+        // editor version calls the serialized field.
+        static void SetNativeData(UnityEngine.Object obj, Prop[] props)
+        {
+            foreach (Prop pr in props)
+            {
+                if (pr.t != "f" && pr.t != "i" && pr.t != "b") continue;
+                string name = pr.p.StartsWith("m_") ? pr.p.Substring(2) : pr.p;
+                if (name.Length == 0 || name.Contains(".")) continue;
+                name = char.ToLowerInvariant(name[0]) + name.Substring(1);
+                var property = obj.GetType().GetProperty(name);
+                if (property == null || !property.CanWrite) { valuesSkipped++; continue; }
+                try
+                {
+                    Type pt = property.PropertyType;
+                    object value = pt.IsEnum ? Enum.ToObject(pt, (int)pr.v)
+                                 : pt == typeof(bool) ? (object)(pr.v != 0)
+                                 : pt == typeof(int) ? (object)(int)pr.v
+                                 : (object)(float)pr.v;
+                    property.SetValue(obj, value, null);
+                    valuesSet++;
+                }
+                catch (Exception) { valuesSkipped++; }
             }
         }
 
@@ -1647,10 +1983,28 @@ namespace UniView
                         else if (r != null && r.GetComponent<MeshFilter>() != null) target = r.GetComponent<MeshFilter>().sharedMesh;
                     }
                     else if (pr.c == "Sprite") target = SpriteAt(pr.s, pr.q);
+                    else if (pr.c == "AudioMixerGroup" || pr.c == "AudioMixerSnapshot") target = MixerPart(pr.s, pr.q, pr.c);
                     else if (!string.IsNullOrEmpty(pr.c)) target = PrefabObject(pr.s, pr.q, pr.c);
                     else target = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(pr.s);
                     if (target == null) { valuesSkipped++; return; }
                     sp.objectReferenceValue = target;
+                    valuesSet++;
+                    return;
+                }
+                if (pr.t == "c")
+                {
+                    if (sp.propertyType != SerializedPropertyType.AnimationCurve || pr.k == null) { valuesSkipped++; return; }
+                    var keys = new Keyframe[pr.k.Length / 7];
+                    for (int i = 0; i < keys.Length; i++)
+                    {
+                        int o = i * 7;
+                        keys[i] = new Keyframe(pr.k[o], pr.k[o + 1], pr.k[o + 2], pr.k[o + 3], pr.k[o + 5], pr.k[o + 6]);
+                        keys[i].weightedMode = (WeightedMode)(int)pr.k[o + 4];
+                    }
+                    var curve = new AnimationCurve(keys);
+                    curve.preWrapMode = CurveWrap((int)pr.v);
+                    curve.postWrapMode = CurveWrap(pr.n);
+                    sp.animationCurveValue = curve;
                     valuesSet++;
                     return;
                 }
@@ -1669,6 +2023,12 @@ namespace UniView
                 valuesSet++;
             }
             catch (Exception) { valuesSkipped++; }
+        }
+
+        // A curve's saved m_PreInfinity / m_PostInfinity: 0 ping-pong, 1 repeat, 2 clamp.
+        static WrapMode CurveWrap(int saved)
+        {
+            return saved == 0 ? WrapMode.PingPong : saved == 1 ? WrapMode.Loop : WrapMode.ClampForever;
         }
 
         static UnityEngine.Object SpriteAt(string texturePath, string name)

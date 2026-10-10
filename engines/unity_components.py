@@ -19,8 +19,28 @@ ASSET_KINDS = {"Mesh": "mesh", "Material": "material", "Texture2D": "file", "Aud
                "VideoClip": "file", "TextAsset": "file", "Cubemap": "file"}
 
 
+CURVE_KEY_FIELDS = ("time", "value", "inSlope", "outSlope", "weightedMode", "inWeight", "outWeight")
+
+
+def _is_curve(value):
+    """An AnimationCurve of floats (m_Curve keyframes + wrap modes). The editor can't set its keys one field at a
+    time through SerializedObject, so it travels as one entry."""
+    keys = value.get("m_Curve")
+    return (isinstance(keys, list) and "m_PreInfinity" in value
+            and all(isinstance(k, dict) and isinstance(k.get("value"), (int, float)) for k in keys))
+
+
+def _curve(value, path):
+    """{"p", "t": "c", "k": 7 floats per key (CURVE_KEY_FIELDS), "v": pre-wrap mode, "n": post-wrap mode}."""
+    flat = []
+    for key in value["m_Curve"]:
+        flat += [float(key.get(f) or 0) for f in CURVE_KEY_FIELDS]
+    return {"p": path, "t": "c", "k": flat, "v": int(value.get("m_PreInfinity") or 0),
+            "n": int(value.get("m_PostInfinity") or 0)}
+
+
 def flatten(tree, resolve):
-    """[{"p": path, "t": "f"|"i"|"b"|"s"|"ref", ...}] for a component's type tree.
+    """[{"p": path, "t": "f"|"i"|"b"|"s"|"c"|"ref", ...}] for a component's type tree ("c": an AnimationCurve).
 
     resolve(file_id, path_id) -> None (leave unset) or a dict merged into a "ref" entry, e.g.
     {"node": 3, "cls": "Transform"} or {"asset": uid, "kind": "mesh"}. A null reference (path id 0)
@@ -41,6 +61,9 @@ def flatten(tree, resolve):
                 target = resolve(value["m_FileID"], value["m_PathID"])
                 if target:
                     add({"p": path, "t": "ref", **target})
+                return
+            if path and _is_curve(value):
+                add(_curve(value, path))
                 return
             for key, item in value.items():
                 if not path and (key in SKIP_FIELDS or key.startswith("(")):  # "(text in undecoded data)"
