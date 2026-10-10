@@ -155,7 +155,8 @@ Unreal notes:
 - **Catalog your library**: tag games (right-click → Tags..., e.g. `lowpoly`, `fps`, `dead game`), then search, filter by tag, group by tag / engine / engine version / compatibility / loaded, and sort by name, engine version or asset count. The search box takes filters like `tag:lowpoly engine:unity version:2019 il2cpp`.
 - **Pin** favorite games to the top. The most recently opened games come next.
 - **Notes** for each game (right-click → Notes, or the Notes button in the viewer) for quirks and where the good stuff is.
-- **Progress bar** while a game loads, plus a **console**, `viewer.log` and `crash.log`.
+- **Loading screen** in the style of the old Garry's Mod one: the game's real files float around (one icon per file, sized by how big it is), the one being read sheds bits into the middle, and finished files get swallowed. While UniView indexes, the assets it finds fly out to a counter per kind (Models, Textures, Audio...). It stays smooth on huge games, with an elapsed timer and how many files and gigabytes are left.
+- A **console**, `viewer.log` and `crash.log` for when something goes wrong.
 
 ## How to use
 
@@ -222,7 +223,10 @@ Check the **Console**, or open `crash.log` / `viewer.log` next to `UniView.exe`.
 Blender can't import text-format FBX, and there's no simple Python writer for binary FBX. GLB (glTF) opens directly in Blender, Godot, Unity and most other tools, and keeps the textures, bones and animation inside one file.
 
 **Does it use a lot of memory?**
-Loaded games stay in memory so they reopen instantly. Right-click a game → **Unload from memory** to free it.
+Loaded games stay in memory so they reopen instantly. Right-click a game → **Unload from memory** to free it. Very big Unity games are kept compact: files with millions of objects (e.g. PEAK's 1.5 GB `data.unity3d`, 16 million objects) keep their object tables as packed arrays and only build what you open, which roughly halves the memory they need and makes them load several times faster.
+
+**Does it use my graphics card?**
+Yes. The 3D view renders on the GPU. On laptops with two GPUs, Windows normally runs apps like UniView on the slower built-in one, so UniView asks Windows for the high-performance card (NVIDIA/AMD) when it starts. You can turn that off under **Options → Use the high-performance graphics card**. Help → Open log file shows which card the 3D view uses.
 
 ## Game compatibility list
 

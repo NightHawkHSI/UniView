@@ -18,6 +18,7 @@ class LogBridge(QObject):
     """Carries log lines from any thread to the console widget (queued to the UI thread)."""
 
     message = Signal(str, int)  # formatted text, level number
+    html = Signal(str)          # the same line ready for QPlainTextEdit.appendHtml (no Python on the UI thread)
 
 class QtLogHandler(logging.Handler):
     def __init__(self):
@@ -26,9 +27,26 @@ class QtLogHandler(logging.Handler):
 
     def emit(self, record):
         try:
-            self.bridge.message.emit(self.format(record), record.levelno)
+            text = self.format(record)
+            self.bridge.message.emit(text, record.levelno)
+            self.bridge.html.emit(log_html(text, record.levelno))
         except RuntimeError:
             pass  # console already destroyed (app closing)
+
+LEVEL_COLORS = {logging.DEBUG: "FAINT", logging.WARNING: "WARNING", logging.ERROR: "DANGER"}  # theme tokens
+
+
+def log_html(text, level):
+    """One console line as HTML: spaces and line breaks kept, warnings/errors coloured. Plain lines get no
+    colour of their own, so they follow the palette after a theme switch."""
+    import html
+    body = html.escape(text).replace("  ", "&nbsp; ").replace("\n", "<br>")
+    color = "#ff4081" if level >= logging.CRITICAL else None
+    if color is None and level in LEVEL_COLORS:
+        from uniview.ui import theme
+        color = getattr(theme, LEVEL_COLORS[level], "") or None
+    return f'<span style="color:{color}">{body}</span>' if color else f"<span>{body}</span>"
+
 
 def setup_logging():
     """Log to viewer.log (rotating) and to the in-app console. Returns the console handler."""

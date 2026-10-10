@@ -50,7 +50,7 @@ class ConsoleDock(QDockWidget):
         lay.addLayout(bar)
         lay.addWidget(self.text)
         self.setWidget(body)
-        handler.bridge.message.connect(self.append)
+        handler.bridge.html.connect(self.text.appendHtml)  # straight to C++: no Python on the UI thread per line
 
     def append(self, text, level):
         bar = self.text.verticalScrollBar()

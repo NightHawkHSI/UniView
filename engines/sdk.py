@@ -399,9 +399,11 @@ class Progress:
 
     def __init__(self, text_fn: Callable[[str], object] | None = None,
                  value_fn: Callable[[int, int], object] | None = None,
-                 options: Mapping[str, Any] | None = None) -> None:
+                 options: Mapping[str, Any] | None = None,
+                 files_fn: Callable[[str, Any], object] | None = None) -> None:
         self._text: Callable[[str], object] = text_fn or (lambda s: None)
         self._value: Callable[[int, int], object] = value_fn or (lambda d, t: None)
+        self._files: Callable[[str, Any], object] = files_fn or (lambda event, payload: None)
         self.options: dict[str, Any] = dict(options or {})
 
     def __call__(self, text: str, done: int = 0, total: int = 0) -> None:
@@ -412,6 +414,21 @@ class Progress:
         """
         self._text(text)
         self._value(done, total)
+
+    def files(self, entries: Iterable[tuple[str, int | None]]) -> None:
+        """Optional: the files this load is about to read, as (name, size in bytes or None). The loading
+        screen shows one icon per file (sized by how big it is) instead of a plain bar."""
+        self._files("queue", [(str(name), int(size or 0)) for name, size in entries])
+
+    def file(self, index: int) -> None:
+        """Optional, after files(): now reading entries[index] (everything before it is done).
+        Pass len(entries) once the last one is finished."""
+        self._files("at", int(index))
+
+    def found(self, counts: Mapping[str, int]) -> None:
+        """Optional: running totals of the assets found so far, by kind ({"texture": 1200, "model": 85}).
+        The loading screen shows them flying out to a counter per kind while the plugin indexes."""
+        self._files("found", {str(k): int(v) for k, v in counts.items()})
 
 
 # Display options from the app's Options menu (all on by default). Plugins read them with

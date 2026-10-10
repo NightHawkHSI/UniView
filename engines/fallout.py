@@ -315,7 +315,9 @@ class FalloutPlugin(EnginePlugin):
                     rel = os.path.relpath(full, data_dir).replace("\\", "/").lower()
                     if not rel.endswith(".dat"):
                         session.files.setdefault(rel, (None, full))
+        progress.files((os.path.basename(d), os.path.getsize(d) if os.path.isfile(d) else 0) for d in dats)
         for n, dat_path in enumerate(dats, 1):
+            progress.file(n - 1)
             progress(f"Reading {os.path.basename(dat_path)} ({n}/{len(dats)})", n - 1, len(dats))
             try:
                 dat = Dat(dat_path)
@@ -325,6 +327,7 @@ class FalloutPlugin(EnginePlugin):
             session.dats.append(dat)
             for entry in dat.entries:
                 session.files.setdefault(entry.name.lower(), (dat, entry))
+        progress.file(len(dats))
         session.file_count = len(session.dats)
         for key, (dat, entry) in session.files.items():
             ext = key.rsplit(".", 1)[-1] if "." in key.rsplit("/", 1)[-1] else ""

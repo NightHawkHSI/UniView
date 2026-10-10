@@ -13,7 +13,7 @@ UniView is built on the work of these projects. Thank you to everyone who made t
 | [fmod_toolkit](https://github.com/K0lb3/fmod_toolkit), [pyfmodex](https://github.com/tyrylu/pyfmodex) | FMOD sound bank decoding (used by UnityPy) | MIT |
 | [tpk_ar](https://github.com/K0lb3/tpk_ar), [archspec](https://github.com/archspec/archspec), [attrs](https://github.com/python-attrs/attrs), [lz4](https://github.com/python-lz4/python-lz4), [Brotli](https://github.com/google/brotli) | UnityPy support libraries | MIT / Apache-2.0 or MIT / MIT / BSD-3-Clause / MIT |
 | [trimesh](https://github.com/mikedh/trimesh) | Mesh helpers | MIT |
-| [PySide6 / Qt for Python](https://www.qt.io/qt-for-python) | User interface | LGPLv3 (used under LGPLv3; also offered as GPLv2/GPLv3) |
+| [PySide6 / Qt for Python](https://www.qt.io/qt-for-python) | User interface (Qt Widgets; Qt Quick for the loading screen) | LGPLv3 (used under LGPLv3; also offered as GPLv2/GPLv3) |
 | [PyVista](https://github.com/pyvista/pyvista) / [pyvistaqt](https://github.com/pyvista/pyvistaqt) / [VTK](https://vtk.org/) | 3D viewer | MIT / MIT / BSD-3-Clause |
 | [QtPy](https://github.com/spyder-ide/qtpy), [scooby](https://github.com/banesullivan/scooby), [pooch](https://github.com/fatiando/pooch), [pyvista-validation](https://pypi.org/project/pyvista-validation/) | PyVista support libraries | MIT / MIT / BSD-3-Clause / MIT |
 | [Matplotlib](https://matplotlib.org/), [contourpy](https://github.com/contourpy/contourpy), [kiwisolver](https://github.com/nucleic/kiwi), [cycler](https://github.com/matplotlib/cycler), [fontTools](https://github.com/fonttools/fonttools), [pyparsing](https://github.com/pyparsing/pyparsing), [python-dateutil](https://github.com/dateutil/dateutil), [six](https://github.com/benjaminp/six) | Pulled in by PyVista (color maps) | Matplotlib License (PSF-based) / BSD-3-Clause / BSD-3-Clause / BSD-3-Clause / MIT / MIT / Apache-2.0 + BSD-3-Clause / MIT |
@@ -43,6 +43,11 @@ PySide6, Shiboken6 and the Qt libraries are used under the GNU Lesser General Pu
 |---|---|---|
 | [ValveResourceFormat](https://github.com/ValveResourceFormat/ValveResourceFormat) | Source 2 KeyValues3 reader (`engines/kv3.py`) and mesh decoder port | MIT |
 | [meshoptimizer](https://github.com/zeux/meshoptimizer) (c) Arseny Kapoulkine | Vertex/index buffer decoding (`engines/meshopt.py`) | MIT |
+| [UnityPy](https://github.com/K0lb3/UnityPy) (c) K0lb3 | A patched copy of UnityPy 1.25's `SerializedFile.__init__` and adjusted bundle reading, for compact object tables in very large games (`engines/unity_lazy.py`) | MIT |
+
+## Inspiration
+
+The loading screen is a homage to the classic **Garry's Mod** loading screen by Facepunch Studios. It is drawn from scratch; no artwork or code from Garry's Mod is used.
 
 ## Optional tools (downloaded on request, not bundled)
 

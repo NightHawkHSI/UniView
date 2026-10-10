@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image
 
 from .sdk import Asset, EnginePlugin, GameSession, kind_for_extension, listdir_lower, pil_image_from_bytes
-from .vpk import VPK, VirtualFS
+from .vpk import VPK, VirtualFS, vpk_size
 
 log = logging.getLogger("viewer.source2")
 
@@ -753,7 +753,9 @@ class Source2Plugin(EnginePlugin):
         if not vpk_files:
             raise FileNotFoundError(f"No Source 2 VPK packs found in:\n{path}")
         failed = 0
+        progress.files((os.path.basename(v), vpk_size(v)) for v in vpk_files)
         for n, vpk_path in enumerate(vpk_files, 1):
+            progress.file(n - 1)
             progress(f"Reading {os.path.basename(os.path.dirname(vpk_path))}/{os.path.basename(vpk_path)} "
                      f"({n}/{len(vpk_files)})", n - 1, len(vpk_files))
             try:
@@ -761,6 +763,7 @@ class Source2Plugin(EnginePlugin):
             except Exception as e:
                 failed += 1
                 log.warning("Could not read %s: %s", vpk_path, e)
+        progress.file(len(vpk_files))
         progress("Listing assets ...")
         session = Source2Session(self, path, fs)
         session.file_count = len(fs.packs)

@@ -33,6 +33,17 @@ from .sdk import (
 
 log = logging.getLogger("viewer.unreal")
 
+
+def _size(path):
+    """Bytes in a container: a .utoc counts its .ucas too."""
+    total = 0
+    for p in (path, path[:-5] + ".ucas") if path.lower().endswith(".utoc") else (path,):
+        try:
+            total += os.path.getsize(p)
+        except OSError:
+            pass
+    return total
+
 PAK_MAGIC = 0x5A6F12E1
 PAK_VERSIONS = {1: "UE4 (early)", 2: "UE4 (early)", 3: "UE 4.0-4.2", 4: "UE 4.3-4.15", 5: "UE 4.16-4.19",
                 6: "UE 4.20", 7: "UE 4.21", 8: "UE 4.22-4.24", 9: "UE 4.25", 10: "UE 4.25",
@@ -773,7 +784,9 @@ class UnrealPlugin(EnginePlugin):
             return decompress(method, data, size, hint)
 
         # IoStore first: in games that have both, the .pak next to a .utoc only holds loose files.
+        progress.files((os.path.basename(f), _size(f)) for f in list(utoc_files) + list(pak_files))
         for n, utoc in enumerate(utoc_files, 1):
+            progress.file(n - 1)
             progress(f"Reading {os.path.basename(utoc)} ({n}/{total})", n - 1, total)
             store, error = None, None
             for key in [None] + keys:
@@ -811,6 +824,7 @@ class UnrealPlugin(EnginePlugin):
                 session.add(chunk.path, UFile(chunk.path, chunk.length, store=store, chunk=chunk))
             log.info("Read %s: IoStore v%d, %d files", os.path.basename(utoc), store.version, len(store.files))
         for n, pak_path in enumerate(pak_files, len(utoc_files) + 1):
+            progress.file(n - 1)
             progress(f"Reading {os.path.basename(pak_path)} ({n}/{total})", n - 1, total)
             try:
                 pak = Pak(pak_path, hint_dirs=hint, keys=keys)
@@ -827,6 +841,7 @@ class UnrealPlugin(EnginePlugin):
                 session.add(entry.path, UFile(entry.path, entry.usize, pak=pak, entry=entry))
             log.info("Read %s: pak v%d, %d files", os.path.basename(pak_path), pak.version, len(pak.entries))
         # Loose files games keep next to their paks (FMOD banks, Wwise sounds, movies...).
+        progress.file(total)
         for content in glob.glob(os.path.join(root, "*", "Content")) + glob.glob(os.path.join(root, "Content")):
             for dirpath, dirs, names in os.walk(content):
                 dirs[:] = [d for d in dirs if d.lower() != "paks"]

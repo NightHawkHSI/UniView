@@ -19,8 +19,14 @@ from uniview.util import pil_to_qimage
 class Loader(QObject):
     """Opens a game with its engine plugin off the UI thread."""
 
+    # While a game loads, the UI connects these straight to C++ slots and to the QML loading screen (signal to
+    # signal), never to Python functions: this thread can hold the GIL for a second at a time, and a Python
+    # slot on the UI thread would freeze the whole window until it lets go.
     progress = Signal(str)
     progress_value = Signal(int, int)  # done, total (total 0 = busy)
+    bar_range = Signal(int, int)       # for QProgressBar.setRange: (0, total), (0, 0) = busy
+    bar_value = Signal(int)            # for QProgressBar.setValue
+    files_event = Signal(str, "QVariant")  # ("queue", [[name, size]]) / ("at", index) / ("found", {kind: n})
     finished = Signal(object)          # GameSession
     failed = Signal(str)
 
@@ -30,12 +36,24 @@ class Loader(QObject):
         self.plugin = plugin
         self.options = options or {}
 
+    def _value(self, done, total):
+        self.progress_value.emit(done, total)
+        self.bar_range.emit(0, max(0, total))
+        if total > 0:
+            self.bar_value.emit(done)
+
+    def _files(self, event, payload):
+        if event == "queue":
+            payload = [[str(name), int(size)] for name, size in payload]  # plain lists: they become JS arrays
+        self.files_event.emit(event, payload)
+
     def run(self):
         try:
             started = time.time()
             log.info("Opening %s with the %s plugin", self.path, self.plugin.name)
-            self.progress_value.emit(0, 0)  # busy until the plugin reports numbers
-            session = self.plugin.open(self.path, Progress(self.progress.emit, self.progress_value.emit, self.options))
+            self._value(0, 0)  # busy until the plugin reports numbers
+            session = self.plugin.open(self.path, Progress(self.progress.emit, self._value, self.options,
+                                                          self._files))
             self.progress.emit("Sorting ...")
             session.assets.sort(key=lambda a: a.name.lower())
             counts = {}

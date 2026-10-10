@@ -78,6 +78,7 @@ from uniview.ui.asset_tree import AssetTree
 from uniview.ui.console import ConsoleDock
 from uniview.ui.dialogs import ExportDialog, PluginsDialog, edit_project_notes, open_plugins_folder
 from uniview.ui.home import HomePage
+from uniview.ui.loading_screen import LoadingScreen
 from uniview.ui.media import AnimationView, AudioView, ImageView, ImageWindow, VideoView
 from uniview.ui import canvas_render
 from uniview.ui.controller_view import ControllerView
@@ -287,6 +288,7 @@ class MainWindow(QMainWindow):
         pl.addWidget(self.placeholder)
         pl.addWidget(self.load_bar, 0, Qt.AlignHCenter)
         pl.addStretch()
+        self.loading_screen = LoadingScreen()
 
         self.stack = QStackedWidget()
         for w in (self.placeholder_page, self.mesh_view, self.image_view, self.text_view, self.audio_view,
@@ -308,6 +310,7 @@ class MainWindow(QMainWindow):
         self.pages = QStackedWidget()
         self.pages.addWidget(self.home)
         self.pages.addWidget(self.viewer)
+        self.pages.addWidget(self.loading_screen)
         self.setCentralWidget(self.pages)
 
         self.progress = QProgressBar()
@@ -505,6 +508,14 @@ class MainWindow(QMainWindow):
             act.setStatusTip(tip)
             act.toggled.connect(lambda on, key=key: self._set_view_option(key, on))
             options.addAction(act)
+        options.addSeparator()
+        fast = QAction("Use the high-performance graphics card", self, checkable=True)
+        fast.setChecked(self.settings.fast_gpu)
+        fast.setToolTip("Laptops with two GPUs: render the 3D view on the NVIDIA/AMD card instead of the "
+                        "integrated one. Takes effect the next time UniView starts.")
+        fast.setStatusTip(fast.toolTip())
+        fast.toggled.connect(self._set_fast_gpu)
+        options.addAction(fast)
         options.setToolTipsVisible(True)
 
         help_menu = self.menuBar().addMenu("&Help")
@@ -544,6 +555,19 @@ class MainWindow(QMainWindow):
         if self.current is not None and self.current.kind in MODEL_KINDS:
             self.show_asset(self.current)  # rebuild the map / scene with the new setting
 
+    def _set_fast_gpu(self, on):
+        from uniview import gpu
+        self.settings.fast_gpu = on
+        self.settings.save()
+        gpu.apply(on)
+        self.statusBar().showMessage("Graphics card choice saved - restart UniView to switch", 8000)
+
+    def log_renderer(self):
+        from uniview import gpu
+        name = gpu.renderer_name(self.mesh_view.plotter.render_window)
+        if name:
+            log.info("3D view renders on: %s", name)
+
     def _set_online_compat(self, on):
         self.settings.online_compat = on
         self.settings.save()
@@ -560,6 +584,7 @@ class MainWindow(QMainWindow):
                 bar.setRange(0, total)
                 bar.setValue(done)
             bar.show()
+        self.loading_screen.set_progress(done, total)
 
     def show_busy(self):
         self.set_progress(0, 0)
@@ -567,6 +592,10 @@ class MainWindow(QMainWindow):
     def hide_progress(self):
         self.progress.hide()
         self.load_bar.hide()
+        if self.loading_screen.is_active():
+            self.loading_screen.stop()
+            if self.pages.currentWidget() is self.loading_screen:
+                self.pages.setCurrentWidget(self.viewer)
 
     # ---- loading
     def open_file(self):
@@ -617,6 +646,8 @@ class MainWindow(QMainWindow):
                                 + ", ".join(p.name for p in engines.plugins())
                                 + "\n\nSee Help \u2192 Engine plugins to add one.")
             return
+        self.loading_screen.start(os.path.basename(os.path.normpath(path)) or path)
+        self.pages.setCurrentWidget(self.loading_screen)
         self.show_busy()
         self.thread = QThread()
         options = project_options(project, plugin) if project else {}
@@ -625,7 +656,10 @@ class MainWindow(QMainWindow):
         self.thread.started.connect(self.loader.run)
         self.loader.progress.connect(self.statusBar().showMessage)
         self.loader.progress.connect(self.placeholder.setText)
-        self.loader.progress_value.connect(self.set_progress)
+        self.loading_screen.attach(self.loader)
+        for bar in (self.progress, self.load_bar):  # C++ slots: see Loader
+            self.loader.bar_range.connect(bar.setRange)
+            self.loader.bar_value.connect(bar.setValue)
         self.loader.finished.connect(self.on_loaded)
         self.loader.failed.connect(self.on_load_failed)
         self.loader.finished.connect(self.thread.quit)

@@ -16,7 +16,7 @@ from .sdk import (
     ALBEDO, NORMAL, Asset, EnginePlugin, GameSession, Material, MeshData, TextureRef,
     cstr_at, kind_for_extension, listdir_lower, orient_to_normals, pil_image_from_bytes, view_option, z_up_to_y_up,
 )
-from .vpk import VPK, VirtualFS
+from .vpk import VPK, VirtualFS, vpk_size
 
 log = logging.getLogger("viewer.source")
 
@@ -701,7 +701,9 @@ class SourcePlugin(EnginePlugin):
         for mod in mods:
             progress(f"Reading loose files in {os.path.basename(mod)} ...")
             fs.add_folder(mod, LOOSE_DIRS)
+        progress.files((os.path.basename(v), vpk_size(v)) for v in vpk_files)
         for n, vpk_path in enumerate(vpk_files, 1):
+            progress.file(n - 1)
             progress(f"Reading {os.path.basename(vpk_path)} ({n}/{len(vpk_files)})", n - 1, len(vpk_files))
             try:
                 fs.add_vpk(VPK(vpk_path))
@@ -709,6 +711,7 @@ class SourcePlugin(EnginePlugin):
             except Exception as e:
                 failed += 1
                 log.warning("Could not read %s: %s", vpk_path, e)
+        progress.file(len(vpk_files))
         progress("Listing assets ...")
         session = SourceSession(self, path, fs)
         session.file_count = len(fs.packs)

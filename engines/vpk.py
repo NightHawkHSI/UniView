@@ -11,6 +11,19 @@ VPK_MAGIC = 0x55AA1234
 DIR_ARCHIVE = 0x7FFF
 
 
+def vpk_size(dir_path):
+    """Bytes in a pack: the _dir.vpk plus its numbered archives (name_000.vpk ...)."""
+    import glob
+    total = 0
+    stem = dir_path[:-len("_dir.vpk")] if dir_path.lower().endswith("_dir.vpk") else None
+    for p in [dir_path] + (glob.glob(glob.escape(stem) + "_[0-9][0-9][0-9].vpk") if stem else []):
+        try:
+            total += os.path.getsize(p)
+        except OSError:
+            pass
+    return total
+
+
 class VPKEntry:
     __slots__ = ("pack", "path", "crc", "preload", "archive", "offset", "length")
 

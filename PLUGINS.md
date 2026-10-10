@@ -65,7 +65,7 @@ A plugin whose `id` matches a built-in one replaces the built-in plugin.
 | `detect(path) -> int` | Returns 0–100 for how sure you are that `path` is your engine. The highest score wins. Runs for every game on the Projects page, so it must be **fast**: list folders and read a few headers, nothing heavy. Real engines usually return 90+. |
 | `game_info(path) -> dict` | `{"engine_version": "...", "detail": "..."}`, shown on the game's box. |
 | `count_files(path) -> int` | Number of data files, shown on the box. |
-| `open(path, progress) -> GameSession` | Loads the game on a worker thread. Call `progress("text", done, total)` to update the loading screen. Raise an exception with a clear message if the game can't be opened. |
+| `open(path, progress) -> GameSession` | Loads the game on a worker thread. Call `progress("text", done, total)` to update the loading screen. Raise an exception with a clear message if the game can't be opened. Optional, for a livelier loading screen: `progress.files([(name, size_in_bytes), ...])` once with the files you're about to read, then `progress.file(i)` as you start each one (`progress.file(len(files))` when done), and `progress.found({"texture": 1200, "model": 85})` with running totals while you index. |
 | `label(info)`, `short_version(info)` | Optional. Text for the box and for "Group by engine version". |
 | `options` | Optional per-game settings, e.g. `[{"id": "aes_keys", "label": "AES key(s)", "help": "...", "multiline": True}]`. The user fills them in with right-click → **Engine settings...**, and `open()` gets them as `progress.options`. |
 

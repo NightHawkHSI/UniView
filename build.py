@@ -242,6 +242,8 @@ def build_release(version, test_game=None):
         "--collect-submodules", "vtkmodules",
         # Built-in engine plugins are imported by name at runtime, so list them explicitly.
         "--paths", ROOT, "--collect-submodules", "engines", "--collect-submodules", "uniview",
+        # Non-Python files inside the package: the loading screen's QML (uniview/ui/loading_screen.qml).
+        "--collect-data", "uniview",
         # The app uses PySide6; other Qt bindings on the machine would break the build.
         # IPython/jedi get dragged in by optional imports and just add size. The dev tools too, and
         # mypy must stay out: pyvista imports it if present, and a bundled mypy crashes on launch.

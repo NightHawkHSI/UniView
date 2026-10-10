@@ -1,5 +1,6 @@
 """Unity engine plugin (UnityPy): meshes, Texture2D, Sprites and TextAssets from any Unity game."""
 
+import gc
 import logging
 import os
 import re
@@ -10,6 +11,7 @@ from contextlib import contextmanager
 
 import numpy as np
 
+from .unity_lazy import LazyObjects, objects_of, serialized_files
 from .sdk import (
     ALBEDO, NORMAL, OTHER, Asset, EnginePlugin, GameSession, Material, MeshData, TextureRef,
 )
@@ -37,6 +39,13 @@ UNITY_VERSION_RE = re.compile(rb"\d{1,4}\.\d+\.\d+[a-zA-Z]?\d*")
 
 
 # --------------------------------------------------------------------------- finding files
+
+def _file_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
 
 def looks_like_unity_file(path):
     """Sniff a file's header to decide whether UnityPy can load it."""
@@ -801,7 +810,7 @@ class TextureFinder:
         self._indexed = False   # mesh -> users index done
         self._finished = False  # texture -> models index done too (or gave up)
         self._mesh_users = {}   # mesh key -> [(assets file, GameObject path id)]
-        self._renderers = {}    # GameObject key -> MeshRenderer ObjectReader
+        self._renderers = {}    # GameObject key -> (assets file, path id) of its MeshRenderer
         self._skinned = {}      # mesh key -> [SkinnedMeshRenderer ObjectReader]
         self._files = {}        # (id(assets file), file id) -> target assets file or None
         self._tex_users = {}    # texture key -> {mesh keys}
@@ -845,7 +854,7 @@ class TextureFinder:
     def _build_steps(self):
         log.info("Indexing which objects use which meshes/materials...")
         started = time.time()
-        for n, obj in enumerate(self.env.objects, 1):
+        for n, obj in enumerate(objects_of(self.env, ("MeshFilter", "MeshRenderer", "SkinnedMeshRenderer")), 1):
             if n % self.CHUNK == 0:
                 yield
             tname = obj.type.name
@@ -858,7 +867,7 @@ class TextureFinder:
                 elif tname == "MeshRenderer":
                     ptrs = self._read_pptrs(obj, 1)
                     if ptrs:
-                        self._renderers[obj_key(*ptrs[0])] = obj
+                        self._renderers[obj_key(*ptrs[0])] = (obj.assets_file, obj.path_id)
                 elif tname == "SkinnedMeshRenderer":
                     mesh_ptr = obj.read().m_Mesh
                     if mesh_ptr.path_id:
@@ -925,9 +934,14 @@ class TextureFinder:
         return self._files[key]
 
     # ---- lookups
+    def _renderer(self, go_key):
+        """The MeshRenderer reader on a GameObject, or None."""
+        where = self._renderers.get(go_key)
+        return where[0].objects.get(where[1]) if where is not None else None
+
     def _material_ptrs(self, mesh_key, first_only=False):
         for assets_file, go_id in self._mesh_users.get(mesh_key, []):
-            renderer = self._renderers.get(obj_key(assets_file, go_id))
+            renderer = self._renderer(obj_key(assets_file, go_id))
             if renderer is not None:
                 try:
                     return list(renderer.read().m_Materials)
@@ -1218,11 +1232,11 @@ class ScriptReader:
         itself and include [SerializeReference] fields the code-based generators leave out."""
         if self._embedded is None:
             self._embedded = {}
-            seen, files = set(), set()
-            for obj in self.env.objects:
-                if id(obj.assets_file) not in files:
-                    files.add(id(obj.assets_file))
-                    self._ref_types += [r for r in getattr(obj.assets_file, "ref_types", None) or () if r.node is not None]
+            seen = set()
+            for f in serialized_files(self.env):
+                if f.objects:
+                    self._ref_types += [r for r in getattr(f, "ref_types", None) or () if r.node is not None]
+            for obj in objects_of(self.env, ("MonoBehaviour",), one_per_type=True):
                 st = obj.serialized_type
                 if obj.type.name != "MonoBehaviour" or st is None or st.node is None:
                     continue
@@ -1596,7 +1610,8 @@ class UnitySession(GameSession):
         ref = asset.ref
         if ref["type"] == "scene":
             roots = []
-            for t in ref["transforms"]:
+            transforms = ref["transforms"] if "transforms" in ref else                 ref["file"].objects.of_types(("Transform", "RectTransform"))
+            for t in transforms:
                 try:
                     if not t.read().m_Father.path_id:
                         roots.append(t)
@@ -1901,7 +1916,7 @@ class UnitySession(GameSession):
     def color_space(self):
         """The game's color space: "linear", "gamma", or "" if unknown."""
         with self.lock:
-            for obj in self.env.objects:
+            for obj in objects_of(self.env, ("PlayerSettings",)):
                 if obj.type.name == "PlayerSettings":
                     try:
                         value = obj.read_typetree().get("m_ActiveColorSpace")
@@ -1918,7 +1933,7 @@ class UnitySession(GameSession):
         with self.lock:
             asset = None
             quality = None
-            for obj in self.env.objects:
+            for obj in objects_of(self.env, ("GraphicsSettings", "QualitySettings")):
                 name = obj.type.name
                 if name not in ("GraphicsSettings", "QualitySettings"):
                     continue
@@ -1956,7 +1971,7 @@ class UnitySession(GameSession):
         return self._scene_managers.pop(asset.uid, [])
 
     def _settings_objects(self):
-        return [o for o in self.env.objects if o.type.name in SETTINGS_TYPES + ("BuildSettings", "PlayerSettings")]
+        return list(objects_of(self.env, SETTINGS_TYPES + ("BuildSettings", "PlayerSettings")))
 
     def _ref_resolver(self, reader, node_keys=None):
         """resolve(file id, path id) for unity_components.flatten(): an object of the same prefab/scene
@@ -2057,7 +2072,7 @@ class UnitySession(GameSession):
         """Names of the assemblies (e.g. 'Assembly-CSharp.dll') the game's MonoScripts come from."""
         names = set()
         with self.lock:
-            for obj in self.env.objects:
+            for obj in objects_of(self.env, ("MonoScript",)):
                 if obj.type.name == "MonoScript":
                     try:
                         names.add(obj.read_typetree().get("m_AssemblyName") or "")
@@ -2242,7 +2257,7 @@ class UnitySession(GameSession):
         if self._shader_users is None:
             index = {}
             with self.lock:
-                for obj in self.env.objects:
+                for obj in objects_of(self.env, ("Material",)):
                     if obj.type.name != "Material":
                         continue
                     try:
@@ -2335,7 +2350,7 @@ class UnitySession(GameSession):
         if self._routing is None:
             routing = {}
             with self.lock:
-                for obj in self.env.objects:
+                for obj in objects_of(self.env, ("AudioSource",)):
                     if obj.type.name != "AudioSource":
                         continue
                     try:
@@ -2437,7 +2452,7 @@ class UnitySession(GameSession):
         """CRC32 path hash -> transform path, from every Avatar's table (animations name bones by hash)."""
         if self._paths is None:
             self._paths = {}
-            for obj in self.env.objects:
+            for obj in objects_of(self.env, ("Avatar",)):
                 if obj.type.name != "Avatar":
                     continue
                 try:
@@ -2458,7 +2473,7 @@ class UnitySession(GameSession):
             started = time.time()
             nodes = {}
             with self.lock:
-                for obj in self.env.objects:
+                for obj in objects_of(self.env, ("Transform", "RectTransform")):
                     if obj.type.name not in ("Transform", "RectTransform"):
                         continue
                     try:
@@ -2536,7 +2551,7 @@ class UnitySession(GameSession):
             from .unity_humanoid import HumanRig
             rigs = []
             with self.lock:
-                for obj in self.env.objects:
+                for obj in objects_of(self.env, ("Avatar",)):
                     if obj.type.name != "Avatar":
                         continue
                     try:
@@ -2639,7 +2654,7 @@ class UnitySession(GameSession):
         with self.lock:
             if self._lod_index is None:
                 self._lod_index = {}  # renderer key -> (LODGroup reader, level, position in the level)
-                for obj in self.env.objects:
+                for obj in objects_of(self.env, ("LODGroup",)):
                     if obj.type.name != "LODGroup":
                         continue
                     try:
@@ -2651,7 +2666,7 @@ class UnitySession(GameSession):
                     except Exception:
                         continue
             key = obj_key(asset.ref.assets_file, asset.ref.path_id)
-            renderers = [f._renderers.get(obj_key(af, go)) for af, go in f._mesh_users.get(key, [])]
+            renderers = [f._renderer(obj_key(af, go)) for af, go in f._mesh_users.get(key, [])]
             renderers += f._skinned.get(key, [])
             group = next((self._lod_index[k] for k in (obj_key(r.assets_file, r.path_id) for r in renderers if r)
                           if k in self._lod_index), None)
@@ -2910,7 +2925,7 @@ class UnitySession(GameSession):
         """[(uid "controller:<file>:<id>", name, source file)] of the game's AnimatorControllers."""
         out = []
         with self.lock:
-            for obj in self.env.objects:
+            for obj in objects_of(self.env, ("AnimatorController",)):
                 if obj.type.name == "AnimatorController":
                     uid = f"controller:{obj.assets_file.name}:{obj.path_id}"
                     self._controller_readers[uid] = obj
@@ -3131,7 +3146,7 @@ class UnitySession(GameSession):
             return {"size": obj.byte_size, "info": f"terrain {res}\u00d7{res}" if res else "terrain",
                     "sort": res * res * 2}
         if asset.kind == "scene":
-            n = len(asset.ref.get("transforms", [])) if asset.ref["type"] == "scene" else 0
+            n = (len(asset.ref["transforms"]) if "transforms" in asset.ref else asset.ref.get("count", 0))                 if asset.ref["type"] == "scene" else 0
             return {"size": asset.size, "info": f"{n:,} objects" if n else "prefab", "sort": n}
         obj = asset.ref
         stats = {"size": obj.byte_size}
@@ -3245,7 +3260,7 @@ class UnitySession(GameSession):
         if self._container_scripts is None:
             self._container_scripts, self._material_names = {}, {}
             with self.lock:
-                for obj in self.env.objects:
+                for obj in objects_of(self.env, ("MonoBehaviour", "Material")):
                     name = obj.type.name
                     if name == "MonoBehaviour" and getattr(obj, "container", None):
                         self._container_scripts.setdefault(obj.container, []).append(obj)
@@ -3311,7 +3326,7 @@ class UnitySession(GameSession):
             self._registry = {}
             if self.catalog():
                 guid_text = re.compile(rb"\x20\x00\x00\x00[0-9a-f]{32}")
-                for obj in self.env.objects:
+                for obj in objects_of(self.env, ("MonoBehaviour",)):
                     if obj.type.name != "MonoBehaviour":
                         continue
                     try:
@@ -3521,11 +3536,12 @@ class UnityPlugin(EnginePlugin):
                                     size=obj.byte_size, path=getattr(obj, "container", None) or "",
                                     source=obj.assets_file.name, ref={"type": "terrain", "obj": obj}))
 
-    def _scenes_and_prefabs(self, env, session, transforms_by_file, prefab_containers, renderer_readers):
+    def _scenes_and_prefabs(self, env, session, transforms_by_file, prefab_containers, renderer_readers,
+                            lazy_scenes=()):
         """Add 'scene' assets: one per level file, one per prefab (bundle container or root object)."""
         from .unity_scene import is_scene_file, scene_name, scene_path
         scene_paths = []
-        for obj in env.objects:
+        for obj in objects_of(env, ("BuildSettings",)):
             if obj.type.name == "BuildSettings":
                 try:
                     tree = obj.read_typetree()
@@ -3543,6 +3559,15 @@ class UnityPlugin(EnginePlugin):
                                         size=sum(t.byte_size for t in transforms),
                                         path=scene_path(assets_file, scene_paths), source=assets_file.name,
                                         ref={"type": "scene", "transforms": transforms}))
+            added += 1
+        for assets_file in lazy_scenes:
+            name = scene_name(assets_file, scene_paths)
+            kinds = ("Transform", "RectTransform")
+            session.assets.append(Asset("scene", f"Scene: {name}", ("scene", id(assets_file)),
+                                        uid=f"scene:{assets_file.name}", size=assets_file.objects.size_of(kinds),
+                                        path=scene_path(assets_file, scene_paths), source=assets_file.name,
+                                        ref={"type": "scene", "file": assets_file,
+                                             "count": assets_file.objects.count_of(kinds)}))
             added += 1
         # Every bundle prefab: ones with nothing to draw in 3D (UI, sound, logic) open as a 2D picture or
         # structure view.
@@ -3617,6 +3642,10 @@ class UnityPlugin(EnginePlugin):
 
     def open(self, path, progress):
         import UnityPy
+
+        from . import unity_lazy
+        from .unity_scene import is_scene_file
+        unity_lazy.install()
         started = time.time()
         progress(f"Scanning {path} for Unity files ...")
         log.info("Scanning %s for Unity files", path)
@@ -3627,15 +3656,21 @@ class UnityPlugin(EnginePlugin):
         root = path if os.path.isdir(path) else os.path.dirname(path)
         env = UnityPy.Environment(path=root)
         failed = 0
+        progress.files((os.path.relpath(f, root), _file_size(f)) for f in files)
         for n, fpath in enumerate(files, 1):
             rel = os.path.relpath(fpath, root)
-            progress(f"Loading file {n}/{len(files)}: {rel}", n - 1, len(files))
-            log.info("Loading %d/%d  %s  (%.1f MB)", n, len(files), rel, os.path.getsize(fpath) / 1e6)
+            progress.file(n - 1)
+            size_mb = os.path.getsize(fpath) / 1e6
+            big = f" ({size_mb:,.0f} MB)" if size_mb >= 100 else ""
+            progress(f"Loading file {n}/{len(files)}: {rel}{big}", n - 1, len(files))
+            log.info("Loading %d/%d  %s  (%.1f MB)", n, len(files), rel, size_mb)
             try:
                 env.load_files([fpath])
             except Exception as e:
                 failed += 1  # one broken/encrypted file shouldn't stop the rest
                 log.warning("Could not load %s: %s: %s", rel, type(e).__name__, e)
+            gc.collect()  # UnityPy leaves its bundle buffers in reference cycles: gigabytes for big games
+        progress.file(len(files))
         progress("Indexing objects ...")
         session = UnitySession(self, path, env, len(files))
         _warm_cpp2il(path)
@@ -3645,7 +3680,38 @@ class UnityPlugin(EnginePlugin):
         prefab_containers = {}    # container path -> [GameObject readers]
         renderer_readers = []     # MeshFilter / SkinnedMeshRenderer (to find prefab roots in classic builds)
         shader_budget = 3.0       # seconds spent naming shaders while loading
-        for i, obj in enumerate(env.objects):
+        lazy_scenes = []          # scene files with compact tables: their Transforms are only read when opened
+        wanted = set(TYPE_KINDS) | {"Transform", "RectTransform", "GameObject", "MeshFilter", "SkinnedMeshRenderer",
+                                    "TerrainData"}
+        scene_skip = {"Transform", "RectTransform", "GameObject", "MeshFilter"}
+
+        def index_objects():
+            for f in serialized_files(env):
+                objects = f.objects
+                if not isinstance(objects, LazyObjects):
+                    yield from list(objects.values())
+                elif is_scene_file(f):
+                    lazy_scenes.append(f)
+                    yield from objects.of_types(wanted - scene_skip)
+                else:
+                    yield from objects.of_types(wanted)
+
+        index_total = sum(len(f.objects) if not isinstance(f.objects, LazyObjects) else
+                          f.objects.count_of(wanted - scene_skip if is_scene_file(f) else wanted)
+                          for f in serialized_files(env))
+        found, counted, last_report = {}, [0], [0.0]
+
+        def report_found():
+            for a in session.assets[counted[0]:]:
+                found[a.kind] = found.get(a.kind, 0) + 1
+            counted[0] = len(session.assets)
+            progress.found(found)
+
+        for i, obj in enumerate(index_objects()):
+            if i % 256 == 0 and time.time() - last_report[0] > 0.1:  # ~10 updates a second for the loading screen
+                last_report[0] = time.time()
+                report_found()
+                progress(f"Indexing objects ... {i:,}/{index_total:,}", i, index_total)
             type_name = obj.type.name
             if type_name in ("Transform", "RectTransform"):
                 entry = transforms_by_file.setdefault(id(obj.assets_file), (obj.assets_file, []))
@@ -3701,13 +3767,14 @@ class UnityPlugin(EnginePlugin):
                           ext=self._ext(kind, obj))
             session.assets.append(asset)
             session.by_key[key] = asset
-            if i % 2000 == 0:
-                progress(f"Indexing objects ... {i}")
+        report_found()
         try:
             progress("Finding scenes and prefabs ...")
-            self._scenes_and_prefabs(env, session, transforms_by_file, prefab_containers, renderer_readers)
+            self._scenes_and_prefabs(env, session, transforms_by_file, prefab_containers, renderer_readers,
+                                     lazy_scenes)
         except Exception:
             log.exception("Listing scenes and prefabs failed")
+        report_found()
         if failed:
             session.warnings.append(f"{failed} file(s) could not be loaded (see the console).")
         version = next((v for v in (getattr(f, "unity_version", "") for f in getattr(env, "assets", []))

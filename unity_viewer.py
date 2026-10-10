@@ -50,6 +50,12 @@ def main():
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_SHORT)
         except Exception:
             pass
+        try:  # before any OpenGL window: render on the NVIDIA/AMD card, not the integrated one
+            from uniview import gpu
+            from uniview.settings import Settings
+            gpu.apply(Settings.load().fast_gpu)
+        except Exception:
+            pass
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
     app.setApplicationVersion(__version__)
@@ -58,6 +64,7 @@ def main():
     win.show()
     close_splash()
     QTimer.singleShot(800, win.check_tools_at_startup)
+    QTimer.singleShot(1500, win.log_renderer)
     if len(sys.argv) > 1:
         win.load(sys.argv[1])
     sys.exit(app.exec())
