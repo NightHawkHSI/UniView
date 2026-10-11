@@ -49,6 +49,7 @@ class Settings:
     keep_games_loaded: bool = False  # keep earlier games in memory when opening another (instant switch back)
     loading_sounds: bool = True   # loading screen sound effects (Sounds/); each one can be muted via options
     sound_volume: float = 0.02    # 0..1, loading screen sounds
+    disabled_plugins: list = field(default_factory=list)  # plugin manager: engine ids / plugins/ file names switched off
     options: dict = field(default_factory=dict)  # Options menu (VIEW_OPTION_ITEMS): {key: bool}, missing = on
     path: str = SETTINGS_FILE
     extra: dict = field(default_factory=dict)  # keys this version doesn't know, written back unchanged
@@ -67,6 +68,8 @@ class Settings:
             raise ValueError(f"Setting '{name}' must be 0..1, not {value}")
         if name == "ram_budget_gb" and not 0.0 <= value <= 4096.0:
             raise ValueError(f"Setting '{name}' must be 0 (Auto) or a size in GB, not {value}")
+        if name == "disabled_plugins" and not all(isinstance(v, str) for v in value):
+            raise TypeError(f"Setting '{name}' must be a list of names")
         if name in ("ram_warn_pct", "ram_slow_pct") and not 10 <= value <= 100:
             raise ValueError(f"Setting '{name}' must be 10..100, not {value}")
         object.__setattr__(self, name, value)

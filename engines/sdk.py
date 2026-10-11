@@ -10,7 +10,7 @@ Writing a plugin
 2. Subclass :class:`EnginePlugin` (detect a game folder, open it) and :class:`GameSession`
    (list assets, decode them).
 3. Expose it with a module level ``PLUGIN = MyEnginePlugin()``.
-4. Restart UniView. Help -> Engine plugins shows whether it loaded (errors go to the console).
+4. Restart UniView. Options -> Plugin manager shows whether it loaded (errors go to the console).
 
 Everything is called from worker threads as well as the UI thread; the app serializes calls
 into a session with ``session.lock``, so plugin code doesn't need its own locking.

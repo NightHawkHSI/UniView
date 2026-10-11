@@ -12,11 +12,11 @@ import struct
 import numpy as np
 from PIL import Image
 
-from .sdk import (
-    ALBEDO, NORMAL, Asset, EnginePlugin, GameSession, Material, MeshData, TextureRef,
+from engines.sdk import (
+    ALBEDO, NORMAL, Asset, EnginePlugin, GameSession, Kind, Material, MeshData, TextureRef,
     cstr_at, kind_for_extension, listdir_lower, orient_to_normals, pil_image_from_bytes, view_option, z_up_to_y_up,
 )
-from .vpk import VPK, VirtualFS, vpk_size
+from engines.vpk import VPK, VirtualFS, vpk_size
 
 log = logging.getLogger("viewer.source")
 
@@ -136,8 +136,8 @@ def decode_pixels(fmt, data, w, h):
         rgba = np.dstack([(v >> 8) & 15, (v >> 4) & 15, v & 15, (v >> 12) & 15]).astype(np.uint8) * 17
         return Image.fromarray(rgba, "RGBA")
     if fmt == 22:  # UV88
-        v = np.frombuffer(data, np.uint8, w * h * 2).reshape(h, w, 2)
-        return Image.fromarray(np.dstack([v, np.full((h, w), 255, np.uint8)]), "RGB")
+        uv = np.frombuffer(data, np.uint8, w * h * 2).reshape(h, w, 2)
+        return Image.fromarray(np.dstack([uv, np.full((h, w), 255, np.uint8)]), "RGB")
     if fmt in (24, 25, 27, 28, 29):  # HDR: simple clamp / tonemap for viewing
         dtype, ch = {24: ("<f2", 4), 25: ("<u2", 4), 27: ("<f4", 1), 28: ("<f4", 3), 29: ("<f4", 4)}[fmt]
         arr = np.frombuffer(data, dtype, w * h * ch).reshape(h, w, ch).astype(np.float32)
@@ -400,7 +400,7 @@ class SourceSession(GameSession):
         if asset.kind == "model" and asset.ref.endswith(".bsp"):
             # World only, counted from the face table (building the map took ~1 s each: far too slow to measure
             # hundreds of maps in the background).
-            from .bsp import triangle_count
+            from engines.bsp import triangle_count
             tris, verts = triangle_count(lambda start, length: self.fs.read(asset.ref, start, length))
             stats.update(tris=tris, verts=verts, info=f"{tris:,} tris (map)", sort=tris)
         elif asset.kind == "model":
@@ -424,7 +424,7 @@ class SourceSession(GameSession):
         if vvd_path is None:
             raise ValueError("This model has no .vvd file (vertex data), so it can't be shown.")
         verts = vvd_vertices(self.fs.read(vvd_path))
-        by_texture = {}  # texture index -> [index arrays]
+        by_texture: dict[int, list] = {}  # texture index -> [index arrays]
         for b, models in enumerate(hdr["bodyparts"]):
             if not models:
                 continue
@@ -511,7 +511,7 @@ class SourceSession(GameSession):
         """(BSP, points, uvs, parts, pakfile, skybox leaves) of a map's world, cached (maps are big)."""
         if self._map_cache and self._map_cache[0] == key:
             return self._map_cache[1]
-        from .bsp import BSP
+        from engines.bsp import BSP
         bsp = BSP(self.fs.read(key))
         sky_leaves, sky_faces = set(), set()
         try:
@@ -718,6 +718,7 @@ class SourcePlugin(EnginePlugin):
         for key in fs.files:
             ext = key.rsplit(".", 1)[-1] if "." in key.rsplit("/", 1)[-1] else ""
             display = fs.display_path(key)
+            kind: Kind
             if ext == "bsp":
                 kind = "model"
             elif ext == "mdl":

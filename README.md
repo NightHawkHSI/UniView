@@ -4,7 +4,7 @@
 
 # UniView - Game Asset Viewer
 
-**Browse the 3D models, maps, textures, sprites, sounds, animations and text inside Unity, Source, Source 2, Unreal, XNA/FNA (Terraria), Clyde (Spiral Knights), Wakfu and Fallout 1/2 games, including games that have shut down and can't be played anymore. Any other game's loose files open too, and new engines can be added with plugins.**
+**Browse the 3D models, maps, textures, sprites, sounds, animations and text inside Unity, Source, Source 2, Unreal, XNA/FNA (Terraria), Clyde (Spiral Knights), Wakfu, Spore and Fallout 1/2 games, including games that have shut down and can't be played anymore. Any other game's loose files open too, and new engines can be added with plugins.**
 
 [![Views](https://hits.sh/github.com/NightHawkHSI/UniView.svg?label=views&color=4c1)](https://hits.sh/github.com/NightHawkHSI/UniView/)
 [![Downloads](https://img.shields.io/github/downloads/NightHawkHSI/UniView/total?label=downloads&color=blue)](https://github.com/NightHawkHSI/UniView/releases)
@@ -35,12 +35,12 @@ Unzip it and run `UniView.exe`. You don't need Python.
 
 | | |
 |---|---|
-| **What it opens** | Unity, Source, Source 2, Unreal, XNA/FNA, Clyde (Spiral Knights), Wakfu and Fallout 1/2 game folders; loose files and zip archives of any game; any engine that has a [plugin](#engine-plugins) |
+| **What it opens** | Unity, Source, Source 2, Unreal, XNA/FNA, Clyde (Spiral Knights), Wakfu, Spore and Fallout 1/2 game folders; loose files and zip archives of any game; any engine that has a [plugin](#engine-plugins) |
 | **What it shows** | Models and maps (3D), textures, sprites, sounds (built-in player), animations (played on their models), text files; everything else can be exported as-is |
 | **What it exports** | Models as `.obj` + `.mtl` + `.png` or a single `.glb` with their full PBR materials (color, normal, metallic, roughness, AO, emission, height), textures as `.png`, sounds as `.wav`/`.mp3`/`.ogg`, animations as JSON keyframes or a rigged, animated `.glb`, text as-is, or a whole Unity game as a **Unity project** |
 | **Modding** | Swap textures, sprites, text, data, fonts, sounds and models in Unity games with the [Mod Maker](#modding-unity-games) |
 | **Game files** | Only read. The one exception is **Mod Maker → Install into game**, which backs up the originals first and can restore them |
-| **Tested with** | Robocraft, Muck, Valheim (Unity) · Team Fortress 2, Portal (Source) · CS2, Deadlock (Source 2) · Satisfactory, Headliners, Dead as Disco (Unreal) · Terraria (XNA) · Spiral Knights (Clyde) · Wakfu · Fallout 1 & 2 · Project Zomboid, Serious Sam 2 (loose files) |
+| **Tested with** | Robocraft, Muck, Valheim (Unity) · Team Fortress 2, Portal (Source) · CS2, Deadlock (Source 2) · Satisfactory, Headliners, Dead as Disco (Unreal) · Terraria (XNA) · Spiral Knights (Clyde) · Wakfu · Spore · Fallout 1 & 2 · Project Zomboid, Serious Sam 2 (loose files) |
 | **Built with** | [UnityPy](https://github.com/K0lb3/UnityPy) · [PySide6](https://doc.qt.io/qtforpython-6/) · [PyVista](https://pyvista.org/) |
 
 ## Download
@@ -79,12 +79,13 @@ Each game is read by an **engine plugin**. UniView picks the plugin automaticall
 | Engine | Games (examples) | Models | Textures | Sound | Other |
 |---|---|---|---|---|---|
 | **Unity** | Valheim, Muck, Among Us, Robocraft, Megabonk | ✔ with materials and their colors; ✔ **scenes & prefabs** (every object placed); ✔ **terrains** | ✔ + sprites, sprite sheets, 2D animations | ✔ AudioClips | ✔ text; fonts (.ttf/.otf); videos; **scripts & data** (item stats, configs...); animations (generic and humanoid) play on their skinned models and export as animated GLB |
-| **Source** | TF2, HL2, Portal, CS:S, L4D2, GMod | ✔ `.mdl` with `.vmt` materials; ✔ **maps** (`.bsp`) with terrain and static props | ✔ `.vtf` | ✔ wav/mp3 | ✔ text |
-| **Source 2** | CS2, Dota 2, Deadlock, HL: Alyx | ✔ `.vmdl_c` with materials | ✔ `.vtex_c` | ✔ `.vsnd_c` | ✔ text |
-| **Unreal 4/5** | Satisfactory, Dead as Disco, Headliners | ✔ static + skeletal meshes, textures found through their materials | ✔ incl. virtual textures | ✔ Ogg/WAV SoundWaves, Wwise `.wem`, FMOD `.bank`* (not Bink Audio yet) | ✔ ini/json/csv...; raw export of the rest |
+| **Source** (plugin `plugins/source.py`) | TF2, HL2, Portal, CS:S, L4D2, GMod | ✔ `.mdl` with `.vmt` materials; ✔ **maps** (`.bsp`) with terrain and static props | ✔ `.vtf` | ✔ wav/mp3 | ✔ text |
+| **Source 2** (plugin `plugins/source2.py`) | CS2, Dota 2, Deadlock, HL: Alyx | ✔ `.vmdl_c` with materials | ✔ `.vtex_c` | ✔ `.vsnd_c` | ✔ text |
+| **Unreal 4/5** (plugin `plugins/unreal.py`) | Satisfactory, Dead as Disco, Headliners | ✔ static + skeletal meshes, textures found through their materials | ✔ incl. virtual textures | ✔ Ogg/WAV SoundWaves, Wwise `.wem`, FMOD `.bank`* (not Bink Audio yet) | ✔ ini/json/csv...; raw export of the rest |
 | **XNA / FNA** (plugin `plugins/terraria.py`) | Terraria | – | ✔ `.xnb` textures (LZX compressed too), sprite-font sheets | ✔ `.xnb` sound effects, XACT music banks (`.xwb`, MS-ADPCM / PCM) named by their cues | raw `.xnb` export of the rest (shaders, data) |
 | **Clyde** (plugin `plugins/spiralknights.py`) | Spiral Knights | ✔ static, rigged (bind pose), compound/derived models with textures | ✔ `.png`/`.jpg` | ✔ `.ogg` sounds & music | every other `.dat` config (animations, particles, UI) as a readable outline |
 | **Ankama (Wakfu)** (plugin `plugins/wakfu.py`) | Wakfu | – | ✔ UI/particle `.tga`/`.dds`, map element graphics (`.tgam`), animation atlases | ✔ `.pk` sound packs (Ogg) | ✔ **2D animations** (`.anm`, every animation as a flipbook / GIF, player classes with their parts); Lua scripts, texts, XML, fonts, videos |
+| **Spore** (plugin `plugins/spore.py`) | Spore | ✔ RenderWare 4 `.rw4` models with their textures (not yet the ones with blend shapes) | ✔ `.raster`, `.rw4`, `.png` (DXT1/3/5, 32-bit) | ✔ `.snr` (EA layer 3, via vgmstream*) | ✔ property lists (`.prop`) as readable text, locale texts, XML/CSS; raw export of the rest (animations, creature parts, effects, `.vp6` videos) |
 | **Fallout 1/2** (plugin `plugins/fallout.py`) | Fallout, Fallout 2 | – | ✔ FRM sprites (whole animation strip), RIX images | ✔ ACM* | ✔ MSG text |
 | **Loose files & archives** | any other game (Project Zomboid, Serious Sam 2...) | ✔ `.obj`, DirectX `.x` | ✔ png/jpg/tga/dds/bmp... | ✔ wav/mp3/ogg, plus anything vgmstream* plays | ✔ text; files inside `.zip`/`.gro`/`.pk3` archives |
 
@@ -158,7 +159,7 @@ Unreal notes:
 - **Catalog your library**: tag games (right-click → Tags..., e.g. `lowpoly`, `fps`, `dead game`), then search, filter by tag, group by tag / engine / engine version / compatibility / loaded, and sort by name, engine version or asset count. The search box takes filters like `tag:lowpoly engine:unity version:2019 il2cpp`.
 - **Pin** favorite games to the top. The most recently opened games come next.
 - **Notes** for each game (right-click → Notes, or the Notes button in the viewer) for quirks and where the good stuff is.
-- **Loading screen** in the style of the old Garry's Mod one: the game's real files float around (one icon per file, sized by how big it is), the one being read sheds bits into the middle, and finished files get swallowed. While UniView indexes, the assets it finds fly out to a counter per kind (Models, Textures, Audio...). It stays smooth on huge games, with an elapsed timer and how many files and gigabytes are left. Optional sound effects (a pop, a drop, and a pitch-shifting 1s-and-0s loop) with a volume slider under Options > Loading screen sounds.
+- **Loading screen** in the style of the old Garry's Mod one: the game's real files float around (one icon per file, sized by how big it is), the one being read sheds bits into the middle, and finished files get swallowed. While UniView indexes, the assets it finds fly out to a counter per kind (Models, Textures, Audio...). It stays smooth on huge games, with an elapsed timer and how many files and gigabytes are left. When the game is open, the last finds land and the counters fill up before it fades over to the app. Optional quiet sound effects that follow what's on screen (a deep pop as a file starts, a drop as each find lands, a soft 1s-and-0s hum while bits and finds fly; each play varies a little) with a volume slider under Options > Loading screen sounds. Moving the window to a monitor with other scaling keeps it fitted.
 - A **console**, `viewer.log` and `crash.log` for when something goes wrong.
 
 ## How to use
@@ -180,9 +181,11 @@ Is there a game UniView can't read? You can teach it a new engine without touchi
 
 1. Copy `plugins/_template.py` (next to `UniView.exe`) to `plugins/my_engine.py`.
 2. Fill in how to recognize the game's folder and how to read its models and textures.
-3. Restart UniView. **Help → Engine plugins** shows what loaded.
+3. Restart UniView. **Options → Plugin manager** shows what loaded.
 
-The template is already a working "loose files" plugin (images, text and `.obj` models), so you can start from something that runs. [**PLUGINS.md**](PLUGINS.md) explains the API: assets, mesh conventions, materials and the helpers for Valve VPK and Unreal pak archives. A plugin with the same id as a built-in one replaces it, so you can also fix or extend the built-in engines. Pull requests for new engines are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+**Options → Plugin manager** lists every engine plugin with a switch to turn it off, installs a plugin someone sent you (a `.py`, or a `.zip` with its files; or drop it on the window), and removes plugins (they're moved to `plugins/_removed/`, so you can put them back). Changes apply after a restart, which the window offers. A plugin that fails to load never stops UniView from starting; it shows up there in red instead.
+
+The template is already a working "loose files" plugin (images, text and `.obj` models), so you can start from something that runs. [**PLUGINS.md**](PLUGINS.md) explains the API: assets, mesh conventions, materials and the helpers for Valve VPK and Unreal pak archives. Source, Source 2 and Unreal are plugins too (in `plugins/`), so they're full examples, and you can switch any of them off in the plugin manager. A plugin with the same id as a built-in one (Unity, loose files) replaces it. Pull requests for new engines are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Run from source
 
@@ -263,6 +266,7 @@ UniView has no telemetry, accounts or ads. It only goes online for:
 - "Terraria" is a trademark of Re-Logic. "XNA" is a trademark of Microsoft Corporation.
 - "Fallout" is a trademark or registered trademark of ZeniMax Media Inc.
 - "Spiral Knights" is a trademark of Three Rings Design / Grey Havens. "Wakfu" is a trademark of Ankama.
+- "Spore" and "RenderWare" are trademarks of Electronic Arts Inc.
 - "Oodle" is a trademark of Epic Games Tools LLC.
 - "FMOD" is a trademark of Firelight Technologies Pty Ltd. UniView uses the FMOD Engine, copyright © Firelight Technologies Pty Ltd.
 - All other trademarks and game names belong to their respective owners and are used only to identify compatible games.

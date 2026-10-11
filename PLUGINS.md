@@ -1,8 +1,10 @@
 # Writing an engine plugin for UniView
 
-UniView reads every game through an **engine plugin**. The built-in plugins live in
-[`engines/`](engines) (Unity, Source, Source 2, Unreal). If your game uses another engine, or a
-format the built-in plugin doesn't handle, you can write your own plugin as a single `.py` file.
+UniView reads every game through an **engine plugin**. Unity and the loose-files reader are built
+into [`engines/`](engines); every other engine is a plugin in [`plugins/`](plugins) (Source, Source 2
+and Unreal are full examples there), and the format readers they use (VPK, BSP, KeyValues3, Unreal
+pak/IoStore/packages) stay in `engines/` for any plugin to use. If your game uses another engine, or a
+format the existing plugins don't handle, you can write your own plugin as a single `.py` file.
 You don't need to change UniView itself.
 
 ## Quick start
@@ -10,10 +12,14 @@ You don't need to change UniView itself.
 1. Copy [`plugins/_template.py`](plugins/_template.py) to `plugins/my_engine.py`, next to
    `UniView.exe` or `unity_viewer.py`. Files that start with `_` are ignored.
 2. Change `id` and `name`, then fill in `detect()` and `open()`.
-3. Restart UniView. **Help → Engine plugins** shows whether your plugin loaded. Load errors also
+3. Restart UniView. **Options → Plugin manager** shows whether your plugin loaded. Load errors also
    show up there and in the console.
 4. Add the game. If detection picks a different engine, right-click the game and choose
    **Read with engine → your plugin**.
+
+To install someone else's plugin, use **Options → Plugin manager → Install plugin...** (a `.py` file, or
+a `.zip` with the plugin's files in it) or drop the file on that window. The same window switches
+plugins off and removes them; changes apply after a restart.
 
 As shipped, the template is a working "loose files" engine that shows images, text files and
 `.obj` models found in a folder, so you can try it before changing anything.
@@ -55,8 +61,11 @@ EnginePlugin            one per engine: "is this folder mine?", "open it"
                        └─ animation_code(asset) -> (title, text)   (what drives a sprite animation, beside it)
 ```
 
-Your module must define `PLUGIN = MyEnginePlugin()`, or `PLUGINS = [...]` for several engines.
-A plugin whose `id` matches a built-in one replaces the built-in plugin.
+Your module must define `PLUGIN = MyEnginePlugin()`, or `PLUGINS = [...]` for several engines, at the top
+level. Every `.py` file directly in `plugins/` is loaded as a plugin, so put helper modules in a subfolder (a
+package) or start their names with `_`; the plugin manager refuses to install a `.py` without a `PLUGIN` line.
+A plugin whose `id` matches a built-in one (`unity`, `generic`) replaces the built-in plugin. If your module
+raises while it loads (even `SystemExit`), UniView still starts: the plugin manager shows the error in red.
 
 ## EnginePlugin
 
@@ -151,7 +160,7 @@ materials whose albedo alpha is a cutout or transparency; the 3D view then draws
   `pil_image_from_bytes(data)` opens png, jpg, tga, dds and more.
 * `walk_files(root, exts)` and `listdir_lower(path)` help inside `detect()`.
 * `engines.vpk.VPK` / `VirtualFS` read Valve VPK archives and merge several of them with loose folders.
-* `engines.unreal.Pak` and `engines.iostore.IoStore` read Unreal `.pak` and `.utoc`/`.ucas` files, including Oodle via a game-shipped `oo2core_*.dll`.
+* `engines.ue_pak.Pak` and `engines.iostore.IoStore` read Unreal `.pak` and `.utoc`/`.ucas` files, including Oodle via a game-shipped `oo2core_*.dll`.
 * `engines.ue_package` reads Unreal package headers (Zen and legacy), textures, virtual textures and meshes.
 * `engines.aes.AES` decrypts AES-256 ECB with numpy, no crypto package needed.
 * `engines.sdk.cache_dir()` is a folder for caching slow indexing results between runs.
@@ -162,19 +171,20 @@ materials whose albedo alpha is a cutout or transparency; the 3D view then draws
 Only the standard library, **numpy**, **Pillow** and what UniView already ships (UnityPy, lz4,
 texture2ddecoder, brotli) are guaranteed to be available in the packaged exe.
 
-## What the built-in plugins can and can't do yet
+## What the shipped plugins can and can't do yet
 
 | Engine | Handles | Missing (good first plugin) |
 |---|---|---|
 | Unity | models with materials, textures, sprites, text, AudioClips, AnimationClips (generic and humanoid clips play on skinned models; rigged/animated GLB export) | IK goals and twist distribution for humanoid clips |
-| Source | .mdl models, .bsp maps with props, .vtf textures, .vmt materials, sounds, text | model animations, map entities/lighting |
-| Source 2 | .vmdl_c models + materials, .vtex_c textures, .vsnd_c sounds, text | animations, maps (.vmap_c / world nodes) |
+| Source (`plugins/source.py`) | .mdl models, .bsp maps with props, .vtf textures, .vmt materials, sounds, text | model animations, map entities/lighting |
+| Source 2 (`plugins/source2.py`) | .vmdl_c models + materials, .vtex_c textures, .vsnd_c sounds, text | animations, maps (.vmap_c / world nodes) |
 | Terraria / XNA / FNA (`plugins/terraria.py`) | Content/*.xnb (LZX), Texture2D, SoundEffect, sprite-font sheets, XACT .xwb music (PCM / MS-ADPCM) named from .xsb cues | XMA/xWMA banks, compact wave banks, Stardew-style data (.xnb dictionaries) as text, tModLoader .tmod |
 | Fallout 1/2 (`plugins/fallout.py`) | .dat archives (DAT1 LZSS / DAT2 zlib), FRM sprites, RIX images, ACM sounds, MSG text | maps, critter art sets as animations |
 | Spiral Knights / Clyde (`plugins/spiralknights.py`) | rsrc bundle jars, Clyde binary `.dat` configs, static/rigged/compound models, textures, Ogg sounds | animations on models, particles, scenes |
+| Spore (`plugins/spore.py`) | DBPF `.package` archives (RefPack), RenderWare 4 `.rw4` models + textures, `.raster`/`.png` textures, binary `.prop` as text, locale texts, `.snr` sounds; names from hashes found in `SporeApp.exe` or name lists in `plugins/spore_names/*.txt` | blend-shape models (section `0x200af`), `.gmdl` creature parts, animations, effects, most real file names |
 | Wakfu (`plugins/wakfu.py`) | jars, `.anm` 2D animations (player classes with parts), `.tgam` map graphics, `.pk` Ogg sound packs, bdata monster names | maps, `.xps` particles, sound names, equipment on players, skin colors |
 | Loose files & archives | any folder or zip-style archive: images, sounds, text, .obj/.x models | more archive types (e.g. id .pak, GoldSrc .wad) |
-| Unreal | .pak (v3-12) and IoStore with AES keys; textures incl. virtual textures, static and skeletal meshes, Ogg/WAV sounds | Bink Audio and Wwise sounds, animations, DataTables (need property mappings), UE3 .upk |
+| Unreal (`plugins/unreal.py`) | .pak (v3-12) and IoStore with AES keys; textures incl. virtual textures, static and skeletal meshes, Ogg/WAV sounds | Bink Audio and Wwise sounds, animations, DataTables (need property mappings), UE3 .upk |
 
-If you add support for one of these, please send a pull request. Improving a built-in plugin in
-`engines/` is welcome as well as adding new ones.
+If you add support for one of these, please send a pull request. Improving an existing plugin is
+welcome as well as adding new ones.

@@ -686,7 +686,7 @@ class HomePage(QWidget):
                 names = ", ".join(p.name for p in engines.plugins())
                 QMessageBox.warning(self, "Add game", f"None of the engine plugins ({names}) recognize:\n{path}\n\n"
                                     "Pick the game's install folder, or add a plugin for its engine "
-                                    "(Help \u2192 Engine plugins).")
+                                    "(Options \u2192 Plugin manager).")
                 continue
             name = os.path.basename(path)
             if len(paths) == 1:

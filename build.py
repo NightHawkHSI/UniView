@@ -89,7 +89,7 @@ def build_github():
     for name in SOURCE_FILES:
         src = os.path.join(ROOT, name)
         if os.path.isdir(src):
-            shutil.copytree(src, os.path.join(dest, name), ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            shutil.copytree(src, os.path.join(dest, name), ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "_removed"))
             print(f"  copied {name}/")
         elif os.path.exists(src):
             shutil.copy2(src, os.path.join(dest, name))
@@ -272,14 +272,10 @@ def build_release(version, test_game=None):
     step("Collecting third-party licences")
     made = collect_licenses(out_dir, os.path.join(WORK, "build", APP_NAME, "PYZ-00.toc"))
     print(f"  {len(made)} packages -> licenses/")
-    # User plugins live next to the exe: ship the template, the Terraria plugin (a full example) and the guide.
-    os.makedirs(os.path.join(out_dir, "plugins"), exist_ok=True)
-    for name, target in (("plugins/_template.py", "plugins/_template.py"), ("plugins/terraria.py", "plugins/terraria.py"), ("plugins/spiralknights.py", "plugins/spiralknights.py"),
-                         ("plugins/wakfu.py", "plugins/wakfu.py"), ("plugins/fallout.py", "plugins/fallout.py"),
-                         ("PLUGINS.md", "PLUGINS.md")):
-        src = os.path.join(ROOT, name)
-        if os.path.isfile(src):
-            shutil.copy2(src, os.path.join(out_dir, target))
+    # Plugins live next to the exe (Source, Source 2, Unreal, the game plugins and the template), plus the guide.
+    shutil.copytree(os.path.join(ROOT, "plugins"), os.path.join(out_dir, "plugins"), dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "_removed"))
+    shutil.copy2(os.path.join(ROOT, "PLUGINS.md"), os.path.join(out_dir, "PLUGINS.md"))
 
     step("Self-testing the packaged exe")
     exe = os.path.join(out_dir, f"{APP_NAME}.exe")

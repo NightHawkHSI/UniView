@@ -13,8 +13,10 @@ import struct
 import numpy as np
 from PIL import Image
 
-from .sdk import Asset, EnginePlugin, GameSession, kind_for_extension, listdir_lower, pil_image_from_bytes
-from .vpk import VPK, VirtualFS, vpk_size
+from engines.sdk import (
+    Asset, EnginePlugin, GameSession, Kind, kind_for_extension, listdir_lower, pil_image_from_bytes,
+)
+from engines.vpk import VPK, VirtualFS, vpk_size
 
 log = logging.getLogger("viewer.source2")
 
@@ -69,7 +71,7 @@ def resource_blocks(data):
     _size, header_version, _type_version, block_offset, block_count = struct.unpack_from("<IHHII", data, 0)
     if header_version != 12:
         raise ValueError(f"Unknown resource header version {header_version}")
-    blocks = {}
+    blocks: dict[str, tuple[int, int]] = {}
     pos = 8 + block_offset
     for _ in range(block_count):
         kind = data[pos:pos + 4].decode("ascii", "replace")
@@ -93,7 +95,7 @@ def resource_block_list(data):
 
 
 def block_kv3(data, blocks, kind):
-    from .kv3 import read_kv3
+    from engines.kv3 import read_kv3
     for k, off, size in blocks:
         if k == kind:
             return read_kv3(data[off:off + size])
@@ -184,7 +186,7 @@ def resource_data(data):
     if text and text.strip():
         return text, "txt", refs
     block = next(((o, sz) for k, o, sz in blocks if k == "DATA"), (0, len(data)))
-    from .sdk import find_cstrings
+    from engines.sdk import find_cstrings
     return find_cstrings(data[block[0]:block[0] + block[1]]), "json", refs
 
 
@@ -225,7 +227,7 @@ def _attribute(vdata, count, stride, field):
                     "itemsize": stride})
     arr = np.frombuffer(vdata, rec, count)["v"].astype(np.float32 if scale or dtype.startswith("<f") else np.int64)
     if scale:
-        arr = arr / scale
+        arr = arr.astype(np.float32) / scale
     return arr.reshape(count, comps)
 
 
@@ -262,10 +264,10 @@ def _normals(vdata, count, stride, field):
 
 def _decode_buffer(raw, count, size, is_vertex, meshopt, zstd):
     if zstd:
-        from .kv3 import _zstd
+        from engines.kv3 import _zstd
         raw = _zstd(raw, count * size)
     if meshopt and len(raw) < count * size:
-        from . import meshopt as mo
+        from engines import meshopt as mo
         if is_vertex:
             return mo.decode_vertex_buffer(count, size, raw)
         return mo.decode_index_buffer(count, size, raw).astype("<u4" if size == 4 else "<u2").tobytes()
@@ -342,7 +344,7 @@ def model_parts(data):
             continue  # a lower level of detail
         data_block = em.get("m_nDataBlock", em.get("data_block"))
         _k, off, size = blocks[data_block]
-        from .kv3 import read_kv3
+        from engines.kv3 import read_kv3
         mesh = read_kv3(data[off:off + size])
         if "vbib_block" in em:
             _k, voff, _vsize = blocks[em["vbib_block"]]
@@ -356,7 +358,7 @@ def model_parts(data):
 
 def model_meshdata(data, name=""):
     """MeshData + material paths (one submesh per draw call)."""
-    from .sdk import MeshData, orient_to_normals, z_up_to_y_up
+    from engines.sdk import MeshData, orient_to_normals, z_up_to_y_up
     parts, _info = model_parts(data)
     points, normals, uvs, submeshes, slots, materials = [], [], [], [], [], []
     base = 0
@@ -424,7 +426,7 @@ def sound_audio(data):
     header = b""
     if ctrl and ctrl.get("_class") in ("CVoiceContainerDefault", "CVoiceContainerEnvelope"):
         snd = ctrl.get("m_vSound") or {}
-        fmt = {"MP3": "mp3", "PCM8": "pcm8", "PCM16": "pcm16"}.get(snd.get("m_nFormat"), "")
+        fmt = {"MP3": "mp3", "PCM8": "pcm8", "PCM16": "pcm16"}.get(str(snd.get("m_nFormat")), "")
         rate, channels = snd.get("m_nRate", 44100), snd.get("m_nChannels", 1)
         size = snd.get("m_nStreamingSize", 0)
         duration = snd.get("m_flDuration", 0.0)
@@ -633,7 +635,7 @@ class Source2Session(GameSession):
                 img = img.convert("RGB")  # alpha ~0 everywhere: the channel holds no opacity (Deadlock g_tColor)
             return img
         if asset.ref.endswith(".vsvg_c"):
-            from .sdk import svg_image
+            from engines.sdk import svg_image
             text = panorama_text(data, resource_block_list(data))
             if not text:
                 raise ValueError("This SVG has no image data.")
@@ -654,7 +656,7 @@ class Source2Session(GameSession):
     NORMAL_PARAMS = ("g_tnormal", "g_tnormal1", "g_tnormala", "g_tnormalroughness", "g_tlayer1normal")
 
     def materials(self, asset):
-        from .sdk import ALBEDO, NORMAL, OTHER, Material, TextureRef
+        from engines.sdk import ALBEDO, NORMAL, OTHER, Material, TextureRef
         _md, paths = model_meshdata(self.fs.read(asset.ref))
         out = []
         for path in paths:
@@ -771,6 +773,7 @@ class Source2Plugin(EnginePlugin):
             display = fs.display_path(key)
             base = key.rsplit("/", 1)[-1]
             ext = base.rsplit(".", 1)[-1] if "." in base else ""
+            kind: Kind
             if ext == "vtex_c":
                 kind, name = "texture", display[:-len(".vtex_c")]
                 if name.lower().startswith("materials/"):

@@ -41,7 +41,12 @@ def close_splash():
 def main():
     handler = setup_logging()
     install_crash_handlers()
-    engines.load_plugins(PLUGINS_DIR)
+    try:
+        from uniview.settings import Settings
+        disabled = Settings.load().disabled_plugins
+    except Exception:
+        disabled = []
+    engines.load_plugins(PLUGINS_DIR, disabled)
     if "--self-test" in sys.argv:
         args = [a for a in sys.argv[1:] if a != "--self-test"]
         close_splash()

@@ -143,6 +143,22 @@ class ReadWatch:
         return {"i": self.index, "frac": done / size if size else 0.0, "bytes": delta, "bits": bits}
 
 
+def host_client_size(hwnd):
+    """(width, height) in physical pixels of a window's client area (Windows), or None."""
+    if not hwnd or sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        rect = wintypes.RECT()
+        if not ctypes.windll.user32.GetClientRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+            return None
+        w, h = rect.right - rect.left, rect.bottom - rect.top
+        return (w, h) if w > 0 and h > 0 else None
+    except (OSError, AttributeError):
+        return None
+
+
 def make_bridge():
     from PySide6.QtCore import QObject, Signal
 
@@ -151,6 +167,7 @@ def make_bridge():
         event = Signal(str, "QVariant")   # config / start / stop / queue / at / found / sounds / preview
         stage = Signal(str)               # a loader message
         progress = Signal(int, int)       # done, total
+        settled = Signal()                # from the QML: after "finish", everything on screen has played out
 
     return Bridge
 
@@ -213,17 +230,32 @@ def child_main():
     for error in view.errors():
         if errors is not None:
             print("QML:", error.toString(), file=errors, flush=True)
-    state = {"host": None}
+    state = {"host": None, "hwnd": 0, "px": None, "applied": None}
+
+    def fit():
+        """Size the view to the host window's pixels, in this window's own scale (which can differ from the main
+        process's, and change when the app moves to another monitor)."""
+        px = host_client_size(state["hwnd"]) or state["px"]
+        if not px:
+            return
+        dpr = view.devicePixelRatio() or 1.0
+        geometry = (max(1, round(px[0] / dpr)), max(1, round(px[1] / dpr)))
+        if geometry != state["applied"]:
+            state["applied"] = geometry
+            view.setGeometry(0, 0, *geometry)
 
     def on_command(kind, value):
         if kind == "embed":
             host = QWindow.fromWinId(int(value))
             state["host"] = host  # keep the wrapper alive
+            state["hwnd"] = int(value)
             view.setParent(host)
             view.setPosition(0, 0)
             view.show()
-        elif kind == "size":
-            view.setGeometry(0, 0, max(1, int(value[0])), max(1, int(value[1])))
+        elif kind == "size":  # host size in physical pixels
+            state["px"] = (int(value[0]), int(value[1]))
+            state["applied"] = None
+            fit()
         elif kind == "bg":
             view.setColor(QColor(value))
         elif kind == "snapshot":  # the current frame to a file, for the main window's fade-out
@@ -236,9 +268,20 @@ def child_main():
             app.quit()
 
     control.command.connect(on_command)
+    from PySide6.QtCore import QTimer
+    fitter = QTimer(app)  # catches scale/size changes no message announced (dragging to another monitor)
+    fitter.timeout.connect(fit)
+    fitter.start(250)
+    replies = _std_stream("stdout", -11, "w")
+    if replies is not None:  # back to the main process (LoadingScreen._reply_loop)
+        def settled():
+            try:
+                print('{"k":"settled"}', file=replies, flush=True)
+            except (OSError, ValueError):
+                pass
+        bridge.settled.connect(settled)
     counter = io_counter(os.getppid())
     if counter is not None:  # real reading progress; without it the QML falls back to its own guesswork
-        from PySide6.QtCore import QTimer
         watch = ReadWatch(counter)
 
         def on_event(name, payload):

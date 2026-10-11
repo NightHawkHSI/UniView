@@ -1,9 +1,8 @@
-"""Small dialogs: export, Steam game picker, tags, engine options, notes, plugins."""
+"""Small dialogs: export, Steam game picker, tags, engine options, notes."""
 
 import os
 
 from PySide6.QtCore import QFileInfo, Qt
-from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -13,7 +12,6 @@ from PySide6.QtWidgets import (
     QFileIconProvider,
     QFormLayout,
     QHBoxLayout,
-    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -21,13 +19,10 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPlainTextEdit,
     QPushButton,
-    QTreeWidget,
-    QTreeWidgetItem,
     QVBoxLayout,
 )
 
-import engines
-from uniview.constants import APP_SHORT, PLUGINS_DIR, REPO_URL, log
+from uniview.constants import PLUGINS_DIR, log
 from uniview.projects import game_exe, project_options
 from uniview.ui.theme import role
 
@@ -220,46 +215,3 @@ def edit_project_notes(parent, project):
 def open_plugins_folder():
     os.makedirs(PLUGINS_DIR, exist_ok=True)
     os.startfile(PLUGINS_DIR)
-
-class PluginsDialog(QDialog):
-    """Help -> Engine plugins: what's installed, what failed to load, how to add one."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Engine plugins")
-        self.resize(720, 460)
-        tree = QTreeWidget()
-        tree.setHeaderLabels(["Engine", "Version", "From", "About"])
-        tree.setRootIsDecorated(False)
-        tree.setWordWrap(True)
-        loaded = {p.name: p for p in engines.plugins()}
-        for name, origin, ok, message in engines.load_report():
-            plugin = loaded.get(name)
-            about = plugin.description if (ok and plugin) else f"Failed to load: {message}"
-            item = QTreeWidgetItem([name, plugin.version if (ok and plugin) else "-", origin, about])
-            item.setToolTip(3, about)
-            if not ok:
-                item.setForeground(3, QBrush(QColor("#ef5350")))
-            tree.addTopLevelItem(item)
-        header = tree.header()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)
-        info = QLabel(
-            "Each game is read by an engine plugin. To support another engine (or a game with its own "
-            f"formats), put a <code>.py</code> file in the <b>plugins</b> folder next to {APP_SHORT} "
-            "and restart. Start from <code>plugins/_template.py</code> and see "
-            f"<a href='{REPO_URL}/blob/main/PLUGINS.md'>PLUGINS.md</a>. A plugin with the same id as a "
-            "built-in one replaces it. Right-click a game → <i>Read with engine</i> to pick one by hand.")
-        info.setWordWrap(True)
-        info.setOpenExternalLinks(True)
-        folder = QPushButton("Open plugins folder")
-        folder.clicked.connect(open_plugins_folder)
-        buttons = QDialogButtonBox(QDialogButtonBox.Close)
-        buttons.rejected.connect(self.reject)
-        buttons.addButton(folder, QDialogButtonBox.ActionRole)
-        lay = QVBoxLayout(self)
-        lay.addWidget(tree, 1)
-        lay.addWidget(info)
-        lay.addWidget(buttons)

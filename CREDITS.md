@@ -48,6 +48,8 @@ PySide6, Shiboken6 and the Qt libraries are used under the GNU Lesser General Pu
 
 The Wakfu plugin (`plugins/wakfu.py`) reads Ankama's file formats from notes written while studying the game client, for interoperability. No Ankama code or assets are included.
 
+The Spore plugin (`plugins/spore.py`) reads Maxis / Electronic Arts formats (DBPF packages, RefPack compression, RenderWare 4 models and rasters, property lists) worked out from the game's own files, with format knowledge shared by the Spore modding community around [SporeModder FX](https://github.com/emd4600/SporeModder-FX) (emd4600). No code from it and no EA code or assets are included.
+
 ## Inspiration
 
 The loading screen is a homage to the classic **Garry's Mod** loading screen by Facepunch Studios. It is drawn from scratch; no artwork or code from Garry's Mod is used.

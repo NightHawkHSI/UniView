@@ -15,13 +15,13 @@ PLUGINS_DIR = os.path.join(ROOT, "plugins")
 
 def test_all_plugins_load():
     engines.load_plugins(PLUGINS_DIR)
-    failed = [(name, origin, msg) for name, origin, ok, msg in engines.load_report() if not ok]
+    failed = [(e.name, e.origin, e.message) for e in engines.load_report() if not e.ok]
     assert not failed, failed
     ids = [p.id for p in engines.plugins()]
     assert len(ids) == len(set(ids)), f"duplicate plugin ids: {ids}"
-    for builtin in ("unity", "source", "source2", "unreal", "generic"):
+    for builtin in ("unity", "generic"):
         assert builtin in ids
-    for user_plugin in ("fallout", "xna", "spiralknights", "wakfu"):  # plugins/*.py
+    for user_plugin in ("source", "source2", "unreal", "fallout", "xna", "spiralknights", "wakfu", "spore"):  # plugins/*.py
         assert user_plugin in ids
 
 

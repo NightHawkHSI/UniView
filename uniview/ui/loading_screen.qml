@@ -26,6 +26,7 @@ Rectangle {
     readonly property real diveGap: 0.07
     readonly property real sparkTime: 0.8
     readonly property real crumbTime: 0.9
+    readonly property real finishTime: 1.2   // seconds the end of a load gets to play out before the fade
     readonly property int maxSparks: 140
     readonly property int maxCrumbs: 90
     readonly property int maxIcons: 72
@@ -37,8 +38,9 @@ Rectangle {
         var t = Date.now() / 1000
         return {title: title, stages: [], icons: [], names: [], sizes: [], realFiles: false, at: 0, done: 0, total: 0,
                 pulse: -10, lastDive: t, started: t, lastFrame: t, chips: {}, sparks: [], crumbs: [], crumbDue: 0,
-                crumbSeq: 0, reading: null, lastFind: -10, beamFor: null, beamStart: 0,
-                readLive: false, readFrac: 0, fracShown: 0, readRate: 0, readAt: -10, readBits: "", bitPos: 0}
+                crumbSeq: 0, reading: null, beamFor: null, beamStart: 0,
+                readLive: false, readFrac: 0, fracShown: 0, readRate: 0, readAt: -10, readBits: "", bitPos: 0,
+                finishing: false, finishAt: 0, settledSent: false, bitsLevel: -1}
     }
 
     // ---- events from Python
@@ -52,6 +54,8 @@ Rectangle {
                 root.st = fresh(payload); addStage("Starting ..."); root.running = true; canvas.requestPaint()
             } else if (name === "stop") {
                 root.running = false; st.icons = []; setBits(false)
+            } else if (name === "finish") {
+                finish()
             } else if (name === "sounds") {
                 setSounds(payload)
             } else if (name === "preview") {
@@ -134,11 +138,37 @@ Rectangle {
         if (index === st.at) return
         st.at = index
         st.readFrac = 0; st.fracShown = 0; st.readRate = 0; st.readAt = -10; st.readBits = ""
-        var t = now()
-        for (var i = 0; i < st.icons.length; i++) {
+        var t = now(), waiting = 0, i
+        for (i = 0; i < st.icons.length; i++) if (st.icons[i].dive === null && st.icons[i].last < index) waiting++
+        // finishing: whatever is left goes in within finishTime instead of queueing up one diveGap apart
+        var gap = st.finishing ? Math.min(diveGap, finishTime * 0.5 / Math.max(1, waiting)) : diveGap
+        if (st.finishing) st.lastDive = Math.min(st.lastDive, t)
+        for (i = 0; i < st.icons.length; i++) {
             var ic = st.icons[i]
-            if (ic.dive === null && ic.last < index) { ic.dive = Math.max(t, st.lastDive + diveGap); st.lastDive = ic.dive }
+            if (ic.dive === null && ic.last < index) { ic.dive = Math.max(t, st.lastDive + gap); st.lastDive = ic.dive }
         }
+    }
+
+    // the load is done (bridge "finish"): play out what's still on screen - files left are swallowed, finds in the
+    // air land, counters reach their totals - then tell Python (bridge.settled) so it fades over to the app
+    function finish() {
+        st.finishing = true; st.finishAt = now()
+        if (st.total > 0) st.done = st.total
+        advance(st.names.length)
+    }
+
+    function settled() {
+        if (!st.finishing) return false
+        if (now() - st.finishAt > finishTime + 1.5) return true  // never hold the app back for long
+        if (st.sparks.length || st.icons.length) return false
+        for (var k in st.chips) if (st.chips[k].shown !== st.chips[k].target) return false
+        return true
+    }
+
+    // 0..1 for the 1s-and-0s pitch when there are no real read numbers: small files read fast (high), big ones low
+    function sizeLevel(size) {
+        if (!size) return 0.5
+        return 1 - Math.max(0, Math.min(1, (Math.log(size) / Math.LN10 - 3) / 6))  // 1 KB .. 1 GB
     }
 
     // real reading progress from the loading screen process (loading_child.ReadWatch): how much of the current
@@ -178,16 +208,21 @@ Rectangle {
     // ---- sounds (bridge "sounds"). Players are made from a string so a Qt without QtMultimedia just stays silent.
     property var sfx: ({})               // name -> {url, players, next, last}
     property real sfxVolume: 0.02
-    readonly property var sfxGap: ({pop: 0.08, drop: 0.06})  // seconds; fast loads would otherwise machine-gun
-    readonly property real bitsPitchMin: 0.8   // the 1s-and-0s loop gets a new pitch each time round (tape style:
-    readonly property real bitsPitchMax: 1.25  // playbackRate with pitch compensation off, so speed moves with it)
+    readonly property var sfxGap: ({pop: 0.12, drop: 0.16})  // seconds; fast loads would otherwise machine-gun
+    // each sound's share of the volume setting: a soft bed under the picture, the hum lowest of all
+    readonly property var sfxGain: ({pop: 0.35, drop: 0.45, bits: 0.35})
+    readonly property var sfxPitch: ({pop: 0.72})  // base playback rate per sound (pitch compensation off): < 1 = deeper
+    readonly property real sfxPitchSpread: 0.14  // one-shots play at their base pitch +- this, so repeats never sound identical
+    readonly property real sfxLevelSpread: 0.35  // and at (1 - this .. 1) of their volume
+    readonly property real bitsPitchMin: 0.9   // the 1s-and-0s loop gets a new pitch each time round (tape style:
+    readonly property real bitsPitchMax: 1.12  // playbackRate with pitch compensation off, so speed moves with it)
 
     function makePlayer(url, loop) {
         try {
             var p = Qt.createQmlObject("import QtMultimedia; MediaPlayer { audioOutput: AudioOutput {} loops: "
                                        + (loop ? "MediaPlayer.Infinite" : "1") + " }", root, "sfx")
             p.audioOutput.volume = sfxVolume
-            if (loop && "pitchCompensation" in p) p.pitchCompensation = false  // Qt 6.10+; older ones never compensate
+            if ("pitchCompensation" in p) p.pitchCompensation = false  // Qt 6.10+ (rate = pitch); older never compensate
             p.source = url
             return p
         } catch (e) {
@@ -201,7 +236,7 @@ Rectangle {
         for (var name in cfg.files) {
             var url = cfg.files[name], old = sfx[name], i
             if (old && old.url === url) {
-                for (i = 0; i < old.players.length; i++) old.players[i].audioOutput.volume = sfxVolume
+                if (name === "bits") old.players[0].audioOutput.volume = sfxVolume * sfxGain.bits  // one-shots: per play
                 continue
             }
             if (old) { for (i = 0; i < old.players.length; i++) { old.players[i].stop(); old.players[i].destroy() } }
@@ -212,7 +247,9 @@ Rectangle {
                 var p = makePlayer(url, name === "bits")
                 if (p) players.push(p)
             }
-            if (players.length) sfx[name] = {url: url, players: players, next: 0, last: -10, lastPos: 0}
+            if (!players.length) continue
+            if (name === "bits") players[0].audioOutput.volume = sfxVolume * sfxGain.bits
+            sfx[name] = {url: url, players: players, next: 0, last: -10, lastPos: 0}
         }
     }
 
@@ -224,19 +261,26 @@ Rectangle {
         s.last = t
         var p = s.players[s.next]
         s.next = (s.next + 1) % s.players.length
+        // a little different every time: pitch (rate, with pitch compensation off) and loudness
+        p.playbackRate = (sfxPitch[name] || 1) * (1 + (Math.random() * 2 - 1) * sfxPitchSpread)
+        p.audioOutput.volume = sfxVolume * (sfxGain[name] || 0.5) * (1 - Math.random() * sfxLevelSpread)
         p.setPosition(0)
         p.play()
     }
 
-    function setBits(on, newFile) {
+    // level 0..1 sets the pitch: how fast the current file reads (or its size), or how many finds are in the air
+    function setBits(on, newFile, level) {
         var s = sfx.bits
         if (!s) return
         if (!root.running) on = false  // a frame already queued when "stop" came mustn't start the loop again
         var p = s.players[0], playing = p.playbackState === 1  // MediaPlayer.PlayingState
         if (on) {
             var pos = p.position
-            if (newFile || !playing || pos < s.lastPos)  // a new file, or the clip just looped round: faster reads, higher
-                p.playbackRate = bitsPitchMin + (st.readLive ? readSpeed() : Math.random()) * (bitsPitchMax - bitsPitchMin)
+            // re-pitch on a new file, when the clip loops round, or when the activity clearly changed
+            if (newFile || !playing || pos < s.lastPos || Math.abs(level - st.bitsLevel) > 0.15) {
+                p.playbackRate = bitsPitchMin + level * (bitsPitchMax - bitsPitchMin)
+                st.bitsLevel = level
+            }
             s.lastPos = pos
             if (!playing) p.play()
         } else if (p.playbackState !== 2) {  // not PausedState: also catches a play() whose state hasn't updated yet
@@ -264,7 +308,6 @@ Rectangle {
             var delta = n - chip.target
             chip.target = n
             if (delta <= 0) continue
-            st.lastFind = t
             var spray = Math.min(8, 1 + Math.floor(Math.log(delta + 1) / Math.LN2))
             for (var j = 0; j < spray && st.sparks.length < maxSparks; j++)
                 st.sparks.push({chip: chip, born: t + j * 0.06, bend: ((hash(kind + n + "/" + j) % 200) - 100) / 100})
@@ -307,9 +350,13 @@ Rectangle {
             var cx = width / 2, cy = Math.max(height * 0.36, 230 * scale)
             var reading = root.current()
             var newFile = reading !== st.reading
-            if (newFile) { if (reading !== null) root.playSfx("pop"); st.reading = reading }
-            var indexing = t - st.lastFind < sparkTime + 0.5  // finds still flying out (+ a hold over short gaps)
-            root.setBits((reading !== null && reading.x !== null && root.readingNow()) || indexing, newFile)
+            var indexingNow = Object.keys(st.chips).length > 0  // finds have started: only the hum and drops from here
+            if (newFile) { if (reading !== null && !indexingNow) root.playSfx("pop"); st.reading = reading }
+            var flying = st.sparks.length  // finds in the air: the loop plays exactly while they fly
+            var readingFile = reading !== null && reading.x !== null && root.readingNow()
+            var level = readingFile ? (st.readLive ? root.readSpeed() : root.sizeLevel(reading.size))
+                                    : Math.min(1, flying / 24)
+            root.setBits(readingFile || flying > 0, newFile, level)
             drawBeam(ctx, t, cx, cy, scale)
             drawIcons(ctx, t, dt, cx, cy, scale)
             drawCrumbs(ctx, t, dt, cx, cy, scale)
@@ -323,6 +370,7 @@ Rectangle {
             drawBar(ctx, t)
             var side = (56 + 8 * bump) * scale
             logo.width = side; logo.height = side; logo.x = cx - side / 2; logo.y = cy - side / 2
+            if (!st.settledSent && root.settled()) { st.settledSent = true; bridge.settled() }
             if (root.running) requestAnimationFrame(function () { canvas.requestPaint() })
         }
 
@@ -530,7 +578,7 @@ Rectangle {
                 var chip = spots[i][0]
                 if (chip.x === null) { chip.x = cx; chip.y = cy }  // new counters slide out from the middle
                 chip.x += (spots[i][1] - chip.x) * follow; chip.y += (spots[i][2] - chip.y) * follow
-                chip.shown += (chip.target - chip.shown) * (1 - Math.exp(-dt * 3))
+                chip.shown += (chip.target - chip.shown) * (1 - Math.exp(-dt * (st.finishing ? 9 : 3)))
                 if (chip.target - chip.shown < 0.5) chip.shown = chip.target
             }
             // the icons in flight: out of the centre, along a slight curve, into their counter
@@ -538,7 +586,7 @@ Rectangle {
             for (i = 0; i < st.sparks.length; i++) {
                 var s = st.sparks[i], p = (t - s.born) / sparkTime
                 if (p < 0) { keep.push(s); continue }
-                if (p >= 1) { s.chip.bump = t; continue }
+                if (p >= 1) { s.chip.bump = t; root.playSfx("drop"); continue }  // the sound lands with the find
                 keep.push(s)
                 var e = 1 - Math.pow(1 - p, 3), dx = s.chip.x - cx, dy = s.chip.y - cy, len = Math.hypot(dx, dy) || 1
                 var arc = Math.sin(Math.PI * e) * 40 * scale * s.bend

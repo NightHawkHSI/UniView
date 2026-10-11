@@ -21,8 +21,9 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QRect, Qt, QTimer, QUrl
+from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QRect, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QPainter, QPalette
 from PySide6.QtQuick import QQuickWindow, QSGRendererInterface
 from PySide6.QtQuickWidgets import QQuickWidget
@@ -103,6 +104,8 @@ class LoadingScreen(QWidget):
         self._fallback = None
         self._proc = None
         self._dead = threading.Event()
+        self._settled = threading.Event()  # the screen played out its last moves after finish()
+        self._generation = 0               # bumped by start(): a finish() wait left from an earlier load gives up
         self._outbox = queue.SimpleQueue()
         self._embedded = 0
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
@@ -124,7 +127,7 @@ class LoadingScreen(QWidget):
             return False
         try:
             self._proc = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, cwd=APP_DIR,
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=APP_DIR,
                 env=dict(os.environ, PYINSTALLER_SUPPRESS_SPLASH_SCREEN="1"),
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except OSError as e:
@@ -132,6 +135,7 @@ class LoadingScreen(QWidget):
             return False
         threading.Thread(target=self._write_loop, daemon=True, name="loading-screen-writer").start()
         threading.Thread(target=self._error_loop, daemon=True, name="loading-screen-stderr").start()
+        threading.Thread(target=self._reply_loop, daemon=True, name="loading-screen-replies").start()
         atexit.register(self._shutdown)
         return True
 
@@ -154,6 +158,15 @@ class LoadingScreen(QWidget):
                 log.warning("Loading screen process: %s", text)
         self._dead.set()
 
+    def _reply_loop(self):
+        for raw in self._proc.stdout:
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(msg, dict) and msg.get("k") == "settled":
+                self._settled.set()
+
     def _shutdown(self):
         proc = self._proc
         if proc is not None and proc.poll() is None:
@@ -174,6 +187,7 @@ class LoadingScreen(QWidget):
             log.warning("Loading screen process stopped - drawing it in-process")
             self._shutdown()
         self._fallback = _InProcessView(self)
+        self._fallback.bridge.settled.connect(self._settled.set)
         self._layout.addWidget(self._fallback)
 
     def send(self, msg):
@@ -190,7 +204,10 @@ class LoadingScreen(QWidget):
         self.setAutoFillBackground(True)
 
     def _send_size(self):
-        self.send({"k": "size", "v": [self.width(), self.height()]})
+        # physical pixels: the screen process may be on another scale (125% laptop vs 100% monitor) and
+        # converts with its own; logical sizes stay the same when the window moves between such screens
+        dpr = self.devicePixelRatioF()
+        self.send({"k": "size", "v": [round(self.width() * dpr), round(self.height() * dpr)]})
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -206,11 +223,17 @@ class LoadingScreen(QWidget):
         if self._embedded and self._fallback is None:
             self._send_size()
 
+    def event(self, event):
+        # moved to a screen with another scale: same logical size, different pixel size
+        moved = event.type() in (QEvent.Type.DevicePixelRatioChange, QEvent.Type.ScreenChangeInternal)
+        if moved and self._embedded and self._fallback is None:
+            self._send_size()
+        return super().event(event)
+
     def snapshot(self, timeout=0.4):
         """The screen's current frame as a QPixmap, rendered by its process (so windows on top don't matter), or
         None. Waits up to `timeout` seconds for it."""
         import tempfile
-        import time
 
         from PySide6.QtGui import QPixmap
         if self._fallback is not None:
@@ -260,6 +283,8 @@ class LoadingScreen(QWidget):
             "icon": QUrl.fromLocalFile(ICON_FILE).toString() if os.path.isfile(ICON_FILE) else "",
         }})
         self._active = True
+        self._generation += 1
+        self._settled.clear()
         self.send({"k": "event", "n": "start", "p": title})
 
     def set_sounds(self, config):
@@ -269,6 +294,29 @@ class LoadingScreen(QWidget):
     def preview_sound(self):
         """Play the pop once at the current volume (after the volume slider moves)."""
         self.send({"k": "event", "n": "preview", "p": None})
+
+    def finish(self, then, timeout=3.5):
+        """The load is done: let the screen play out what's still moving (files being swallowed, finds landing,
+        counters counting up), then call then(). Waits on the UI thread's event loop, never blocks; gives up after
+        `timeout` seconds or if the screen's process is gone. Nothing is called if another load starts meanwhile
+        or the screen is stopped first."""
+        if not self._active:
+            then()
+            return
+        generation = self._generation
+        self._settled.clear()
+        self.send({"k": "event", "n": "finish", "p": None})
+        end = time.monotonic() + timeout
+
+        def poll():
+            if not self._active or self._generation != generation:
+                return
+            if self._settled.is_set() or time.monotonic() > end or (self._fallback is None and not self._alive()):
+                then()
+            else:
+                QTimer.singleShot(30, poll)
+
+        QTimer.singleShot(30, poll)
 
     def stop(self):
         self._active = False

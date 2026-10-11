@@ -28,7 +28,7 @@ def self_test(game_path=None):
         return ", ".join(mods)
 
     def plugins():
-        failed = [f"{name}: {msg}" for name, _origin, ok, msg in engines.load_report() if not ok]
+        failed = [f"{e.name}: {e.message}" for e in engines.load_report() if not e.ok]
         if failed:
             raise RuntimeError("; ".join(failed))
         return ", ".join(p.id for p in engines.plugins())

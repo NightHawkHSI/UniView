@@ -2,12 +2,18 @@
 
     1. Copy it to plugins/my_engine.py (files starting with "_" are ignored, so this one never loads).
     2. Change the id/name, then fill in detect(), open() and the GameSession methods you need.
-    3. Restart UniView and check Help -> Engine plugins (load errors show there and in the console).
+    3. Restart UniView and check Options -> Plugin manager (load errors show there and in the console).
+       To give your plugin to someone else, send them the .py (or a .zip with it and its helper files): they
+       install it with Options -> Plugin manager -> Install plugin..., or by dropping it on that window.
+
+Every .py directly in plugins/ is loaded as a plugin and must set PLUGIN = ... (or PLUGINS = [...]) at the top
+level. Keep helper modules in a subfolder (a package next to your plugin) or start their names with "_".
 
 As written it's a working "loose files" engine: it shows .png/.jpg/.tga/.dds images, text files and
 Wavefront .obj models found anywhere under a folder. That makes it a handy starting point for a game
-that keeps some of its files unpacked. Read engines/sdk.py for the full API and engines/source.py or
-engines/unreal.py for real examples (archives, binary formats, materials).
+that keeps some of its files unpacked. Read engines/sdk.py for the full API and plugins/source.py,
+plugins/unreal.py or plugins/spore.py for real examples (archives, compression, binary formats, materials).
+Shared readers for other plugins to use live in engines/ (vpk.py, ue_pak.py, iostore.py, ue_package.py, aes.py).
 
 Only the standard library, numpy and Pillow (PIL) are guaranteed to be available, also in the
 packaged UniView.exe. Anything else you import has to be installed next to it yourself.

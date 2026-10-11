@@ -2,13 +2,14 @@
 
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import traceback
 import webbrowser
 
 from PIL import Image
-from PySide6.QtCore import QEventLoop, QPoint, QSignalBlocker, QSize, Qt, QThread, QTimer
+from PySide6.QtCore import QEventLoop, QPoint, QProcess, QSignalBlocker, QSize, Qt, QThread, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QFontDatabase, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -81,7 +82,7 @@ from uniview.settings import BLENDER_IMPORT, Settings, find_blender
 from uniview.tools import missing_recommended
 from uniview.ui.asset_tree import AssetTree
 from uniview.ui.console import ConsoleDock
-from uniview.ui.dialogs import ExportDialog, PluginsDialog, edit_project_notes, open_plugins_folder
+from uniview.ui.dialogs import ExportDialog, edit_project_notes, open_plugins_folder
 from uniview.ui.home import HomePage
 from uniview.ui.loading_screen import SOUNDS, FadeOverlay, LoadingScreen, sound_config
 from uniview.ui.media import AnimationView, AudioView, ImageView, ImageWindow, VideoView
@@ -572,6 +573,11 @@ class MainWindow(QMainWindow):
         memory.setStatusTip(memory.toolTip())
         memory.triggered.connect(self.show_memory_settings)
         options.addAction(memory)
+        plugins = QAction("Plugin manager...", self)
+        plugins.setToolTip("Engine plugins: switch them on or off, install new ones, remove them.")
+        plugins.setStatusTip(plugins.toolTip())
+        plugins.triggered.connect(self.show_plugin_manager)
+        options.addAction(plugins)
         stats = QAction("Show RAM / CPU / GPU use in the title bar", self, checkable=True)
         stats.setChecked(self.settings.option("title_stats"))
         stats.setToolTip("Memory, processor and graphics card use, updated every 2 seconds.")
@@ -589,7 +595,6 @@ class MainWindow(QMainWindow):
         help_menu.addAction(online)
         help_menu.addAction("Project page on GitHub", lambda: webbrowser.open(REPO_URL))
         help_menu.addSeparator()
-        help_menu.addAction("Engine plugins...", lambda: PluginsDialog(self).exec())
         help_menu.addAction("Optional tools (audio decoder, script decompiler...)...", self.show_tools)
         help_menu.addAction("Open plugins folder", open_plugins_folder)
         help_menu.addSeparator()
@@ -778,7 +783,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Unknown engine",
                                 "None of the engine plugins recognize:\n" + path + "\n\nInstalled: "
                                 + ", ".join(p.name for p in engines.plugins())
-                                + "\n\nSee Help \u2192 Engine plugins to add one.")
+                                + "\n\nSee Options \u2192 Plugin manager to add one.")
             return
         self._watch(False)  # no Python timers while the loader holds the GIL (they'd stall the loading screen)
         self.loading_screen.set_sounds(sound_config(self.settings))
@@ -814,7 +819,8 @@ class MainWindow(QMainWindow):
             self._show_session(session)
         finally:
             self._watch(True)
-            self._close_loading_screen(fade=True)
+            # the loading screen plays out its last moves (finds landing, counters filling) before the fade
+            self.loading_screen.finish(lambda: self._close_loading_screen(fade=True))
         log.info("Asset list ready in %.1fs (%s items)", time.perf_counter() - started, f"{len(self.items_by_key):,}")
 
     def _show_session(self, session):
@@ -2187,6 +2193,19 @@ class MainWindow(QMainWindow):
         box.setModal(False)
         box.setAttribute(Qt.WA_DeleteOnClose)
         box.show()
+
+    def show_plugin_manager(self):
+        from uniview.ui.plugin_dialog import PluginManagerDialog
+        PluginManagerDialog(self.settings, self.restart_app, self).exec()
+
+    def restart_app(self):
+        """Close (saving settings like any close) and start UniView again with the same arguments."""
+        if not self.close():
+            return
+        args = sys.argv[1:] if getattr(sys, "frozen", False) else sys.argv
+        if not QProcess.startDetached(sys.executable, args):
+            log.error("Could not restart %s %s", sys.executable, args)
+        QApplication.instance().quit()
 
     def show_memory_settings(self):
         from uniview.ui.memory_dialog import MemoryDialog

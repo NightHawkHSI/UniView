@@ -45,8 +45,8 @@ Layout:
 | `unity_viewer.py` | Entry point |
 | `uniview/` | The app: windows, viewer, export, Unity project export, Mod Maker |
 | `uniview/ui/` | Qt widgets and dialogs |
-| `engines/` | Built-in engine plugins (Unity, Source, Source 2, Unreal) and format readers; `engines/sdk.py` is the plugin API |
-| `plugins/` | User plugins loaded at startup (`_template.py`, `terraria.py`) |
+| `engines/` | Built-in engines (Unity, loose files) and shared format readers (VPK, BSP, KV3, Unreal pak/IoStore/packages); `engines/sdk.py` is the plugin API |
+| `plugins/` | Engine plugins loaded at startup (Source, Source 2, Unreal, Spore and the other game plugins, `_template.py`); Options → Plugin manager switches them off / installs / removes them |
 | `tests/` | pytest tests |
 
 Before sending a pull request, run the same checks the build runs:
