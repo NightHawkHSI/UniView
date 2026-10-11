@@ -44,6 +44,9 @@ PySide6, Shiboken6 and the Qt libraries are used under the GNU Lesser General Pu
 | [ValveResourceFormat](https://github.com/ValveResourceFormat/ValveResourceFormat) | Source 2 KeyValues3 reader (`engines/kv3.py`) and mesh decoder port | MIT |
 | [meshoptimizer](https://github.com/zeux/meshoptimizer) (c) Arseny Kapoulkine | Vertex/index buffer decoding (`engines/meshopt.py`) | MIT |
 | [UnityPy](https://github.com/K0lb3/UnityPy) (c) K0lb3 | A patched copy of UnityPy 1.25's `SerializedFile.__init__` and adjusted bundle reading, for compact object tables in very large games (`engines/unity_lazy.py`) | MIT |
+| [Clyde](https://github.com/threerings/clyde) (c) Three Rings Design | Binary export reader for Spiral Knights `.dat` files (`plugins/spiralknights.py`, a port of `BinaryImporter`) | BSD |
+
+The Wakfu plugin (`plugins/wakfu.py`) reads Ankama's file formats from notes written while studying the game client, for interoperability. No Ankama code or assets are included.
 
 ## Inspiration
 

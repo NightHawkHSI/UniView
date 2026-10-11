@@ -103,7 +103,7 @@ class SystemStats:
             threading.Thread(target=self._run, daemon=True, name="system-stats").start()
 
     def latest(self):
-        """{"app_ram", "sys_ram_pct", "sys_ram_total", "cpu", "gpu", "vram"} - any may be missing."""
+        """{"app_ram", "app_private", "sys_ram_pct", "sys_ram_total", "cpu", "gpu", "vram"} - any may be missing."""
         return dict(self._latest)
 
     def stop(self):
@@ -133,6 +133,7 @@ class SystemStats:
                 pm.cb = ctypes.sizeof(pm)
                 if psapi.GetProcessMemoryInfo(proc, ctypes.byref(pm), pm.cb):
                     stats["app_ram"] = int(pm.WorkingSetSize)
+                    stats["app_private"] = int(pm.PagefileUsage)  # committed to this app (not mapped files)
                 times = [ctypes.c_ulonglong() for _ in range(4)]  # creation, exit, kernel, user (100 ns)
                 if k32.GetProcessTimes(proc, *[ctypes.byref(t) for t in times]):
                     used, wall = (times[2].value + times[3].value) / 1e7, time.monotonic()
@@ -150,14 +151,31 @@ class SystemStats:
             self._latest = stats
 
 
+def ram_budget(setting_gb, total_bytes):
+    """Settings > Memory 'Allocated RAM' in bytes: the setting (GB), or with 0 = Auto half the installed RAM
+    (at least 4 GB). Never more than what's installed."""
+    total = total_bytes or 0
+    if setting_gb and setting_gb > 0:
+        budget = int(setting_gb * 2**30)
+    else:
+        budget = max(4 * 2**30, total // 2)
+    return min(budget, total) if total else budget
+
+
 def fmt_gb(n):
     return f"{n / 2**30:.1f} GB" if n >= 2**30 * 0.95 else f"{n / 2**20:.0f} MB"
 
 
-def stats_text(stats):
-    """One line for the title bar, e.g. 'RAM 1.8 GB (system 71%) · CPU 14% · GPU 23% · VRAM 640 MB'."""
+def stats_text(stats, budget=None):
+    """One line for the title bar, e.g. 'RAM 1.8 GB (system 71%) · CPU 14% · GPU 23% · VRAM 640 MB'; with the
+    allocated RAM `budget` (bytes): 'RAM 1.8 of 8.0 GB (system 71%) ...'."""
     parts = []
-    if "app_ram" in stats:
+    if budget and "app_private" in stats:
+        ram = f"RAM {stats['app_private'] / 2**30:.1f} of {fmt_gb(budget)}"
+        if "sys_ram_pct" in stats:
+            ram += f" (system {stats['sys_ram_pct']}%)"
+        parts.append(ram)
+    elif "app_ram" in stats:
         ram = "RAM " + fmt_gb(stats["app_ram"])
         if "sys_ram_pct" in stats:
             ram += f" (system {stats['sys_ram_pct']}%)"
@@ -184,7 +202,7 @@ class Throttle:
     LAG_HIGH_MS = 250     # one event-loop hiccup this long raises the level
     LAG_SEVERE_MS = 1500  # this long (a near-freeze) goes straight to level 2
     CALM_SECONDS = 4.0    # this long without hiccups lowers the level by one
-    MEM_EASE, MEM_SEVERE = 85, 93  # system memory load percent
+    MEM_EASE, MEM_SEVERE = 85, 93  # memory percent (system load, or UniView's share of its allocation)
     SLEEPS = (0.0, 0.04, 0.3)
 
     def __init__(self, clock=time.monotonic):
@@ -194,6 +212,13 @@ class Throttle:
         self._mem_level = 0
         self._calm_since = clock()
         self._active_until = 0.0
+        self._mem_reason = ""
+
+    def configure(self, slow_pct):
+        """Settings > Memory: slow down from `slow_pct` percent memory use; severe a few points later."""
+        with self._lock:
+            self.MEM_EASE = max(10, min(99, int(slow_pct)))
+            self.MEM_SEVERE = min(99, self.MEM_EASE + 8)
 
     @property
     def level(self):
@@ -204,7 +229,7 @@ class Throttle:
         """Why the workers are slowed, for the status bar ('' at full speed)."""
         with self._lock:
             if self._mem_level:
-                return "memory is almost full"
+                return self._mem_reason or "memory is almost full"
             if self._lag_level:
                 return "the window was lagging"
             return ""
@@ -222,11 +247,19 @@ class Throttle:
                 self._calm_since = now
             return self._lag_level != before
 
-    def report_memory(self, load_pct):
-        """System memory load percent. Returns True if the level changed."""
+    def report_memory(self, load_pct, budget_pct=None):
+        """System memory load percent, and UniView's use as a percent of its allocated RAM (None = no limit).
+        Over the allocation is severe. Returns True if the level changed."""
         with self._lock:
             before = self._mem_level
-            self._mem_level = 2 if load_pct >= self.MEM_SEVERE else 1 if load_pct >= self.MEM_EASE else 0
+            sys_level = 2 if load_pct >= self.MEM_SEVERE else 1 if load_pct >= self.MEM_EASE else 0
+            app_level = 0
+            if budget_pct is not None:
+                app_level = 2 if budget_pct >= 100 else 1 if budget_pct >= self.MEM_EASE else 0
+            self._mem_level = max(sys_level, app_level)
+            near = "UniView is over its allocated RAM" if app_level == 2 else "UniView is near its allocated RAM"
+            self._mem_reason = (near if app_level > sys_level else
+                                "memory is almost full" if sys_level else "")
             return self._mem_level != before
 
     def user_active(self, seconds=0.8):
@@ -279,4 +312,5 @@ class FreezeWatch:
             reported = True
             frame = sys._current_frames().get(self._ui_thread)
             stack = "".join(traceback.format_stack(frame)[-12:]) if frame is not None else "(unknown)\n"
+            del frame  # holding it keeps the whole UI stack alive, locals and all (a loaded game's session: GBs)
             log.warning("The window hasn't responded for %.0f s - it's busy in:\n%s", stalled, stack.rstrip())

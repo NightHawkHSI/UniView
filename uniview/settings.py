@@ -15,7 +15,7 @@ from uniview.constants import COMPAT_BUNDLED, COMPAT_CACHE, COMPAT_URL, REPO_URL
 from uniview.projects import engine_info_text, steam_library_dirs
 from uniview.util import read_json, write_json
 
-SETTING_CHOICES = {"model_format": ("obj", "glb"), "view": ("list", "grid"), "theme": ("system", "dark", "light")}
+SETTING_CHOICES = {"model_format": ("obj", "glb"), "anim_format": ("gif", "sheet", "frames"), "view": ("list", "grid"), "theme": ("system", "dark", "light")}
 
 _SETTINGS_INTERNAL = ("options", "path", "extra")
 
@@ -30,6 +30,7 @@ class Settings:
     last_dir: str = field(default_factory=lambda: os.path.expanduser("~"))
     export_dir: str = ""
     model_format: str = "obj"
+    anim_format: str = "gif"  # flipbook animations: gif / sheet (sprite sheet + JSON) / frames (PNGs + JSON)
     keep_structure: bool = True
     volume: float = 0.7  # 0..1
     autoplay: bool = False
@@ -42,6 +43,10 @@ class Settings:
     blender_path: str = ""
     check_tools: bool = True  # startup check for missing optional tools
     fast_gpu: bool = True     # ask Windows for the high-performance GPU on two-GPU laptops (uniview/gpu.py)
+    ram_budget_gb: float = 0.0   # Settings > Memory: UniView's allocated RAM in GB, 0 = Auto (half the installed RAM)
+    ram_warn_pct: int = 90       # warn when UniView uses this much of its allocated RAM
+    ram_slow_pct: int = 85       # slow background work from this memory use (system load or share of allocation)
+    keep_games_loaded: bool = False  # keep earlier games in memory when opening another (instant switch back)
     loading_sounds: bool = True   # loading screen sound effects (Sounds/); each one can be muted via options
     sound_volume: float = 0.02    # 0..1, loading screen sounds
     options: dict = field(default_factory=dict)  # Options menu (VIEW_OPTION_ITEMS): {key: bool}, missing = on
@@ -60,6 +65,10 @@ class Settings:
             raise ValueError(f"Setting '{name}' must be one of {SETTING_CHOICES[name]}, not {value!r}")
         if name in ("volume", "sound_volume") and not 0.0 <= value <= 1.0:
             raise ValueError(f"Setting '{name}' must be 0..1, not {value}")
+        if name == "ram_budget_gb" and not 0.0 <= value <= 4096.0:
+            raise ValueError(f"Setting '{name}' must be 0 (Auto) or a size in GB, not {value}")
+        if name in ("ram_warn_pct", "ram_slow_pct") and not 10 <= value <= 100:
+            raise ValueError(f"Setting '{name}' must be 10..100, not {value}")
         object.__setattr__(self, name, value)
 
     @classmethod

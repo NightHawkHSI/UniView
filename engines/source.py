@@ -701,7 +701,7 @@ class SourcePlugin(EnginePlugin):
         for mod in mods:
             progress(f"Reading loose files in {os.path.basename(mod)} ...")
             fs.add_folder(mod, LOOSE_DIRS)
-        progress.files((os.path.basename(v), vpk_size(v)) for v in vpk_files)
+        progress.files((os.path.basename(v), vpk_size(v), v) for v in vpk_files)
         for n, vpk_path in enumerate(vpk_files, 1):
             progress.file(n - 1)
             progress(f"Reading {os.path.basename(vpk_path)} ({n}/{len(vpk_files)})", n - 1, len(vpk_files))

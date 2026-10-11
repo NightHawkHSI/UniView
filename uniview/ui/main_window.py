@@ -8,13 +8,14 @@ import traceback
 import webbrowser
 
 from PIL import Image
-from PySide6.QtCore import QPoint, QSignalBlocker, QSize, Qt, QThread, QTimer
+from PySide6.QtCore import QEventLoop, QPoint, QSignalBlocker, QSize, Qt, QThread, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QFontDatabase, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QButtonGroup,
     QComboBox,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -62,6 +63,8 @@ from uniview.constants import (
     log,
 )
 from uniview.export import (
+    ANIM_FILTERS,
+    ANIM_FORMATS,
     display_texture,
     export_ext,
     plan_export,
@@ -80,7 +83,7 @@ from uniview.ui.asset_tree import AssetTree
 from uniview.ui.console import ConsoleDock
 from uniview.ui.dialogs import ExportDialog, PluginsDialog, edit_project_notes, open_plugins_folder
 from uniview.ui.home import HomePage
-from uniview.ui.loading_screen import SOUNDS, LoadingScreen, sound_config
+from uniview.ui.loading_screen import SOUNDS, FadeOverlay, LoadingScreen, sound_config
 from uniview.ui.media import AnimationView, AudioView, ImageView, ImageWindow, VideoView
 from uniview.ui import canvas_render
 from uniview.ui.controller_view import ControllerView
@@ -95,15 +98,21 @@ from uniview.ui.ui_prefab import has_thumbnail, ui_picture, uid_map
 from uniview.ui.tools_dialog import ToolsDialog
 from uniview.ui.unity_export import ask_project_folder, ask_streaming_assets, choose_editor_version, run_export
 from uniview.unity_project import installed_editors, target_version, unity_version
-from uniview.util import blank_icon, fmt_size, norm_path, open_path, pil_to_pixmap, safe_filename
-from uniview.perf import THROTTLE, FreezeWatch, SystemStats, stats_text
+from uniview.util import (blank_icon, fmt_size, norm_path, open_path, pil_to_pixmap, release_memory,
+                          safe_filename)
+from uniview.perf import THROTTLE, FreezeWatch, SystemStats, fmt_gb, ram_budget, stats_text
 from uniview.workers import Loader, PreviewWorker, StatsWorker, ThumbnailWorker, meshdata_to_polydata
 from uniview.ui import theme
 from uniview.ui.theme import role
 
 
 class SortItem(QTreeWidgetItem):
-    """Tree row that sorts by SORT_ROLE numbers/strings instead of display text."""
+    """Tree row that sorts by SORT_ROLE numbers/strings instead of display text. `asset` and `hid` mirror the
+    UserRole data and the hidden state as plain attributes: reading them is far cheaper than data()/isHidden(),
+    and apply_filter only touches Qt for rows whose state really changes."""
+
+    asset = None
+    hid = False
 
     def __lt__(self, other):
         tree = self.treeWidget()
@@ -160,6 +169,8 @@ class MainWindow(QMainWindow):
         # responsiveness: a heartbeat that notices lag (and eases off background work), title bar stats
         self.freeze_watch = FreezeWatch()
         self.system_stats = SystemStats()
+        THROTTLE.configure(self.settings.ram_slow_pct)
+        self._ram_warned = False  # the over-allocation warning was shown (re-armed once use drops again)
         self._beat_at = time.monotonic()
         self.heartbeat = QTimer(self, interval=100)
         self.heartbeat.timeout.connect(self._heartbeat)
@@ -375,10 +386,20 @@ class MainWindow(QMainWindow):
             self.placeholder.setText("This game was unloaded. Go back to Projects to open it again.")
             self.statusBar().showMessage("Unloaded")
         del entry
-        import gc
-        gc.collect()
+        release_memory()
+        # Background workers can still be mid-batch on the old game; once they let go, its reference cycles need
+        # another full collection or they sit in memory until Python happens to run one.
+        QTimer.singleShot(4000, release_memory)
         log.info("Unloaded %s from memory", path)
         self.home.refresh()
+
+    def unload_others(self, path):
+        """Only one game in memory unless Options > Keep games loaded is on: drop every game but `path`."""
+        if self.settings.keep_games_loaded:
+            return
+        keep = norm_path(path)
+        for other in [p for p in self.loaded if p != keep]:
+            self.unload_game(other)
 
     def show_home(self):
         self.home.refresh()
@@ -538,6 +559,19 @@ class MainWindow(QMainWindow):
         fast.setStatusTip(fast.toolTip())
         fast.toggled.connect(self._set_fast_gpu)
         options.addAction(fast)
+        keep = QAction("Keep games loaded when opening another", self, checkable=True)
+        keep.setChecked(self.settings.keep_games_loaded)
+        keep.setToolTip("Off: opening a game unloads the one before it, so only one game uses memory. On: games "
+                        "stay in memory until you unload them (right-click on Projects), so switching back is "
+                        "instant but RAM adds up (several GB per big game).")
+        keep.setStatusTip(keep.toolTip())
+        keep.toggled.connect(self._set_keep_loaded)
+        options.addAction(keep)
+        memory = QAction("Memory settings...", self)
+        memory.setToolTip("Allocated RAM, when to warn about memory, and when to slow background work down.")
+        memory.setStatusTip(memory.toolTip())
+        memory.triggered.connect(self.show_memory_settings)
+        options.addAction(memory)
         stats = QAction("Show RAM / CPU / GPU use in the title bar", self, checkable=True)
         stats.setChecked(self.settings.option("title_stats"))
         stats.setToolTip("Memory, processor and graphics card use, updated every 2 seconds.")
@@ -576,6 +610,8 @@ class MainWindow(QMainWindow):
             self.apply_filter()
             return
         VIEW_OPTIONS[key] = on
+        if key == "bundle_temp_file":
+            return  # used when the next game loads
         for entry in self.loaded.values():
             session = entry.get("session")
             if session is not None:
@@ -636,6 +672,10 @@ class MainWindow(QMainWindow):
         self.settings.save()
         self.loading_screen.preview_sound()
 
+    def _set_keep_loaded(self, on):
+        self.settings.keep_games_loaded = on
+        self.settings.save()
+
     def _set_fast_gpu(self, on):
         from uniview import gpu
         self.settings.fast_gpu = on
@@ -674,10 +714,21 @@ class MainWindow(QMainWindow):
         self.progress.hide()
         self.load_bar.hide()
         self._watch(True)
+        self._close_loading_screen()
+
+    def _close_loading_screen(self, fade=False):
         if self.loading_screen.is_active():
+            overlay = None
+            if fade and self.pages.currentWidget() is self.loading_screen and self.isVisible()                     and not self.isMinimized():
+                try:
+                    overlay = FadeOverlay(self.loading_screen)
+                except Exception as e:  # a missing fade is fine; a failed load screen isn't
+                    log.debug("No fade-out: %s", e)
             self.loading_screen.stop()
             if self.pages.currentWidget() is self.loading_screen:
                 self.pages.setCurrentWidget(self.viewer)
+            if overlay is not None:
+                overlay.start()
 
     # ---- loading
     def open_file(self):
@@ -712,6 +763,7 @@ class MainWindow(QMainWindow):
         self._update_notes_button()
         if self.current_project() is None:
             self.engine_label.clear()
+        self.unload_others(path)
         entry = self.loaded.get(norm_path(path))
         if entry is not None:
             log.info("Already loaded - reusing assets in memory for %s", path)
@@ -751,7 +803,21 @@ class MainWindow(QMainWindow):
         self.thread.start()
 
     def on_loaded(self, session):
-        self.hide_progress()
+        """The loader finished. Building the list takes the UI thread a moment for big games; the loading screen
+        (its own process, still animating) stays up until it's done instead of a grey, frozen page."""
+        started = time.perf_counter()
+        self.progress.hide()
+        self.load_bar.hide()
+        if self.loading_screen.is_active():
+            self.loading_screen.add_stage("Building the asset list ...")
+        try:
+            self._show_session(session)
+        finally:
+            self._watch(True)
+            self._close_loading_screen(fade=True)
+        log.info("Asset list ready in %.1fs (%s items)", time.perf_counter() - started, f"{len(self.items_by_key):,}")
+
+    def _show_session(self, session):
         key = norm_path(self.loading_path)
         entry = self.loaded.get(key)
         if entry is None or entry["session"] is not session:
@@ -798,6 +864,7 @@ class MainWindow(QMainWindow):
             for asset in items:
                 child = SortItem([asset.name, "", fmt_size(asset.size)])
                 child.setData(0, Qt.UserRole, asset)
+                child.asset = asset
                 child.setData(0, SORT_ROLE, asset.name.lower())
                 child.setData(2, SORT_ROLE, asset.size if asset.size is not None else -1)
                 child.setIcon(0, self.thumb_cache.get(asset.key, self.blank) if has_thumbnail(asset) else
@@ -811,6 +878,8 @@ class MainWindow(QMainWindow):
                     jobs.append((asset.key, session, asset))
                 self.items_by_key[asset.key] = child
                 children.append(child)
+                if len(self.items_by_key) % 20000 == 0:  # huge games: keep answering Windows ("Not responding")
+                    QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
             top.addChildren(children)
             tops.append(top)
             total += len(items)
@@ -874,8 +943,45 @@ class MainWindow(QMainWindow):
             self.filter_timer.start()
 
     def resort(self):
+        """Sort each group by the header's column. Done in Python with a key: QTreeWidget.sortItems() calls
+        SortItem.__lt__ for every comparison (millions for a big game, several seconds of frozen window)."""
         header = self.tree.header()
-        self.tree.sortItems(header.sortIndicatorSection(), header.sortIndicatorOrder())
+        col, desc = header.sortIndicatorSection(), header.sortIndicatorOrder() == Qt.DescendingOrder
+
+        def key(item):
+            v = item.data(col, SORT_ROLE)
+            v = -1 if v is None else v
+            return (isinstance(v, str), v)
+
+        tree = self.tree
+        current = tree.currentItem()
+        tree.setUpdatesEnabled(False)
+        try:
+            tops = [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
+            for top in tops:
+                children = top.takeChildren()
+                try:
+                    children.sort(key=key, reverse=desc)
+                    top.addChildren(children)
+                except TypeError:  # mixed values the key can't order: Qt's own way
+                    top.addChildren(children)
+                    top.sortChildren(col, header.sortIndicatorOrder())
+                for child in children:
+                    if child.hid:  # the view forgot when they were taken out
+                        child.setHidden(True)
+            expanded = {id(t): t.isExpanded() for t in tops}
+            group_key = lambda t: t.data(0, SORT_ROLE) or ""  # noqa: E731 - groups keep their fixed order
+            if [id(t) for t in sorted(tops, key=group_key)] != [id(t) for t in tops]:
+                for _ in tops:
+                    tree.takeTopLevelItem(0)
+                tops.sort(key=group_key)
+                tree.addTopLevelItems(tops)
+                for t in tops:
+                    t.setExpanded(expanded[id(t)])
+            if current is not None:
+                tree.setCurrentItem(current)
+        finally:
+            tree.setUpdatesEnabled(True)
         self.grid_dirty = True
         if self.list_stack.currentWidget() is self.grid:
             self.rebuild_grid()
@@ -896,7 +1002,7 @@ class MainWindow(QMainWindow):
                 if group_ok:
                     for j in range(top.childCount()):
                         child = top.child(j)
-                        asset = child.data(0, Qt.UserRole)
+                        asset = child.asset
                         stats = self.stats.get(asset.key)
                         ok = filt.matches(asset.name, kind, stats)
                         if ok and hide_unreadable and is_unreadable(stats):
@@ -905,7 +1011,9 @@ class MainWindow(QMainWindow):
                             ok = asset.uid in self.favorites
                         if ok and asset.uid in self.hidden_copies:
                             ok = False
-                        child.setHidden(not ok)
+                        if child.hid == ok:  # only when it changes: setHidden() is slow on big trees
+                            child.hid = not ok
+                            child.setHidden(not ok)
                         shown += ok
                 count = top.childCount()
                 top.setText(0, f"{label} ({shown:,})" if shown == count else f"{label} ({shown:,} of {count:,})")
@@ -1191,6 +1299,8 @@ class MainWindow(QMainWindow):
                         frames = []
                     self.anim_view.show_clip(text, targets, flipbook=len(frames))
                     self.stack.setCurrentWidget(self.anim_view)
+                    if frames and not targets:  # a 2D animation and nothing else to do with it: play it right away
+                        QTimer.singleShot(0, lambda clip=asset: self.current is clip and self.play_flipbook())
                 elif asset.kind == "controller":
                     self.controller_view.show_controller(asset.name, session.controller(asset))
                     self.stack.setCurrentWidget(self.controller_view)
@@ -1261,11 +1371,26 @@ class MainWindow(QMainWindow):
         self._flipbook = {"frames": padded, "length": max(length, padded[-1][0] + step), "start": time.time(),
                           "index": -1, "name": clip.name}
         self.stack.setCurrentWidget(self.image_view)
-        self.image_view.set_links("Sprite animation", [], f"{len(padded)} frames, {self._flipbook['length']:.2f} s "
-                                                        "(select another asset to stop)")
+        self._flipbook_side(clip, session, len(padded))
         self._flipbook_tick()
         self.image_view.fit()
         self.flipbook_timer.start()
+
+    def _flipbook_side(self, clip, session, frame_count):
+        """The image view's right bar while a sprite animation plays: its sprite sheet(s) and the code behind it."""
+        summary = f"{frame_count} frames, {self._flipbook['length']:.2f} s (select another asset to stop)"
+        try:
+            with session.lock:
+                title, sheets, empty = session.related(clip)
+                code_title, code = session.animation_code(clip)
+        except Exception:
+            log.exception("Reading what's behind the animation '%s' failed", clip.name)
+            title, sheets, empty, code_title, code = "", [], "", "", ""
+        entries = [(a.key, os.path.basename(a.name), self.blank_big) for a in sheets]
+        self.image_view.set_links(f"{title or 'Sprite animation'}<br><small>{summary}</small>", entries,
+                                  empty or summary)
+        self._request_icons(sheets, self.image_view.set_link_icon)
+        self.image_view.set_details(code_title, code)
 
     def _flipbook_tick(self):
         fb = self._flipbook
@@ -1863,7 +1988,10 @@ class MainWindow(QMainWindow):
             filters = "PNG image (*.png)"
         else:
             filters = "All files (*)"
-        ext = export_ext(asset, self.settings.model_format)
+        anim_formats = self._flipbook_formats(asset)
+        if anim_formats:
+            filters = ";;".join(ANIM_FILTERS[f] for f in anim_formats)
+        ext = export_ext(asset, self.settings.model_format, anim_formats[0] if anim_formats else None)
         if asset.kind in ("font", "video") and ext:
             label = {"ttf": "TrueType font", "otf": "OpenType font"}.get(ext, f"{ext.upper()} video")
             filters = f"{label} (*.{ext});;All files (*)"
@@ -1874,14 +2002,35 @@ class MainWindow(QMainWindow):
             return
         if asset.kind in MODEL_KINDS and not path.lower().endswith((".obj", ".glb")):
             path += ".glb" if "glb" in chosen else ".obj"
+        anim_format = next((f for f in anim_formats if ANIM_FILTERS[f] == chosen), None)
+        if anim_format:
+            self.settings.anim_format = anim_format
+            self.settings.save()
         try:
-            written = write_asset(self.session, asset, path)
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                written = write_asset(self.session, asset, path, anim_format)
+            finally:
+                QApplication.restoreOverrideCursor()
             self.statusBar().showMessage("Saved " + ", ".join(os.path.basename(w) for w in written))
             for w in written:
                 log.info("Saved %s", w)
         except Exception as e:
             log.exception("Saving %s failed", asset.name)
             QMessageBox.warning(self, "Save failed", str(e))
+
+    def _flipbook_formats(self, asset):
+        """Save formats for a 2D (flipbook) animation, the last used first; [] for other assets."""
+        if asset.kind != "animation" or self.session is None:
+            return []
+        try:
+            with self.session.lock:
+                if not self.session.sprite_frames(asset)[0]:
+                    return []
+        except Exception:
+            return []
+        last = self.settings.anim_format
+        return [last] + [f for f in ANIM_FORMATS if f != last] if last in ANIM_FORMATS else list(ANIM_FORMATS)
 
     def export_animated(self, model):
         """Save `model` as a GLB with its skeleton and the current animation clip."""
@@ -1932,20 +2081,21 @@ class MainWindow(QMainWindow):
         if not items:
             QMessageBox.information(self, "Export", "Nothing to export.")
             return
-        dlg = ExportDialog(len(items), any(a.kind in MODEL_KINDS for a in items), self.settings, self)
+        dlg = ExportDialog(len(items), any(a.kind in MODEL_KINDS for a in items), self.settings, self,
+                           has_animations=any(a.kind == "animation" for a in items))
         if dlg.exec():
-            folder, model_format, keep = dlg.values()
-            self._export_to_folder(items, folder, model_format, keep)
+            folder, model_format, keep, anim_format = dlg.values()
+            self._export_to_folder(items, folder, model_format, keep, anim_format)
 
-    def _export_to_folder(self, items, folder, model_format="obj", keep_structure=False):
+    def _export_to_folder(self, items, folder, model_format="obj", keep_structure=False, anim_format=None):
         log.info("Exporting %d item(s) to %s (models as %s%s)", len(items), folder, model_format.upper(),
                  ", keeping the game's folders" if keep_structure else "")
         ok = fail = 0
         self.set_progress(0, len(items))
-        for n, (asset, path) in enumerate(plan_export(items, folder, model_format, keep_structure), 1):
+        for n, (asset, path) in enumerate(plan_export(items, folder, model_format, keep_structure, anim_format), 1):
             try:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-                write_asset(self.session, asset, path)
+                write_asset(self.session, asset, path, anim_format)
                 ok += 1
             except Exception as e:
                 fail += 1
@@ -1982,14 +2132,23 @@ class MainWindow(QMainWindow):
         if THROTTLE.report_lag(lag_ms):
             self._show_strain()
 
+    def ram_budget(self, stats=None):
+        stats = self.system_stats.latest() if stats is None else stats
+        return ram_budget(self.settings.ram_budget_gb, stats.get("sys_ram_total", 0))
+
     def _update_stats(self):
         stats = self.system_stats.latest()
+        budget = self.ram_budget(stats)
+        used = stats.get("app_private")
+        budget_pct = 100.0 * used / budget if used and budget else None
         if "sys_ram_pct" in stats:
-            if THROTTLE.report_memory(stats["sys_ram_pct"]):
+            if THROTTLE.report_memory(stats["sys_ram_pct"], budget_pct):
                 self._show_strain()
                 if THROTTLE.level >= 2:
                     self._free_memory()
-        text = stats_text(stats) if self.settings.option("title_stats") else ""
+        if budget_pct is not None:
+            self._check_ram_warning(used, budget, budget_pct)
+        text = stats_text(stats, budget) if self.settings.option("title_stats") else ""
         if THROTTLE.level:
             text = ("⚠ Slowed down to stay responsive" + (" · " if text else "")) + text
         title = f"{APP_TITLE}   |   {text}" if text else APP_TITLE
@@ -2009,12 +2168,46 @@ class MainWindow(QMainWindow):
         self.strain_label.setVisible(bool(reason))
         self._update_stats()
 
+    def _check_ram_warning(self, used, budget, pct):
+        """Settings > Memory 'Max RAM warning': once per crossing, a status bar note and a (non-blocking) popup."""
+        warn = self.settings.ram_warn_pct
+        if pct < warn - 5:
+            self._ram_warned = False
+            return
+        if pct < warn or self._ram_warned:
+            return
+        self._ram_warned = True
+        text = f"UniView is using {fmt_gb(used)} of its {fmt_gb(budget)} allocated RAM ({pct:.0f}%)."
+        log.warning("%s", text)
+        self.statusBar().showMessage("⚠ " + text, 15000)
+        box = QMessageBox(QMessageBox.Warning, "Memory is getting full", text + "\n\n"
+                          "To free some: unload games you're not using (right-click on Projects), turn off "
+                          "Options > Keep games loaded, or keep Options > Unpack game bundles to a temp file on. "
+                          "You can raise the allocation in Options > Memory settings.", QMessageBox.Ok, self)
+        box.setModal(False)
+        box.setAttribute(Qt.WA_DeleteOnClose)
+        box.show()
+
+    def show_memory_settings(self):
+        from uniview.ui.memory_dialog import MemoryDialog
+        dialog = MemoryDialog(self.settings, self.system_stats.latest(), self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        dialog.apply()
+        self.settings.save()
+        THROTTLE.configure(self.settings.ram_slow_pct)
+        self._ram_warned = False
+        log.info("Memory settings: allocated %s, warn at %d%%, slow down at %d%%",
+                 fmt_gb(self.ram_budget()), self.settings.ram_warn_pct, self.settings.ram_slow_pct)
+        self._update_stats()
+
     def _free_memory(self):
         """Memory almost full: drop the thumbnail cache's older half and collect garbage."""
         import gc
         for key in list(self.thumb_cache)[:len(self.thumb_cache) // 2]:
             del self.thumb_cache[key]
         gc.collect()
+        release_memory()
         log.warning("Memory is almost full - freed cached thumbnails. Closing other games/programs helps.")
 
     def _set_title_stats(self, on):

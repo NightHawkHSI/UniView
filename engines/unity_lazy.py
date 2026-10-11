@@ -10,9 +10,22 @@ filters by type in numpy before making any reader). Readers someone still holds 
 same object keeps one reader while it's in use. Smaller files keep UnityPy's plain dict.
 
 install() swaps in a copy of UnityPy 1.25's SerializedFile.__init__ that differs only in the "ReadObjects" step.
-Other UnityPy versions are left alone (everything still works, just with the normal memory use)."""
+Other UnityPy versions are left alone (everything still works, just with the normal memory use).
 
+Bundles: UnityPy unpacks each compressed bundle into one buffer it keeps for as long as the game is open. With a
+SpillFile in use (one per open game, see use_spill), bundles of SPILL_MIN or more are unpacked into that temp file
+instead and read through a memory map, so Windows pages them in from disk when needed rather than holding gigabytes
+in RAM. The file is opened delete-on-close: it goes away when the game is unloaded, or when the app exits or
+crashes."""
+
+import itertools
 import logging
+import mmap
+import os
+import re
+import shutil
+import tempfile
+import threading
 import weakref
 from collections.abc import MutableMapping
 
@@ -21,7 +34,115 @@ import numpy as np
 log = logging.getLogger("uniview.unity")
 
 LAZY_MIN = 50_000  # objects in one file before its table is kept compact
+SPILL_MIN = 8 << 20  # unpacked bundles this big or bigger go to the game's temp file
+SPILL_FREE = 2 << 30  # ...as long as the temp drive keeps this much free space
+SPILL_DIR = os.path.join(tempfile.gettempdir(), "UniView")
 _installed = False
+_spill = None  # the SpillFile bundles unpack into, or None (keep them in RAM)
+_spill_ids = itertools.count(1)
+
+
+class SpillFile:
+    """One temp file per open game (%TEMP%/UniView/Temp<Game>-<pid>-<n>.bin) holding its unpacked bundles."""
+
+    def __init__(self, name):
+        os.makedirs(SPILL_DIR, exist_ok=True)
+        _remove_stale()
+        safe = re.sub(r"[^\w.-]+", "_", name).strip("._")[:60] or "Game"
+        self.path = os.path.join(SPILL_DIR, f"Temp{safe}-{os.getpid()}-{next(_spill_ids)}.bin")
+        temporary = getattr(os, "O_TEMPORARY", 0)  # Windows: deleted once the last handle/mapping closes
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | temporary, 0o600)
+        if not temporary:
+            os.unlink(self.path)  # elsewhere: out of the folder now, space freed when closed
+        self.size = 0          # bytes used (end of the last bundle)
+        self.maps = []
+        self.lock = threading.Lock()
+        self.closed = False
+
+    def store(self, total, chunks):
+        """Write `chunks` (an iterable of bytes, `total` long) to the file; a memoryview of them, or None if the
+        temp drive is short on space or the write fails (nothing is left half-used: the caller keeps it in RAM)."""
+        with self.lock:
+            if self.closed:
+                return None
+            try:
+                if shutil.disk_usage(SPILL_DIR).free < total + SPILL_FREE:
+                    return None
+            except OSError:
+                return None
+            grain = mmap.ALLOCATIONGRANULARITY
+            start = -(-self.size // grain) * grain  # map offsets must be multiples of this
+            pos = start
+            try:
+                for data in chunks:
+                    view = memoryview(data)
+                    while view.nbytes:
+                        written = os.pwrite(self.fd, view, pos) if hasattr(os, "pwrite") else self._write_at(view, pos)
+                        view, pos = view[written:], pos + written
+                length = pos - start
+                if length == 0:
+                    return memoryview(b"")
+                # read-only: a copy-on-write map would be charged to RAM up front, which is what this avoids
+                mapped = mmap.mmap(self.fd, length, access=mmap.ACCESS_READ, offset=start)
+            except (OSError, ValueError) as e:
+                log.warning("Couldn't unpack a bundle to the temp file (%s) - keeping it in memory", e)
+                return None
+            self.size = pos
+            self.maps.append(weakref.ref(mapped))
+            return memoryview(mapped)
+
+    def _write_at(self, view, pos):
+        os.lseek(self.fd, pos, os.SEEK_SET)
+        return os.write(self.fd, view)
+
+    def close(self):
+        """Done with this game. Maps still in use close when the last reader lets go; the file is deleted then."""
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            for ref in self.maps:
+                mapped = ref()
+                if mapped is not None:
+                    try:
+                        mapped.close()
+                    except BufferError:
+                        pass  # something still reads it; it closes when that's garbage
+            self.maps = []
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+        log.info("Closed temp file %s (%.0f MB of unpacked bundles)", os.path.basename(self.path), self.size / 1e6)
+
+
+def _remove_stale():
+    """Leftovers from a run that didn't close cleanly (power cut). Files still open can't be deleted - skip those."""
+    try:
+        names = os.listdir(SPILL_DIR)
+    except OSError:
+        return
+    for name in names:
+        if name.startswith("Temp") and name.endswith(".bin"):
+            try:
+                os.remove(os.path.join(SPILL_DIR, name))
+            except OSError:
+                pass
+
+
+def use_spill(spill):
+    """Unpack bundles into `spill` (a SpillFile) from now on; None = keep them in RAM."""
+    global _spill
+    _spill = spill
+
+
+def release_spill(spill):
+    """The game owning `spill` is closing."""
+    global _spill
+    if _spill is spill:
+        _spill = None
+    if spill is not None:
+        spill.close()
 
 
 class LazyObjects(MutableMapping):
@@ -329,6 +450,15 @@ def _join_blocks(bundle, reader, blocks):
     """A bundle's blocks decompressed into one buffer. UnityPy's b"".join() of a generator holds every block
     and the joined result at once (twice the bundle's size)."""
     total = sum(b.uncompressedSize for b in blocks)
+    spill = _spill
+    if spill is not None and total >= SPILL_MIN:
+        start = reader.Position
+        chunks = (bundle.decompress_data(reader.read_bytes(b.compressedSize), b.uncompressedSize, b.flags, i)
+                  for i, b in enumerate(blocks))
+        view = spill.store(total, chunks)
+        if view is not None:
+            return view
+        reader.Position = start  # fall back to RAM: read the blocks again
     buf = bytearray(total)
     view = memoryview(buf)
     pos = 0

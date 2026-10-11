@@ -11,7 +11,7 @@ from .sdk import API_VERSION, EnginePlugin
 
 log = logging.getLogger("viewer.engines")
 
-BUILTIN_MODULES = ("unity", "source", "source2", "unreal", "fallout", "generic")
+BUILTIN_MODULES = ("unity", "source", "source2", "unreal", "generic")
 
 _plugins = []        # [EnginePlugin] in load order (built-ins first)
 _load_report = []    # [(name, origin, ok, message)] for Help -> Engine plugins

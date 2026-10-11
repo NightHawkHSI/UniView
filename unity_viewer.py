@@ -10,6 +10,10 @@ show as images.
 
 import sys
 
+if __name__ == "__main__" and "--loading-screen" in sys.argv:  # the loading screen's own process; keep it light
+    from uniview.ui.loading_child import child_main
+    sys.exit(child_main())
+
 try:
     import pyi_splash  # the packaged exe's launcher splash (build.py --splash); not there when run from source
 except ImportError:

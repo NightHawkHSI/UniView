@@ -33,6 +33,7 @@ class Session:
     def raw(self, a): return self._call("raw", a)
     def text(self, a): return self._call("text", a)
     def skeleton(self, a, clip=None): return self._call("skeleton", a)
+    def sprite_frames(self, a): return self._call("sprite_frames", a)
 
 
 def tri():
@@ -132,3 +133,43 @@ def test_write_animated_glb(tmp_path):
     s = Session(mesh=tri(), materials=[], skeleton=lambda a: (rig, anim))
     written, got_rig = ex.write_animated_glb(s, Asset("model", "m", 1), SimpleNamespace(), str(tmp_path / "a.glb"))
     assert got_rig is rig and open(written[0], "rb").read(4) == b"glTF"
+
+
+def _flipbook_session():
+    """Two frames of different sizes, 0.1 s and 0.3 s."""
+    red, blue = Image.new("RGBA", (4, 2), (255, 0, 0, 255)), Image.new("RGBA", (2, 6), (0, 0, 255, 255))
+    frames = [(0.0, Asset("sprite", "f0", "f0")), (0.1, Asset("sprite", "f1", "f1"))]
+    return Session(sprite_frames=(frames, 0.4), image=lambda a: red if a.key == "f0" else blue)
+
+
+def test_flipbook_frames_share_one_canvas():
+    frames = ex.flipbook(_flipbook_session(), Asset("animation", "walk", 1))
+    assert [img.size for img, _d in frames] == [(4, 6), (4, 6)]
+    assert [round(d, 3) for _i, d in frames] == [0.1, 0.3]
+    assert frames[0][0].getpixel((0, 5))[3] == 255 and frames[0][0].getpixel((0, 0))[3] == 0  # stands on the bottom
+
+
+def test_write_flipbook_gif_sheet_and_frames(tmp_path):
+    import json
+    s, clip = _flipbook_session(), Asset("animation", "walk", 1)
+    gif = ex.write_asset(s, clip, str(tmp_path / "walk.gif"))
+    assert open(gif[0], "rb").read(6) == b"GIF89a"
+    with Image.open(gif[0]) as im:
+        assert im.n_frames == 2
+    sheet = ex.write_asset(s, clip, str(tmp_path / "sheet.png"), "sheet")
+    assert [os.path.basename(p) for p in sheet] == ["sheet.png", "sheet.json"]
+    meta = json.load(open(sheet[1]))
+    assert meta["meta"]["image"] == "sheet.png" and [f["duration"] for f in meta["frames"]] == [100, 300]
+    with Image.open(sheet[0]) as im:
+        f1 = meta["frames"][1]["frame"]
+        assert im.getpixel((f1["x"] + 1, f1["y"] + 5))[2] == 255  # the blue frame sits in its cell
+    files = ex.write_asset(s, clip, str(tmp_path / "run.png"), "frames")
+    assert [os.path.relpath(p, tmp_path).replace(os.sep, "/") for p in files] == [
+        "run/run_000.png", "run/run_001.png", "run/run.json"]
+
+
+def test_non_flipbook_animation_is_saved_as_stored(tmp_path):
+    s = Session(sprite_frames=([], 0.0), raw=b"clip")
+    out = ex.write_asset(s, Asset("animation", "a", 1, ext="anim"), str(tmp_path / "a.gif"), "gif")
+    assert out == [str(tmp_path / "a.anim")] and open(out[0], "rb").read() == b"clip"
+    assert ex.export_ext(Asset("animation", "a", 1, ext="anim"), "obj", "sheet") == "png"

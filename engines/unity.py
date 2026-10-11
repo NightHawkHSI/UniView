@@ -13,7 +13,7 @@ import numpy as np
 
 from .unity_lazy import LazyObjects, objects_of, serialized_files
 from .sdk import (
-    ALBEDO, NORMAL, OTHER, Asset, EnginePlugin, GameSession, Material, MeshData, TextureRef,
+    ALBEDO, NORMAL, OTHER, Asset, EnginePlugin, GameSession, Material, MeshData, TextureRef, view_option,
 )
 
 log = logging.getLogger("viewer.unity")
@@ -1459,6 +1459,7 @@ class UnitySession(GameSession):
         super().__init__(plugin, path)
         self.env = env
         self.file_count = file_count
+        self.spill = None  # unity_lazy.SpillFile with this game's unpacked bundles
         self.finder = TextureFinder(env, self.lock)
         self.by_key = {}
         self._paths = None
@@ -1504,7 +1505,9 @@ class UnitySession(GameSession):
         self.finder.start_background()
 
     def close(self):
+        from . import unity_lazy
         self.finder.stop()
+        unity_lazy.release_spill(self.spill)
 
     def options_changed(self):
         self._scenes.clear()
@@ -3688,11 +3691,27 @@ class UnityPlugin(EnginePlugin):
         return added
 
     def open(self, path, progress):
+        from . import unity_lazy
+        unity_lazy.install()
+        spill = None
+        if view_option("bundle_temp_file"):
+            try:  # big bundles unpack into this instead of RAM (unity_lazy.SpillFile); gone when the game closes
+                spill = unity_lazy.SpillFile(os.path.basename(os.path.normpath(path)))
+            except OSError as e:
+                log.warning("No temp file for unpacked bundles (%s) - keeping them in memory", e)
+        unity_lazy.use_spill(spill)
+        try:
+            session = self._open(path, progress)
+        except BaseException:
+            unity_lazy.release_spill(spill)
+            raise
+        session.spill = spill
+        return session
+
+    def _open(self, path, progress):
         import UnityPy
 
-        from . import unity_lazy
         from .unity_scene import is_scene_file
-        unity_lazy.install()
         started = time.time()
         progress(f"Scanning {path} for Unity files ...")
         log.info("Scanning %s for Unity files", path)
@@ -3703,7 +3722,7 @@ class UnityPlugin(EnginePlugin):
         root = path if os.path.isdir(path) else os.path.dirname(path)
         env = UnityPy.Environment(path=root)
         failed = 0
-        progress.files((os.path.relpath(f, root), _file_size(f)) for f in files)
+        progress.files((os.path.relpath(f, root), _file_size(f), f) for f in files)
         for n, fpath in enumerate(files, 1):
             rel = os.path.relpath(fpath, root)
             progress.file(n - 1)

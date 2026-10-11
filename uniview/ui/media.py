@@ -58,7 +58,8 @@ class ZoomGraphicsView(QGraphicsView):
         self.zoom_by(1.25 ** wheel_steps(event))
 
 class ImageView(QWidget):
-    """Texture viewer: wheel to zoom, drag to pan, save as PNG. Optional 'used by' links on the right."""
+    """Texture viewer: wheel to zoom, drag to pan, save as PNG. Optional 'used by' links on the right, and under
+    them a text box (set_details) - e.g. the code that drives a sprite animation."""
 
     save_requested = Signal()
     goto_requested = Signal(object)  # asset key
@@ -111,17 +112,34 @@ class ImageView(QWidget):
         links_lay.setContentsMargins(6, 0, 0, 0)
         links_lay.addWidget(self.links_title)
         links_lay.addWidget(self.links, 1)
-        hint = QLabel("Click one to jump to it.")
-        role(hint, "muted")
-        links_lay.addWidget(hint)
-        links_box.setVisible(show_links)
+        self.links_hint = QLabel("Click one to jump to it.")
+        role(self.links_hint, "muted")
+        links_lay.addWidget(self.links_hint)
         self._link_items = {}
+        self.details_title = QLabel()
+        self.details_title.setWordWrap(True)
+        self.details = QPlainTextEdit(readOnly=True)
+        self.details.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        self.details.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.details_box = QWidget()
+        details_lay = QVBoxLayout(self.details_box)
+        details_lay.setContentsMargins(6, 0, 0, 0)
+        details_lay.addWidget(self.details_title)
+        details_lay.addWidget(self.details, 1)
+        self.details_box.hide()
+        side = QSplitter(Qt.Vertical)
+        side.addWidget(links_box)
+        side.addWidget(self.details_box)
+        side.setStretchFactor(1, 1)
+        side.setSizes([200, 500])
+        side.setVisible(show_links)
 
         split = QSplitter()
         split.addWidget(self.view)
-        split.addWidget(links_box)
+        split.addWidget(side)
         split.setStretchFactor(0, 1)
         split.setSizes([900, 260])
+        self.split = split
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -129,8 +147,10 @@ class ImageView(QWidget):
         lay.addWidget(split, 1)
 
     def set_links(self, title, entries, empty_text):
-        """entries: [(key, text, icon)] shown in the side list."""
+        """entries: [(key, text, icon)] shown in the side list. Hides the details box (set_details shows it)."""
         self.links_title.setText(f"<b>{title}</b>")
+        self.links_hint.setVisible(bool(entries))
+        self.set_details("", "")
         self.links.clear()
         self._link_items = {}
         if not entries:
@@ -142,6 +162,15 @@ class ImageView(QWidget):
             item.setData(Qt.UserRole, key)
             self.links.addItem(item)
             self._link_items[key] = item
+
+    def set_details(self, title, text):
+        """Text under the side list (monospace, scrollable); hidden when `text` is empty."""
+        self.details_title.setText(f"<b>{html_escape(title)}</b>" if title else "")
+        self.details.setPlainText(text)
+        self.details_box.setVisible(bool(text))
+        sizes = self.split.sizes()
+        if text and sizes[1] < 420 and sum(sizes) > 900:  # room for the code
+            self.split.setSizes([sum(sizes) - 420, 420])
 
     def set_link_icon(self, key, icon):
         item = self._link_items.get(key)

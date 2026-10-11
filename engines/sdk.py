@@ -415,10 +415,13 @@ class Progress:
         self._text(text)
         self._value(done, total)
 
-    def files(self, entries: Iterable[tuple[str, int | None]]) -> None:
-        """Optional: the files this load is about to read, as (name, size in bytes or None). The loading
-        screen shows one icon per file (sized by how big it is) instead of a plain bar."""
-        self._files("queue", [(str(name), int(size or 0)) for name, size in entries])
+    def files(self, entries: Iterable[tuple[Any, ...]]) -> None:
+        """Optional: the files this load is about to read, as (name, size in bytes or None) or
+        (name, size, full path). The loading screen shows one icon per file (sized by how big it is) instead of
+        a plain bar; with the path it also follows how much of the file has really been read and shows its
+        actual bits."""
+        self._files("queue", [(str(e[0]), int(e[1] or 0), str(e[2]) if len(e) > 2 and e[2] else "")
+                              for e in entries])
 
     def file(self, index: int) -> None:
         """Optional, after files(): now reading entries[index] (everything before it is done).
@@ -439,6 +442,7 @@ VIEW_OPTIONS: dict[str, bool] = {
     "hide_lods": True,           # scenes: show only the most detailed LOD of each object
     "hide_inactive": True,       # scenes: leave out objects and renderers the game has switched off
     "show_effects": True,        # scenes: particle systems (as a few still puffs) and line renderers
+    "bundle_temp_file": True,    # loading: unpack big bundles into a temp file per game instead of RAM
 }
 
 
@@ -541,6 +545,11 @@ class GameSession:
     def related(self, asset: Asset) -> tuple[str, list[Asset], str]:
         """Links shown under a texture: (title, [Asset], text when empty). E.g. models that use it."""
         return "", [], ""
+
+    def animation_code(self, asset: Asset) -> tuple[str, str]:
+        """(title, text) of what drives an animation (its keyframes / program as readable text), shown next to it
+        while it plays. ("", "") if there's nothing to show."""
+        return "", ""
 
     def font(self, asset: Asset) -> Image:
         """Sample sheet of a font asset. Default: render raw() (TTF/OTF bytes) with font_preview()."""

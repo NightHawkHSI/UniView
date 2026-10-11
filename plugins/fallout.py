@@ -13,13 +13,14 @@ import zlib
 import numpy as np
 from PIL import Image
 
-from .sdk import Asset, EnginePlugin, GameSession, listdir_lower
+from engines.sdk import Asset, EnginePlugin, GameSession, Kind, listdir_lower
 
 log = logging.getLogger("viewer.fallout")
 
-KINDS = {"frm": "sprite", "fr0": "sprite", "fr1": "sprite", "fr2": "sprite", "fr3": "sprite", "fr4": "sprite",
-         "fr5": "sprite", "rix": "texture", "acm": "audio", "msg": "text", "txt": "text", "lst": "text",
-         "gam": "text", "cfg": "text", "ini": "text", "sve": "text", "bio": "text", "gcd": "file"}
+KINDS: dict[str, Kind] = {
+    "frm": "sprite", "fr0": "sprite", "fr1": "sprite", "fr2": "sprite", "fr3": "sprite", "fr4": "sprite",
+    "fr5": "sprite", "rix": "texture", "acm": "audio", "msg": "text", "txt": "text", "lst": "text",
+    "gam": "text", "cfg": "text", "ini": "text", "sve": "text", "bio": "text", "gcd": "file"}
 
 
 def lzss_decompress(data, size):
@@ -237,7 +238,7 @@ class FalloutSession(GameSession):
         return frm_image(data, self.palette())
 
     def audio(self, asset):
-        from . import extdecode
+        from engines import extdecode
         return extdecode.to_wav(self.raw(asset), "acm"), "wav"
 
     def text(self, asset):
@@ -310,12 +311,12 @@ class FalloutPlugin(EnginePlugin):
             os.path.join(root, "DATA")
         if os.path.isdir(data_dir):
             for dirpath, _dirs, names in os.walk(data_dir):
-                for n in names:
-                    full = os.path.join(dirpath, n)
+                for fname in names:
+                    full = os.path.join(dirpath, fname)
                     rel = os.path.relpath(full, data_dir).replace("\\", "/").lower()
                     if not rel.endswith(".dat"):
                         session.files.setdefault(rel, (None, full))
-        progress.files((os.path.basename(d), os.path.getsize(d) if os.path.isfile(d) else 0) for d in dats)
+        progress.files((os.path.basename(d), os.path.getsize(d) if os.path.isfile(d) else 0, d) for d in dats)
         for n, dat_path in enumerate(dats, 1):
             progress.file(n - 1)
             progress(f"Reading {os.path.basename(dat_path)} ({n}/{len(dats)})", n - 1, len(dats))

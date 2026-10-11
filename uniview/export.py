@@ -501,10 +501,18 @@ def session_materials(session, asset):
         return []
 
 
-def export_ext(asset, model_format="obj"):
-    """File extension an asset is saved with."""
+ANIM_FORMATS = ("gif", "sheet", "frames")  # flipbook animations: animated GIF, sprite sheet + JSON, PNG frames + JSON
+ANIM_FILTERS = {"gif": "Animated GIF (*.gif)", "sheet": "Sprite sheet PNG + JSON (*.png)",
+                "frames": "PNG frames + JSON, in a folder (*.png)"}
+
+
+def export_ext(asset, model_format="obj", anim_format=None):
+    """File extension an asset is saved with. anim_format: how flipbook animations are saved (ANIM_FORMATS),
+    None = as stored."""
     if asset.kind in MODEL_KINDS:
         return model_format
+    if asset.kind == "animation" and anim_format in ANIM_FORMATS:
+        return "gif" if anim_format == "gif" else "png"
     if asset.kind in IMAGE_KINDS:
         return "png"
     if asset.kind == "audio" and asset.ext in ("vsnd_c", ""):
@@ -534,9 +542,18 @@ def rig_for_export(session, asset, md):
     return rig if len(rig["joints_0"]) == len(md.points) else None
 
 
-def write_asset(session, asset, path):
-    """Save one asset to `path` (.obj/.glb for models); returns the list of files written."""
+def write_asset(session, asset, path, anim_format=None):
+    """Save one asset to `path` (.obj/.glb for models); returns the list of files written.
+    anim_format: how a flipbook animation is saved (ANIM_FORMATS; None = by the path's extension, .gif / .png)."""
     with session.lock:
+        if asset.kind == "animation":
+            fmt = anim_format or {".gif": "gif", ".png": "sheet"}.get(os.path.splitext(path)[1].lower())
+            if fmt in ANIM_FORMATS:
+                frames = flipbook(session, asset)
+                if frames:
+                    return write_flipbook(frames, path, fmt)
+                if asset.ext:  # not a flipbook (e.g. a skeletal clip): save it as stored
+                    path = os.path.splitext(path)[0] + "." + asset.ext
         if asset.kind in MODEL_KINDS:
             md = session.mesh(asset)
             materials = session_materials(session, asset)  # waits for background indexing if needed
@@ -565,6 +582,108 @@ def write_asset(session, asset, path):
         return [path]
 
 
+def flipbook(session, asset):
+    """[(RGBA image, duration in seconds)] of a flipbook animation, all frames on one canvas (centred, standing on
+    the bottom edge, like the viewer plays them); [] if the asset has no sprite frames."""
+    try:
+        frames, length = session.sprite_frames(asset)
+    except (NotImplementedError, ValueError):
+        return []
+    if not frames:
+        return []
+    cache, images = {}, []
+    for _t, sprite in frames:
+        if sprite.key not in cache:
+            cache[sprite.key] = session.image(sprite).convert("RGBA")
+        images.append(cache[sprite.key])
+    w, h = max(i.width for i in images), max(i.height for i in images)
+    times = [t for t, _s in frames]
+    step = length / len(frames) if length > 0 else 1 / 12
+    end = max(length, times[-1] + step)
+    out = []
+    for n, img in enumerate(images):
+        if img.size != (w, h):
+            canvas = Image.new("RGBA", (w, h))
+            canvas.paste(img, ((w - img.width) // 2, h - img.height))
+            img = canvas
+        duration = (times[n + 1] if n + 1 < len(times) else end) - times[n]
+        out.append((img, duration if duration > 0 else step))
+    return out
+
+
+def gif_bytes(frames):
+    """Endless-loop animated GIF of [(RGBA image, seconds)]; pixels under 50% alpha become transparent."""
+    pal = []
+    for img, _d in frames:
+        mask = img.getchannel("A").point(lambda a: 255 if a < 128 else 0)
+        p = img.convert("RGB").quantize(255)
+        p.paste(255, mask=mask)
+        pal.append(p)
+    out = io.BytesIO()
+    pal[0].save(out, "GIF", save_all=True, append_images=pal[1:], loop=0, disposal=2, transparency=255,
+                duration=[max(20, round(d * 1000)) for _i, d in frames], optimize=False)
+    return out.getvalue()
+
+
+def sheet_layout(count, w, h, max_side=8192):
+    """Columns of a sprite sheet grid for `count` cells of w x h: close to square, at most max_side wide."""
+    cols = max(1, min(count, int(np.ceil(np.sqrt(count * h / max(1, w))))))
+    return max(1, min(cols, max_side // max(1, w)))
+
+
+def flipbook_json(frames, image, cells, name):
+    """Aseprite / TexturePacker style JSON ("frames" array + "meta"), read by Phaser, Godot and Unity importers."""
+    w, h = frames[0][0].size
+    return {
+        "frames": [{"filename": f"{name}_{n:03d}", "frame": {"x": x, "y": y, "w": w, "h": h}, "rotated": False,
+                    "trimmed": False, "spriteSourceSize": {"x": 0, "y": 0, "w": w, "h": h},
+                    "sourceSize": {"w": w, "h": h}, "duration": max(1, round(d * 1000))}
+                   for n, ((_img, d), (x, y)) in enumerate(zip(frames, cells))],
+        "meta": {"app": f"{APP_SHORT} {__version__}", "image": image, "format": "RGBA8888", "scale": "1",
+                 "frameTags": [{"name": name, "from": 0, "to": len(frames) - 1, "direction": "forward"}]},
+    }
+
+
+def write_flipbook(frames, path, fmt):
+    """Save [(image, seconds)] as an animated GIF, a sprite sheet PNG + JSON, or a folder of PNG frames + JSON.
+    Returns the files written."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    folder = os.path.dirname(path)
+    if fmt == "gif":
+        path = os.path.splitext(path)[0] + ".gif"
+        with open(path, "wb") as f:
+            f.write(gif_bytes(frames))
+        return [path]
+    w, h = frames[0][0].size
+    if fmt == "frames":
+        folder = os.path.join(folder, stem)
+        os.makedirs(folder, exist_ok=True)
+        written = []
+        for n, (img, _d) in enumerate(frames):
+            written.append(os.path.join(folder, f"{stem}_{n:03d}.png"))
+            img.save(written[-1])
+        cells = [(0, 0)] * len(frames)
+        meta = flipbook_json(frames, "", cells, stem)
+        for entry, file in zip(meta["frames"], written):
+            entry["filename"] = os.path.basename(file)
+        meta["meta"].pop("image")
+    else:
+        cols = sheet_layout(len(frames), w, h)
+        rows = -(-len(frames) // cols)
+        sheet = Image.new("RGBA", (cols * w, rows * h))
+        cells = [(n % cols * w, n // cols * h) for n in range(len(frames))]
+        for (img, _d), cell in zip(frames, cells):
+            sheet.paste(img, cell)
+        written = [os.path.splitext(path)[0] + ".png"]
+        sheet.save(written[0])
+        meta = flipbook_json(frames, os.path.basename(written[0]), cells, stem)
+        meta["meta"]["size"] = {"w": sheet.width, "h": sheet.height}
+    json_path = os.path.join(folder, stem + ".json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=1)
+    return written + [json_path]
+
+
 def write_animated_glb(session, model, clip, path):
     """`model` with its skeleton and `clip` as a GLB. Returns (files written, rig)."""
     with session.lock:
@@ -574,11 +693,11 @@ def write_animated_glb(session, model, clip, path):
         return write_glb(session, md, materials, path, rig=rig, animation=animation), rig
 
 
-def plan_export(items, folder, model_format="obj", keep_structure=False):
+def plan_export(items, folder, model_format="obj", keep_structure=False, anim_format=None):
     """[(asset, target path)] for a bulk export: optionally mirrored game folders, unique file names."""
     plan, used = [], set()
     for asset in items:
-        ext = export_ext(asset, model_format)
+        ext = export_ext(asset, model_format, anim_format)
         sub = export_subfolder(asset) if keep_structure else ""
         target = os.path.normpath(os.path.join(folder, sub))
         base = export_stem(asset, ext)

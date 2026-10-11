@@ -274,7 +274,8 @@ def build_release(version, test_game=None):
     print(f"  {len(made)} packages -> licenses/")
     # User plugins live next to the exe: ship the template, the Terraria plugin (a full example) and the guide.
     os.makedirs(os.path.join(out_dir, "plugins"), exist_ok=True)
-    for name, target in (("plugins/_template.py", "plugins/_template.py"), ("plugins/terraria.py", "plugins/terraria.py"),
+    for name, target in (("plugins/_template.py", "plugins/_template.py"), ("plugins/terraria.py", "plugins/terraria.py"), ("plugins/spiralknights.py", "plugins/spiralknights.py"),
+                         ("plugins/wakfu.py", "plugins/wakfu.py"), ("plugins/fallout.py", "plugins/fallout.py"),
                          ("PLUGINS.md", "PLUGINS.md")):
         src = os.path.join(ROOT, name)
         if os.path.isfile(src):

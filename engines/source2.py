@@ -753,7 +753,7 @@ class Source2Plugin(EnginePlugin):
         if not vpk_files:
             raise FileNotFoundError(f"No Source 2 VPK packs found in:\n{path}")
         failed = 0
-        progress.files((os.path.basename(v), vpk_size(v)) for v in vpk_files)
+        progress.files((os.path.basename(v), vpk_size(v), v) for v in vpk_files)
         for n, vpk_path in enumerate(vpk_files, 1):
             progress.file(n - 1)
             progress(f"Reading {os.path.basename(os.path.dirname(vpk_path))}/{os.path.basename(vpk_path)} "

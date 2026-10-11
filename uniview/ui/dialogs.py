@@ -33,9 +33,9 @@ from uniview.ui.theme import role
 
 
 class ExportDialog(QDialog):
-    """Options for bulk export: folder, model format, keep the game's folder structure."""
+    """Options for bulk export: folder, model format, animation format, keep the game's folder structure."""
 
-    def __init__(self, count, has_models, settings, parent=None):
+    def __init__(self, count, has_models, settings, parent=None, has_animations=False):
         super().__init__(parent)
         self.settings = settings
         self.setWindowTitle("Export")
@@ -50,6 +50,15 @@ class ExportDialog(QDialog):
         self.format.addItem("GLB (one file, textures inside)", "glb")
         self.format.setCurrentIndex(max(0, self.format.findData(settings.model_format)))
         self.format.setEnabled(has_models)
+        self.anim_format = QComboBox()
+        self.anim_format.addItem("Animated GIF", "gif")
+        self.anim_format.addItem("Sprite sheet PNG + JSON", "sheet")
+        self.anim_format.addItem("PNG frames + JSON (a folder each)", "frames")
+        self.anim_format.setCurrentIndex(max(0, self.anim_format.findData(settings.anim_format)))
+        self.anim_format.setToolTip("How 2D (flipbook) animations are saved. The JSON lists each frame's rectangle\n"
+                                    "and duration (Aseprite / TexturePacker format: Phaser, Godot, Unity... read it).\n"
+                                    "Other animations are saved as stored.")
+        self.anim_format.setEnabled(has_animations)
         self.keep = QCheckBox("Keep the game's folder structure")
         self.keep.setToolTip("Puts each asset in folders that mirror where it lives in the game\n"
                              "(e.g. assets/prefabs/weapons/...), so big dumps stay easy to browse.")
@@ -58,6 +67,7 @@ class ExportDialog(QDialog):
         form.addRow(QLabel(f"{count:,} item(s) will be exported."))
         form.addRow("Folder:", folder_row)
         form.addRow("Models as:", self.format)
+        form.addRow("2D animations as:", self.anim_format)
         form.addRow(self.keep)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self._accept)
@@ -75,12 +85,13 @@ class ExportDialog(QDialog):
             return
         self.settings.export_dir = self.folder.text().strip()
         self.settings.model_format = self.format.currentData()
+        self.settings.anim_format = self.anim_format.currentData()
         self.settings.keep_structure = self.keep.isChecked()
         self.settings.save()
         self.accept()
 
     def values(self):
-        return self.folder.text().strip(), self.format.currentData(), self.keep.isChecked()
+        return self.folder.text().strip(), self.format.currentData(), self.keep.isChecked(), self.anim_format.currentData()
 
 class SteamPickDialog(QDialog):
     """Checklist of games found in Steam libraries that an engine plugin can read."""

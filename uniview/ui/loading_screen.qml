@@ -37,7 +37,8 @@ Rectangle {
         var t = Date.now() / 1000
         return {title: title, stages: [], icons: [], names: [], sizes: [], realFiles: false, at: 0, done: 0, total: 0,
                 pulse: -10, lastDive: t, started: t, lastFrame: t, chips: {}, sparks: [], crumbs: [], crumbDue: 0,
-                crumbSeq: 0, reading: null, lastFind: -10}
+                crumbSeq: 0, reading: null, lastFind: -10, beamFor: null, beamStart: 0,
+                readLive: false, readFrac: 0, fracShown: 0, readRate: 0, readAt: -10, readBits: "", bitPos: 0}
     }
 
     // ---- events from Python
@@ -62,6 +63,8 @@ Rectangle {
                 advance(payload)
             } else if (name === "found") {
                 found(payload)
+            } else if (name === "read") {
+                gotRead(payload)
             }
         }
 
@@ -130,11 +133,38 @@ Rectangle {
         index = Math.max(st.at, Math.min(Math.floor(index), st.names.length))
         if (index === st.at) return
         st.at = index
+        st.readFrac = 0; st.fracShown = 0; st.readRate = 0; st.readAt = -10; st.readBits = ""
         var t = now()
         for (var i = 0; i < st.icons.length; i++) {
             var ic = st.icons[i]
             if (ic.dive === null && ic.last < index) { ic.dive = Math.max(t, st.lastDive + diveGap); st.lastDive = ic.dive }
         }
+    }
+
+    // real reading progress from the loading screen process (loading_child.ReadWatch): how much of the current
+    // file the main process has read (OS byte counter) and the actual bits at that point of the file
+    function gotRead(r) {
+        if (r.i !== st.at) return
+        st.readLive = true
+        st.readFrac = Math.max(st.readFrac, r.frac)
+        if (r.bits) st.readBits = r.bits
+        if (r.bytes > 0) {
+            st.readAt = now()
+            var rate = r.bytes / r.dt
+            st.readRate = st.readRate > 0 ? st.readRate * 0.6 + rate * 0.4 : rate
+        }
+    }
+
+    // bytes are flowing right now (always true without real numbers: then it's all guesswork, as before)
+    function readingNow() { return !st.readLive || now() - st.readAt < 0.3 }
+
+    // 0..1 for how fast it's reading: 100 KB/s .. 100 MB/s on a log scale
+    function readSpeed() { return Math.max(0, Math.min(1, Math.log(1 + st.readRate / 1e5) / Math.LN10 / 3)) }
+
+    // the next bit off the file: the real ones when we have them, otherwise every third crumb a random digit
+    function nextGlyph(h) {
+        if (st.readLive && st.readBits.length) { var b = st.readBits[st.bitPos % st.readBits.length]; st.bitPos++; return b }
+        return h % 3 ? "" : ((h >>> 4) % 2 ? "1" : "0")
     }
 
     function current() {
@@ -201,14 +231,15 @@ Rectangle {
     function setBits(on, newFile) {
         var s = sfx.bits
         if (!s) return
+        if (!root.running) on = false  // a frame already queued when "stop" came mustn't start the loop again
         var p = s.players[0], playing = p.playbackState === 1  // MediaPlayer.PlayingState
         if (on) {
             var pos = p.position
-            if (newFile || !playing || pos < s.lastPos)  // a new file, or the clip just looped round
-                p.playbackRate = bitsPitchMin + Math.random() * (bitsPitchMax - bitsPitchMin)
+            if (newFile || !playing || pos < s.lastPos)  // a new file, or the clip just looped round: faster reads, higher
+                p.playbackRate = bitsPitchMin + (st.readLive ? readSpeed() : Math.random()) * (bitsPitchMax - bitsPitchMin)
             s.lastPos = pos
             if (!playing) p.play()
-        } else if (playing) {
+        } else if (p.playbackState !== 2) {  // not PausedState: also catches a play() whose state hasn't updated yet
             p.pause()
         }
     }
@@ -278,7 +309,8 @@ Rectangle {
             var newFile = reading !== st.reading
             if (newFile) { if (reading !== null) root.playSfx("pop"); st.reading = reading }
             var indexing = t - st.lastFind < sparkTime + 0.5  // finds still flying out (+ a hold over short gaps)
-            root.setBits((reading !== null && reading.x !== null) || indexing, newFile)
+            root.setBits((reading !== null && reading.x !== null && root.readingNow()) || indexing, newFile)
+            drawBeam(ctx, t, cx, cy, scale)
             drawIcons(ctx, t, dt, cx, cy, scale)
             drawCrumbs(ctx, t, dt, cx, cy, scale)
             var bump = Math.exp(-(t - st.pulse) * 6)
@@ -335,7 +367,14 @@ Rectangle {
                     var ta, tr
                     if (ic === cur) {                    // being read: circles just outside the dots, wobbling
                         ta = (t - st.started) * 0.8; tr = 140 * scale
-                        extra = 1.12 + 0.08 * Math.sin(t * 6); tilt = Math.sin(t * 3) * 0.25
+                        if (st.readLive) {               // starts big, shrinks as it's really read
+                            st.fracShown += (st.readFrac - st.fracShown) * (1 - Math.exp(-dt * 6))
+                            extra = 2.4 - 1.8 * st.fracShown
+                            tr += px * extra * 0.25
+                        } else {
+                            extra = 1.12
+                        }
+                        extra += (root.readingNow() ? 0.08 : 0.02) * Math.sin(t * 6); tilt = Math.sin(t * 3) * 0.25
                     } else {                             // waiting: slow swirl, gentle bob
                         ta = ic.slotA + swirl; tr = ic.slotR * scale + 5 * Math.sin(t * 1.3 + ic.slotA)
                         tilt = Math.sin(t * 0.8 + ic.slotA) * 0.15
@@ -347,6 +386,7 @@ Rectangle {
                     alpha = fadeIn
                 }
                 keep.push(ic)
+                ic.drawPx = px * extra
                 if (Math.hypot(ic.x - cx, ic.y - cy) < 34 * scale) continue  // behind the app icon
                 ctx.save()
                 ctx.translate(ic.x, ic.y); ctx.rotate(tilt); ctx.globalAlpha = Math.max(0, alpha)
@@ -358,6 +398,55 @@ Rectangle {
             st.icons = keep
         }
 
+        function drawBeam(ctx, t, cx, cy, scale) {
+            // a beam of light from the centre to the file being read: narrow at the app icon, as wide as the file
+            // where it lands, with a halo round the file and pulses running out (the bits run back in)
+            var cur = root.current()
+            if (cur === null || cur.x === null) { st.beamFor = null; return }
+            if (cur !== st.beamFor) { st.beamFor = cur; st.beamStart = t }
+            var dx = cur.x - cx, dy = cur.y - cy, len = Math.hypot(dx, dy)
+            var r0 = 30 * scale
+            if (len < r0 + 12 * scale) return
+            var ux = dx / len, uy = dy / len, nx = -uy, ny = ux
+            var fade = Math.min(1, (t - st.beamStart) * 4)
+            var flicker = 0.85 + 0.1 * Math.sin(t * 23) + 0.05 * Math.sin(t * 57)
+            var c = Qt.darker(cur.color, 1.0), px = cur.drawPx || root.iconPx(cur.size, scale)
+            function tint(a) { return Qt.rgba(c.r, c.g, c.b, a) }
+            var x0 = cx + ux * r0, y0 = cy + uy * r0, w0 = 2.5 * scale, w1 = px * 0.5
+            ctx.save()
+            ctx.globalCompositeOperation = "lighter"
+            ctx.globalAlpha = fade * flicker
+            // the cone
+            var g = ctx.createLinearGradient(x0, y0, cur.x, cur.y)
+            g.addColorStop(0, tint(0.85)); g.addColorStop(0.6, tint(0.4)); g.addColorStop(1, tint(0.22))
+            ctx.fillStyle = g
+            ctx.beginPath()
+            ctx.moveTo(x0 + nx * w0, y0 + ny * w0); ctx.lineTo(cur.x + nx * w1, cur.y + ny * w1)
+            ctx.lineTo(cur.x - nx * w1, cur.y - ny * w1); ctx.lineTo(x0 - nx * w0, y0 - ny * w0)
+            ctx.closePath(); ctx.fill()
+            // a bright core
+            var core = ctx.createLinearGradient(x0, y0, cur.x, cur.y)
+            core.addColorStop(0, Qt.rgba(1, 1, 1, 0.95)); core.addColorStop(1, tint(0.5))
+            ctx.strokeStyle = core; ctx.lineWidth = 1.6 * scale; ctx.lineCap = "round"
+            ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(cur.x, cur.y); ctx.stroke()
+            // pulses travelling outwards
+            var span = len - r0
+            for (var k = 0; k < 3; k++) {
+                var f = ((t - st.beamStart) * 1.6 + k / 3) % 1, d = r0 + span * f
+                var w = w0 + (w1 - w0) * f, px0 = cx + ux * d, py0 = cy + uy * d
+                ctx.globalAlpha = fade * 0.8 * Math.sin(Math.PI * f)
+                ctx.strokeStyle = tint(1); ctx.lineWidth = 2 * scale
+                ctx.beginPath(); ctx.moveTo(px0 + nx * w, py0 + ny * w); ctx.lineTo(px0 - nx * w, py0 - ny * w); ctx.stroke()
+            }
+            // a halo where it lands
+            var halo = ctx.createRadialGradient(cur.x, cur.y, 0, cur.x, cur.y, px * 0.95)
+            halo.addColorStop(0, tint(0.6)); halo.addColorStop(1, tint(0))
+            ctx.globalAlpha = fade * flicker
+            ctx.fillStyle = halo
+            ctx.beginPath(); ctx.arc(cur.x, cur.y, px * 0.95, 0, Math.PI * 2, false); ctx.fill()
+            ctx.restore()
+        }
+
         function caption(ctx, x, y, text) {
             ctx.font = "bold 11px sans-serif"; ctx.fillStyle = th.MUTED; ctx.textAlign = "center"; ctx.textBaseline = "top"
             ctx.fillText(text, x, y)
@@ -366,16 +455,18 @@ Rectangle {
         function drawCrumbs(ctx, t, dt, cx, cy, scale) {
             // while a file is being read, bits peel off it and stream into the centre - more for bigger files
             var cur = root.current()
-            if (cur !== null && cur.x !== null) {
-                var mb = Math.max(cur.size, 1) / 1e6
-                st.crumbDue += dt * Math.min(26, 7 + 5 * Math.log(1 + mb) / Math.LN10)
-                var px = root.iconPx(cur.size, scale)
+            if (cur !== null && cur.x !== null && root.readingNow()) {
+                var perSec
+                if (st.readLive) perSec = 6 + 24 * root.readSpeed()   // as fast as it's really reading
+                else perSec = Math.min(26, 7 + 5 * Math.log(1 + Math.max(cur.size, 1) / 1e6) / Math.LN10)
+                st.crumbDue += dt * perSec
+                var px = cur.drawPx || root.iconPx(cur.size, scale)
                 while (st.crumbDue >= 1 && st.crumbs.length < maxCrumbs) {
                     st.crumbDue -= 1; st.crumbSeq += 1
                     var h = root.hash("c" + st.crumbSeq)
                     st.crumbs.push({x: cur.x + ((h % 100) / 100 - 0.5) * px * 0.7, y: cur.y + (((h >>> 8) % 100) / 100 - 0.5) * px * 0.8,
                                    born: t, bend: ((h >>> 16) % 200 - 100) / 100, color: cur.color,
-                                   glyph: h % 3 ? "" : ((h >>> 4) % 2 ? "1" : "0"), size: (3.5 + (h >>> 20) % 3) * scale})
+                                   glyph: root.nextGlyph(h), size: (3.5 + (h >>> 20) % 3) * scale})
                 }
                 st.crumbDue = Math.min(st.crumbDue, 2)
             } else {

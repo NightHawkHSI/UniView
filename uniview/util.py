@@ -14,6 +14,19 @@ from uniview.constants import log
 def norm_path(path):
     return os.path.normcase(os.path.abspath(path))
 
+def release_memory():
+    """After dropping a game: collect the garbage and hand the freed heap back to Windows, so the app's memory
+    use actually goes down instead of staying reserved for the next allocation."""
+    import gc
+    import sys
+    gc.collect()
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.cdll.ucrtbase._heapmin()
+        except (OSError, AttributeError) as e:
+            log.debug("Couldn't trim the heap: %s", e)
+
 def pil_to_qimage(img):
     img = img.convert("RGBA")
     data = img.tobytes("raw", "RGBA")

@@ -19,8 +19,10 @@ def test_all_plugins_load():
     assert not failed, failed
     ids = [p.id for p in engines.plugins()]
     assert len(ids) == len(set(ids)), f"duplicate plugin ids: {ids}"
-    for builtin in ("unity", "source", "source2", "unreal", "fallout", "generic"):
+    for builtin in ("unity", "source", "source2", "unreal", "generic"):
         assert builtin in ids
+    for user_plugin in ("fallout", "xna", "spiralknights", "wakfu"):  # plugins/*.py
+        assert user_plugin in ids
 
 
 @pytest.mark.parametrize("plugin", engines.load_plugins(PLUGINS_DIR), ids=lambda p: p.id)

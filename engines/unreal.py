@@ -784,7 +784,7 @@ class UnrealPlugin(EnginePlugin):
             return decompress(method, data, size, hint)
 
         # IoStore first: in games that have both, the .pak next to a .utoc only holds loose files.
-        progress.files((os.path.basename(f), _size(f)) for f in list(utoc_files) + list(pak_files))
+        progress.files((os.path.basename(f), _size(f), f) for f in list(utoc_files) + list(pak_files))
         for n, utoc in enumerate(utoc_files, 1):
             progress.file(n - 1)
             progress(f"Reading {os.path.basename(utoc)} ({n}/{total})", n - 1, total)

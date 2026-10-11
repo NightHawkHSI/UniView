@@ -51,7 +51,8 @@ EnginePlugin            one per engine: "is this folder mine?", "open it"
                        ├─ materials(asset) -> [Material]   (textures shown on / exported with a model)
                        ├─ stats(asset)  -> {"tris":.., "w":.., ...}  (sorting and search filters)
                        ├─ describe(asset) -> [(label, text)]        (info panel)
-                       └─ related(asset)  -> (title, [Asset], empty text)  (links under a texture)
+                       ├─ related(asset)  -> (title, [Asset], empty text)  (links beside a texture / sprite animation)
+                       └─ animation_code(asset) -> (title, text)   (what drives a sprite animation, beside it)
 ```
 
 Your module must define `PLUGIN = MyEnginePlugin()`, or `PLUGINS = [...]` for several engines.
@@ -65,7 +66,7 @@ A plugin whose `id` matches a built-in one replaces the built-in plugin.
 | `detect(path) -> int` | Returns 0–100 for how sure you are that `path` is your engine. The highest score wins. Runs for every game on the Projects page, so it must be **fast**: list folders and read a few headers, nothing heavy. Real engines usually return 90+. |
 | `game_info(path) -> dict` | `{"engine_version": "...", "detail": "..."}`, shown on the game's box. |
 | `count_files(path) -> int` | Number of data files, shown on the box. |
-| `open(path, progress) -> GameSession` | Loads the game on a worker thread. Call `progress("text", done, total)` to update the loading screen. Raise an exception with a clear message if the game can't be opened. Optional, for a livelier loading screen: `progress.files([(name, size_in_bytes), ...])` once with the files you're about to read, then `progress.file(i)` as you start each one (`progress.file(len(files))` when done), and `progress.found({"texture": 1200, "model": 85})` with running totals while you index. |
+| `open(path, progress) -> GameSession` | Loads the game on a worker thread. Call `progress("text", done, total)` to update the loading screen. Raise an exception with a clear message if the game can't be opened. Optional, for a livelier loading screen: `progress.files([(name, size_in_bytes, full_path), ...])` once with the files you're about to read (the path is optional; with it the screen follows how much of each file is really read and shows its actual bits), then `progress.file(i)` as you start each one (`progress.file(len(files))` when done), and `progress.found({"texture": 1200, "model": 85})` with running totals while you index. |
 | `label(info)`, `short_version(info)` | Optional. Text for the box and for "Group by engine version". |
 | `options` | Optional per-game settings, e.g. `[{"id": "aes_keys", "label": "AES key(s)", "help": "...", "multiline": True}]`. The user fills them in with right-click → **Engine settings...**, and `open()` gets them as `progress.options`. |
 
@@ -94,7 +95,9 @@ leave out raises a clear "not supported" message in the viewer.
   inverse bind matrices (and, with a clip, the sampled joint curves). GLB exports then include the skeleton, and
   **Save animated GLB...** the animation. See the docstring in `engines/sdk.py` for the exact format.
 * **`sprite_frames(clip)`**: for 2D animations, `([(time, sprite Asset)], length)`. The viewer shows a
-  **Play sprite animation** button and flips through the sprites' images.
+  **Play sprite animation** button and flips through the sprites' images (right away when no 3D model can play
+  it). While it plays, the right bar lists `related(clip)` (e.g. its sprite sheets) and, under them,
+  **`animation_code(clip)`** -> `(title, text)`: the keyframes / program that drive it, as readable text.
 * **`sprite_rects(texture)`**: `[(x, y, w, h)]` of the sprites cut from a sprite sheet (y measured from the
   bottom, like Unity). The texture viewer outlines them.
 * **`materials_ready()`**: return `False` while a background index is still building. The viewer
@@ -167,7 +170,9 @@ texture2ddecoder, brotli) are guaranteed to be available in the packaged exe.
 | Source | .mdl models, .bsp maps with props, .vtf textures, .vmt materials, sounds, text | model animations, map entities/lighting |
 | Source 2 | .vmdl_c models + materials, .vtex_c textures, .vsnd_c sounds, text | animations, maps (.vmap_c / world nodes) |
 | Terraria / XNA / FNA (`plugins/terraria.py`) | Content/*.xnb (LZX), Texture2D, SoundEffect, sprite-font sheets, XACT .xwb music (PCM / MS-ADPCM) named from .xsb cues | XMA/xWMA banks, compact wave banks, Stardew-style data (.xnb dictionaries) as text, tModLoader .tmod |
-| Fallout 1/2 | .dat archives (DAT1 LZSS / DAT2 zlib), FRM sprites, RIX images, ACM sounds, MSG text | maps, critter art sets as animations |
+| Fallout 1/2 (`plugins/fallout.py`) | .dat archives (DAT1 LZSS / DAT2 zlib), FRM sprites, RIX images, ACM sounds, MSG text | maps, critter art sets as animations |
+| Spiral Knights / Clyde (`plugins/spiralknights.py`) | rsrc bundle jars, Clyde binary `.dat` configs, static/rigged/compound models, textures, Ogg sounds | animations on models, particles, scenes |
+| Wakfu (`plugins/wakfu.py`) | jars, `.anm` 2D animations (player classes with parts), `.tgam` map graphics, `.pk` Ogg sound packs, bdata monster names | maps, `.xps` particles, sound names, equipment on players, skin colors |
 | Loose files & archives | any folder or zip-style archive: images, sounds, text, .obj/.x models | more archive types (e.g. id .pak, GoldSrc .wad) |
 | Unreal | .pak (v3-12) and IoStore with AES keys; textures incl. virtual textures, static and skeletal meshes, Ogg/WAV sounds | Bink Audio and Wwise sounds, animations, DataTables (need property mappings), UE3 .upk |
 

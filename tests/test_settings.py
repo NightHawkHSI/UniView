@@ -130,3 +130,37 @@ def test_loading_screen_sound_config(tmp_path):
     assert sound_config(s)["volume"] == 1.0
     with pytest.raises(ValueError):
         s.sound_volume = 1.5
+
+
+def test_memory_settings_round_trip_and_ranges(tmp_path):
+    import pytest
+
+    from uniview.settings import Settings
+    path = str(tmp_path / "settings.json")
+    s = Settings(path=path)
+    s.ram_budget_gb, s.ram_warn_pct, s.ram_slow_pct = 6, 80, 75  # an int budget is taken as float
+    s.save()
+    loaded = Settings.load(path)
+    assert (loaded.ram_budget_gb, loaded.ram_warn_pct, loaded.ram_slow_pct) == (6.0, 80, 75)
+    with pytest.raises(ValueError):
+        s.ram_warn_pct = 150
+    with pytest.raises(ValueError):
+        s.ram_budget_gb = -1.0
+
+
+def test_ram_budget_and_throttle_thresholds():
+    from uniview.perf import Throttle, ram_budget
+    gb = 2**30
+    assert ram_budget(0, 16 * gb) == 8 * gb          # Auto: half
+    assert ram_budget(0, 6 * gb) == 4 * gb           # ...at least 4 GB
+    assert ram_budget(0, 3 * gb) == 3 * gb           # ...but never more than installed
+    assert ram_budget(10, 16 * gb) == 10 * gb
+    assert ram_budget(32, 16 * gb) == 16 * gb
+    t = Throttle(clock=lambda: 0.0)
+    t.configure(70)
+    assert (t.MEM_EASE, t.MEM_SEVERE) == (70, 78)
+    assert t.report_memory(50, 72) and t.level == 1 and "allocated" in t.reason()
+    assert t.report_memory(50, 101) and t.level == 2
+    t.report_memory(80, 10)  # still severe (system 80% >= 78%), now because of the system
+    assert t.level == 2 and t.reason() == "memory is almost full"
+    assert t.report_memory(40, None) and t.level == 0

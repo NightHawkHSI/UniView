@@ -27,7 +27,7 @@ class Loader(QObject):
     progress_value = Signal(int, int)  # done, total (total 0 = busy)
     bar_range = Signal(int, int)       # for QProgressBar.setRange: (0, total), (0, 0) = busy
     bar_value = Signal(int)            # for QProgressBar.setValue
-    files_event = Signal(str, "QVariant")  # ("queue", [[name, size]]) / ("at", index) / ("found", {kind: n})
+    files_event = Signal(str, "QVariant")  # ("queue", [[name, size, path]]) / ("at", index) / ("found", {kind: n})
     finished = Signal(object)          # GameSession
     failed = Signal(str)
 
@@ -45,7 +45,7 @@ class Loader(QObject):
 
     def _files(self, event, payload):
         if event == "queue":
-            payload = [[str(name), int(size)] for name, size in payload]  # plain lists: they become JS arrays
+            payload = [[str(e[0]), int(e[1]), str(e[2]) if len(e) > 2 else ""] for e in payload]  # plain lists
         self.files_event.emit(event, payload)
 
     def run(self):
@@ -55,6 +55,7 @@ class Loader(QObject):
             self._value(0, 0)  # busy until the plugin reports numbers
             session = self.plugin.open(self.path, Progress(self.progress.emit, self._value, self.options,
                                                           self._files))
+            self._files("at", 1 << 30)  # past the last file: the loading screen swallows it and the 1s-and-0s stop
             self.progress.emit("Sorting ...")
             session.assets.sort(key=lambda a: a.name.lower())
             counts = {}
@@ -180,18 +181,26 @@ class StatsWorker(QObject):
     def __init__(self):
         super().__init__()
         self._jobs = JobQueue()
+        self._batch = []
         threading.Thread(target=self._run, daemon=True, name="asset-stats").start()
 
     def start(self, jobs):
         """Measure these (key, session, asset) jobs instead of any still waiting; [] just cancels."""
+        self._batch = []
         self._jobs.replace(jobs, cancel=True)
 
     def _run(self):
         while True:
-            gen, batch_jobs = self._jobs.take(40)
+            gen, jobs = self._jobs.take(40)
+            self._batch = list(jobs)  # on self, not a local: start() empties it, so a paused worker (THROTTLE
+            del jobs                  # holds it while a game loads) doesn't keep the old game's session alive
             batch = []
-            for key, session, asset in batch_jobs:
+            while self._batch and self._jobs.is_current(gen):
                 THROTTLE.pause()
+                try:
+                    key, session, asset = self._batch.pop(0)
+                except IndexError:
+                    break  # emptied by start() while paused
                 try:
                     with session.lock:
                         stats = session.stats(asset)
@@ -201,6 +210,7 @@ class StatsWorker(QObject):
                 except Exception as e:
                     log.debug("No stats for %s '%s': %s", asset.kind, asset.name, e)
                     batch.append((key, {"size": asset.size, "info": "?", "sort": -1}))
+            key = session = asset = None  # don't keep the last job's game alive while waiting for more
             remaining = self._jobs.pending_if_current(gen)
             if remaining is None:
                 continue  # a different game was opened meanwhile

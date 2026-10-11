@@ -67,6 +67,9 @@ VIEW_OPTION_ITEMS = (
      "Scenes and prefabs: leave out objects and renderers the game has disabled"),
     ("show_effects", "Show particle effects and lines in scenes",
      "Scenes and prefabs: particle systems as a few still puffs where they emit, and line renderers"),
+    ("bundle_temp_file", "Unpack game bundles to a temp file (less RAM)",
+     "Unity games: big compressed bundles are unpacked into one temp file per open game instead of memory, and "
+     "read back as needed. Deleted when the game is unloaded. Takes effect the next time a game loads."),
 )
 
 PROJECTS_FILE = os.path.join(APP_DIR, "projects.json")
