@@ -654,6 +654,31 @@ class WakfuSession(GameSession):
                                         uid=f"{asset.uid}#{i}", source=asset.source, ref=("frame", asset, i))))
         return out, len(frames) * step
 
+    def animation_dim(self, asset):
+        return "2d"  # every animation here is a flipbook
+
+    def sprite_regions(self, asset: Asset):
+        if asset.ref[0] != "frame" or asset.ref[1].ref[0] != "anim":
+            return []
+        _tag, anim, index = asset.ref
+        frames, (bx, by, _bx1, _by1), _fps, atlases = self.clip(anim.ref)
+        rel_jar = self._rel(anim.ref[1])
+        if self._by_key is None:
+            self._by_key = {a.key: a for a in self.assets}
+        out: list[tuple[Asset, tuple[float, float, float, float], Any]] = []
+        for anm, (u0, v0, u1, v1), (x0, y0), (wx, wy), (hx, hy), _col in frames[index]:
+            sheet = self._by_key.get(("zip", rel_jar, f"Atlas/{anm.texture}.png"))
+            atlas = atlases.get(id(anm))
+            if sheet is None or atlas is None:
+                continue
+            aw, ah = atlas.size
+            left, right, top, bottom = round(u0 * aw), round(u1 * aw), round(v0 * ah), round(v1 * ah)
+            x, y = x0 - bx, y0 - by  # image(frame) covers the clip's box
+            # Pieces are stored upside down (see draw): the region's bottom-left lands on the quad's origin.
+            corners = [(x + hx, y + hy), (x + wx + hx, y + wy + hy), (x + wx, y + wy), (x, y)]
+            out.append((sheet, (float(left), float(ah - bottom), float(right - left), float(bottom - top)), corners))
+        return out
+
     def text(self, asset: Asset) -> str | bytes:
         if asset.ref[0] == "anim":
             _tag, jar, name, sprite, host = asset.ref

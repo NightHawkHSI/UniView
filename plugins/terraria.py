@@ -2154,6 +2154,16 @@ class XnaSession(GameSession):
         h = texture_info(self.raw(asset))[1]
         return [(x, h - y - fh, fw, fh) for x, y, fw, fh in frames]
 
+    def animation_dim(self, asset):
+        return "2d"  # every animation here is a flipbook
+
+    def sprite_regions(self, asset):
+        if asset.ref[0] != "frame":
+            return []
+        _tag, sheet, (x, y, w, h) = asset.ref
+        sheet_h = texture_info(self.raw(sheet))[1]
+        return [(sheet, (x, sheet_h - y - h, w, h), None)]
+
     def sprite_frames(self, asset):
         if asset.ref[0] != "anim":
             return [], 0.0

@@ -34,6 +34,9 @@ class Session:
     def text(self, a): return self._call("text", a)
     def skeleton(self, a, clip=None): return self._call("skeleton", a)
     def sprite_frames(self, a): return self._call("sprite_frames", a)
+    def sprite_regions(self, a): return self._call("sprite_regions", a)
+    def related(self, a): return self._call("related", a)
+    def animation_code(self, a): return self._call("animation_code", a)
 
 
 def tri():
@@ -173,3 +176,38 @@ def test_non_flipbook_animation_is_saved_as_stored(tmp_path):
     out = ex.write_asset(s, Asset("animation", "a", 1, ext="anim"), str(tmp_path / "a.gif"), "gif")
     assert out == [str(tmp_path / "a.anim")] and open(out[0], "rb").read() == b"clip"
     assert ex.export_ext(Asset("animation", "a", 1, ext="anim"), "obj", "sheet") == "png"
+
+
+def test_write_animation_bundle(tmp_path):
+    import json
+    sheet, host = Asset("texture", "atlas/hero", "sheet"), Asset("texture", "atlas/parts", "host")
+    big = Image.new("RGBA", (16, 8))
+    s = _flipbook_session()
+    image = s.hooks["image"]
+    s.hooks.update(
+        image=lambda a: big if a.kind == "texture" else image(a),
+        sprite_regions=lambda a: [(sheet, (0.0, 2.0, 4.0, 2.0), None)] if a.key == "f0" else
+        [(sheet, (4.0, 0.0, 2.0, 6.0), [(0, 0), (2, 0), (2, 6), (0, 6)]), (host, (0.0, 0.0, 1.0, 1.0), None)],
+        related=("Sprite sheet", [sheet, host], ""), animation_code=("Code", "move 1 2"), text="walk cycle")
+    files = ex.write_animation_bundle(s, Asset("animation", "anims/walk", 1), str(tmp_path), "gif")
+    rel = sorted(os.path.relpath(p, tmp_path).replace(os.sep, "/") for p in files)
+    assert rel == ["walk/sheets/hero.png", "walk/sheets/parts.png", "walk/walk.gif", "walk/walk_code.txt",
+                   "walk/walk_regions.json"]
+    regions = json.load(open(tmp_path / "walk" / "walk_regions.json"))
+    f0, f1 = regions["frames"]
+    assert f0["pieces"] == [{"sheet": "sheets/hero.png",
+                             "rect": {"x": 0.0, "y_from_bottom": 2.0, "w": 4.0, "h": 2.0, "y_from_top": 4.0}}]
+    assert f1["pieces"][0]["corners_in_frame"][2] == [2, 6] and f1["pieces"][1]["sheet"] == "sheets/parts.png"
+    code = open(tmp_path / "walk" / "walk_code.txt", encoding="utf-8").read()
+    assert "walk cycle" in code and "move 1 2" in code
+    again = ex.write_animation_bundle(s, Asset("animation", "anims/walk", 1), str(tmp_path), "sheet")
+    assert os.path.basename(os.path.dirname(again[0])) == "walk (2)"  # never overwrites an earlier export
+
+
+def test_clip_swaps_sprites():
+    from engines.unity import clip_swaps_sprites
+    sprite = {"m_ClipBindingConstant": {"genericBindings": [{"typeID": 4, "isPPtrCurve": 0},
+                                                            {"typeID": 212, "isPPtrCurve": 1}]}}
+    moves = {"m_ClipBindingConstant": {"genericBindings": [{"typeID": 4, "isPPtrCurve": 0}]}}
+    assert clip_swaps_sprites(sprite) and not clip_swaps_sprites(moves)
+    assert clip_swaps_sprites({"m_PPtrCurves": [{"attribute": "m_Sprite"}]}) and not clip_swaps_sprites({})

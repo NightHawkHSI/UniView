@@ -4,15 +4,20 @@ import os
 import tempfile
 from html import escape as html_escape
 
-from PySide6.QtCore import QRectF, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QFontDatabase, QPainter, QPen
+import numpy as np
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QFontDatabase, QPainter, QPen, QPixmap, QPolygonF, QTransform
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
+    QGraphicsItem,
     QGraphicsPixmapItem,
+    QGraphicsPolygonItem,
+    QGraphicsRectItem,
     QGraphicsScene,
+    QGraphicsSimpleTextItem,
     QGraphicsView,
     QHBoxLayout,
     QLabel,
@@ -57,12 +62,94 @@ class ZoomGraphicsView(QGraphicsView):
     def wheelEvent(self, event):
         self.zoom_by(1.25 ** wheel_steps(event))
 
+def region_color(i, alpha=255):
+    """Distinct colour for sprite sheet region number i (golden-ratio hues)."""
+    c = QColor.fromHsvF((i * 0.618034) % 1.0, 0.75, 1.0)
+    c.setAlpha(alpha)
+    return c
+
+
+class SheetMap(QWidget):
+    """A sprite sheet shrunk to fit, with the region(s) the current frame is cut from highlighted and the other
+    frames' regions faintly outlined, each region in its own colour (region_color)."""
+
+    MAX_SIDE = 1024  # the sheet is shrunk to this once; painting scales it further
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.pix = None
+        self.scale = 1.0  # sheet pixels -> self.pix pixels
+        self.sheet_h = 0
+        self.current = []  # [(x, y from bottom, w, h)] in sheet pixels
+        self.others = []
+        self.setMinimumHeight(120)
+
+    def set_sheet(self, img):
+        """img: PIL image of the sheet, or None to clear."""
+        self.pix, self.current, self.others = None, [], []
+        if img is not None:
+            self.scale = min(1.0, self.MAX_SIDE / max(img.width, img.height, 1))
+            if self.scale < 1.0:
+                img = img.resize((max(1, round(img.width * self.scale)), max(1, round(img.height * self.scale))))
+            self.pix = pil_to_pixmap(img)
+            self.sheet_h = img.height / self.scale
+        self.update()
+
+    def set_regions(self, current, others=()):
+        self.current, self.others = list(current), list(others)
+        self.update()
+
+    def heightForWidth(self, w):
+        return self._fit_height(w)
+
+    def hasHeightForWidth(self):
+        return self.pix is not None
+
+    def _fit_height(self, w):
+        if self.pix is None or self.pix.width() == 0:
+            return 120
+        return max(60, round(w * self.pix.height() / self.pix.width()))
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), checker_brush())
+        if self.pix is None:
+            painter.end()
+            return
+        pw, ph = self.pix.width(), self.pix.height()
+        k = min(self.width() / pw, self.height() / ph)
+        dw, dh = pw * k, ph * k
+        ox, oy = (self.width() - dw) / 2, (self.height() - dh) / 2
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, k < 1)
+        painter.drawPixmap(QRectF(ox, oy, dw, dh), self.pix, QRectF(0, 0, pw, ph))
+        # Darken the sheet a little so the outlines read on any colours.
+        painter.fillRect(QRectF(ox, oy, dw, dh), QColor(0, 0, 0, 70))
+        s = self.scale * k
+
+        def box(r):
+            x, y, w, h = r
+            return QRectF(ox + x * s, oy + (self.sheet_h - y - h) * s, max(w * s, 2.0), max(h * s, 2.0))
+
+        number = {r: i for i, r in enumerate(self.others)}
+        painter.setBrush(Qt.NoBrush)
+        for i, r in enumerate(self.others):
+            painter.setPen(QPen(region_color(i, 110), 1))
+            painter.drawRect(box(r))
+        for r in self.current:
+            i = number.get(r, 0)
+            painter.setPen(QPen(region_color(i), 2))
+            painter.setBrush(region_color(i, 50))
+            painter.drawRect(box(r))
+        painter.end()
+
+
 class ImageView(QWidget):
     """Texture viewer: wheel to zoom, drag to pan, save as PNG. Optional 'used by' links on the right, and under
     them a text box (set_details) - e.g. the code that drives a sprite animation."""
 
     save_requested = Signal()
     goto_requested = Signal(object)  # asset key
+    MAX_FIT = 2.0  # Fit never zooms small images past this
 
     def __init__(self, parent=None, show_links=True):
         super().__init__(parent)
@@ -93,9 +180,34 @@ class ImageView(QWidget):
         self.outlines.toggled.connect(lambda _on: self._refresh_pixmap())
         self.outlines.hide()
         self.rects = []
+        self.sprite_boxes = QCheckBox("Sprite boxes")
+        self.sprite_boxes.setToolTip("Box each piece of the sprite sheet the playing frame is made of, in the same "
+                                     "colour as on the sheet in the side bar")
+        self.sprite_boxes.hide()
+        self._overlay = []  # graphics items of set_overlay
+        self.layers_3d = QCheckBox("3D")
+        self.layers_3d.setToolTip("Pull the pieces of the frame apart in depth (back to front) and tilt the view")
+        self.layers_3d.hide()
+        self.turn = QSlider(Qt.Horizontal, minimum=-80, maximum=80, value=35)
+        self.turn.setToolTip("Turn the 3D view left / right")
+        self.tilt = QSlider(Qt.Horizontal, minimum=-60, maximum=60, value=15)
+        self.tilt.setToolTip("Tilt the 3D view up / down")
+        self.depth = QSlider(Qt.Horizontal, minimum=0, maximum=100, value=30)
+        self.depth.setToolTip("Space between the layers")
+        self.layer_controls = QWidget()
+        controls = QHBoxLayout(self.layer_controls)
+        controls.setContentsMargins(0, 0, 0, 0)
+        for text, slider in (("Turn", self.turn), ("Tilt", self.tilt), ("Depth", self.depth)):
+            slider.setFixedWidth(90)
+            controls.addWidget(QLabel(text))
+            controls.addWidget(slider)
+        self.layer_controls.hide()
+        self.layers_3d.toggled.connect(self.layer_controls.setVisible)
+        self._layers = []  # graphics items of show_layers
 
         bar = QHBoxLayout()
-        for w in (fit, actual, zoom_in, zoom_out, self.zoom_label, self.outlines):
+        for w in (fit, actual, zoom_in, zoom_out, self.zoom_label, self.outlines, self.sprite_boxes, self.layers_3d,
+                  self.layer_controls):
             bar.addWidget(w)
         bar.addStretch()
         bar.addWidget(self.info)
@@ -116,6 +228,19 @@ class ImageView(QWidget):
         role(self.links_hint, "muted")
         links_lay.addWidget(self.links_hint)
         self._link_items = {}
+        self.map_title = QLabel()
+        self.map_title.setWordWrap(True)
+        self.sheet_map = SheetMap()
+        self.map_info = QLabel()
+        self.map_info.setWordWrap(True)
+        role(self.map_info, "muted")
+        self.map_box = QWidget()
+        map_lay = QVBoxLayout(self.map_box)
+        map_lay.setContentsMargins(6, 0, 0, 0)
+        map_lay.addWidget(self.map_title)
+        map_lay.addWidget(self.sheet_map, 1)
+        map_lay.addWidget(self.map_info)
+        self.map_box.hide()
         self.details_title = QLabel()
         self.details_title.setWordWrap(True)
         self.details = QPlainTextEdit(readOnly=True)
@@ -129,9 +254,10 @@ class ImageView(QWidget):
         self.details_box.hide()
         side = QSplitter(Qt.Vertical)
         side.addWidget(links_box)
+        side.addWidget(self.map_box)
         side.addWidget(self.details_box)
-        side.setStretchFactor(1, 1)
-        side.setSizes([200, 500])
+        side.setStretchFactor(2, 1)
+        side.setSizes([140, 260, 400])
         side.setVisible(show_links)
 
         split = QSplitter()
@@ -151,6 +277,10 @@ class ImageView(QWidget):
         self.links_title.setText(f"<b>{title}</b>")
         self.links_hint.setVisible(bool(entries))
         self.set_details("", "")
+        self.set_sheet_map(None)
+        self.sprite_boxes.hide()
+        self.layers_3d.hide()
+        self.layer_controls.hide()
         self.links.clear()
         self._link_items = {}
         if not entries:
@@ -172,6 +302,18 @@ class ImageView(QWidget):
         if text and sizes[1] < 420 and sum(sizes) > 900:  # room for the code
             self.split.setSizes([sum(sizes) - 420, 420])
 
+    def set_sheet_map(self, img, title=""):
+        """Show the sheet `img` (PIL) under the side list, for set_regions; None hides it."""
+        self.sheet_map.set_sheet(img)
+        self.map_title.setText(f"<b>{html_escape(title)}</b>" if title else "")
+        self.map_info.setText("")
+        self.map_box.setVisible(img is not None)
+
+    def set_regions(self, current, others=(), info=""):
+        """Highlight `current` [(x, y from bottom, w, h)] on the sheet map, outline `others` faintly."""
+        self.sheet_map.set_regions(current, others)
+        self.map_info.setText(info)
+
     def set_link_icon(self, key, icon):
         item = self._link_items.get(key)
         if item is not None:
@@ -184,6 +326,8 @@ class ImageView(QWidget):
 
     def show_image(self, img, name="", rects=None, fit=True):
         """rects: sprites cut from this image [(x, y from bottom, w, h)] - drawn as outlines."""
+        self.clear_overlay()
+        self.clear_layers()
         self.image = img
         self.rects = list(rects or [])
         self.outlines.setVisible(bool(self.rects))
@@ -209,9 +353,103 @@ class ImageView(QWidget):
         self.pix_item.setPixmap(pix)
         self.scene.setSceneRect(QRectF(pix.rect()))
 
+    def set_overlay(self, shapes):
+        """Coloured boxes over the shown image: shapes [(corners [(x, y)] in image pixels with y from the top,
+        colour number (region_color; -1 = grey), label)]. Replaced by the next show_image / set_overlay."""
+        self.clear_overlay()
+        label_them = len(shapes) <= 200  # past that the labels are just noise
+        for corners, number, label in shapes:
+            color = region_color(number) if number >= 0 else QColor(200, 200, 200)
+            item = QGraphicsPolygonItem(QPolygonF([QPointF(x, y) for x, y in corners]))
+            pen = QPen(color, 2)
+            pen.setCosmetic(True)  # same width at any zoom
+            item.setPen(pen)
+            fill = QColor(color)
+            fill.setAlpha(40 if len(shapes) < 4 else 15)  # many overlapping pieces: mostly outlines
+            item.setBrush(fill)
+            item.setZValue(1)
+            self.scene.addItem(item)
+            if label_them and label:
+                text = QGraphicsSimpleTextItem(label, item)
+                text.setFlag(QGraphicsItem.ItemIgnoresTransformations)  # same size at any zoom
+                text.setPos(min(x for x, _y in corners), min(y for _x, y in corners))
+                text.setBrush(color)
+                font = text.font()
+                font.setBold(True)
+                text.setFont(font)
+                back = QGraphicsRectItem(text.boundingRect().adjusted(-2, 0, 2, 0), text)  # readable on any image
+                back.setFlag(QGraphicsItem.ItemStacksBehindParent)
+                back.setPen(Qt.NoPen)
+                back.setBrush(QColor(0, 0, 0, 170))
+            self._overlay.append(item)
+
+    def show_layers(self, size, layers, name="", boxes=False):
+        """A frame pulled apart in 3D: size (w, h) of the frame; layers [(piece QPixmap, corners [(x, y)] in the
+        frame (y down) its top-left, top-right, bottom-right, bottom-left land at, colour number)] back to front.
+        The Turn / Tilt / Depth sliders set the view; boxes: outline each piece too."""
+        self.clear_overlay()
+        self.clear_layers()
+        self.image = None
+        self.pix_item.setPixmap(QPixmap())
+        w, h = size
+        yaw, pitch = np.radians(self.turn.value()), np.radians(self.tilt.value())
+        spacing = self.depth.value() / 100 * max(w, h) / max(len(layers), 1) * 2.5
+        cy, sy, cp, sp = np.cos(yaw), np.sin(yaw), np.cos(pitch), np.sin(pitch)
+        rot = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]]) @ np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+        distance = max(w, h) * 3.0  # camera distance: mild perspective
+        middle = (len(layers) - 1) / 2
+        for i, (piece, corners, number) in enumerate(layers):
+            z = (middle - i) * spacing  # back layers further away
+            # Frame point (u, v) -> 3D (u - w/2, v - h/2, z) -> rotated -> projected: a homography for the plane.
+            m = rot @ np.array([[1, 0, -w / 2], [0, 1, -h / 2], [0, 0, z]], float)
+            m[2] += (0, 0, distance)
+            m[0:2] *= distance
+            plane = QTransform(m[0, 0], m[1, 0], m[2, 0], m[0, 1], m[1, 1], m[2, 1], m[0, 2], m[1, 2], m[2, 2])
+            pw, ph = piece.width(), piece.height()
+            to_frame = QTransform.quadToQuad(
+                QPolygonF([QPointF(0, 0), QPointF(pw, 0), QPointF(pw, ph), QPointF(0, ph)]),
+                QPolygonF([QPointF(x, y) for x, y in corners]))
+            if to_frame is None:
+                continue
+            item = QGraphicsPixmapItem(piece)
+            item.setTransformationMode(Qt.SmoothTransformation)
+            item.setTransform(to_frame * plane)
+            item.setZValue(i)
+            self.scene.addItem(item)
+            self._layers.append(item)
+            if boxes:
+                outline = QGraphicsPolygonItem(QPolygonF([QPointF(x, y) for x, y in corners]))
+                pen = QPen(region_color(number) if number >= 0 else QColor(200, 200, 200), 2)
+                pen.setCosmetic(True)
+                outline.setPen(pen)
+                outline.setTransform(plane)
+                outline.setZValue(i + 0.5)
+                self.scene.addItem(outline)
+                self._layers.append(outline)
+        side = max(w, h) * 1.5  # fixed bounds around the frame's centre: the view doesn't jump between frames
+        self.scene.setSceneRect(QRectF(-side, -side, 2 * side, 2 * side))
+        self.info.setText(f"{name}  {len(layers)} layers")
+
+    def clear_layers(self):
+        for item in self._layers:
+            self.scene.removeItem(item)
+        self._layers = []
+
+    def clear_overlay(self):
+        for item in self._overlay:
+            self.scene.removeItem(item)
+        self._overlay = []
+
     def fit(self):
+        """Shrink big images to fit the view; small ones show at MAX_FIT (the same zoom every time, not blown up
+        to fill the view)."""
         self.view.resetTransform()
-        self.view.fitInView(self.pix_item, Qt.KeepAspectRatio)
+        rect = self.scene.itemsBoundingRect() if self._layers else self.pix_item.sceneBoundingRect()
+        self.view.fitInView(rect, Qt.KeepAspectRatio)
+        if self.view.scale_factor() > self.MAX_FIT:
+            self.view.resetTransform()
+            self.view.scale(self.MAX_FIT, self.MAX_FIT)
+            self.view.centerOn(rect.center())
         self._update_zoom()
 
     def actual_size(self):

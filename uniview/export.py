@@ -684,6 +684,101 @@ def write_flipbook(frames, path, fmt):
     return written + [json_path]
 
 
+def write_animation_bundle(session, asset, parent, anim_format="gif", name=None):
+    """A flipbook animation with everything behind it, in a new folder `name` (default: the asset's) under `parent`
+    ("name (2)" if taken): the animation (anim_format),
+    sheets/ (every sprite sheet its frames are cut from, plus the sheets it depends on - session.related), the
+    code that drives it (session.animation_code) and <name>_regions.json (per frame: which sheet, the region on it
+    and where it lands in the frame). Returns the files written."""
+    stem = safe_filename(name or os.path.basename(asset.name)) or "animation"
+    folder = os.path.join(parent, stem)
+    n = 2
+    while os.path.exists(folder):
+        folder = os.path.join(parent, f"{stem} ({n})")
+        n += 1
+    os.makedirs(os.path.join(folder, "sheets"))
+    written = []
+    with session.lock:
+        frames = flipbook(session, asset)
+        if not frames:
+            raise ValueError(f"{asset.name} has no sprite frames")
+        written += write_flipbook(frames, os.path.join(folder, stem + ".png"), anim_format)
+
+        sprites, _length = session.sprite_frames(asset)
+        found = {}
+        for _t, sprite in sprites:
+            if sprite.key not in found:
+                try:
+                    found[sprite.key] = session.sprite_regions(sprite)
+                except Exception as e:
+                    log.warning("Regions of %s: %s", sprite.name, e)
+                    found[sprite.key] = []
+        sheets = {}  # key -> (Asset, file name)
+        heights = {}  # key -> sheet height in pixels, of the sheets saved
+        try:
+            _title, related, _empty = session.related(asset)
+        except Exception as e:
+            log.warning("Sheets behind %s: %s", asset.name, e)
+            related = []
+        used = [sheet for regions in found.values() for sheet, _r, _c in regions]
+        for sheet in used + [a for a in related if a.kind in IMAGE_KINDS]:
+            if sheet.key in sheets:
+                continue
+            name = safe_filename(os.path.basename(sheet.name)) or "sheet"
+            taken = {f for _a, f in sheets.values()}
+            file, k = name + ".png", 2
+            while file in taken:
+                file, k = f"{name} ({k}).png", k + 1
+            sheets[sheet.key] = (sheet, file)
+            path = os.path.join(folder, "sheets", file)
+            try:
+                img = session.image(sheet)
+                img.save(path)
+                heights[sheet.key] = img.height
+                written.append(path)
+            except Exception as e:
+                log.warning("Saving the sheet %s failed: %s", sheet.name, e)
+
+        regions_json = {"animation": asset.name, "frames": []}
+        for i, ((t, sprite), (_img, duration)) in enumerate(zip(sprites, frames)):
+            pieces = []
+            for sheet, (x, y, w, h), corners in found.get(sprite.key, []):
+                sheet_h = heights.get(sheet.key)
+                piece = {"sheet": "sheets/" + sheets[sheet.key][1] if sheet.key in sheets else sheet.name,
+                         "rect": {"x": x, "y_from_bottom": y, "w": w, "h": h}}
+                if sheet_h is not None:
+                    piece["rect"]["y_from_top"] = sheet_h - y - h
+                if corners is not None:
+                    piece["corners_in_frame"] = [[round(cx, 3), round(cy, 3)] for cx, cy in corners]
+                pieces.append(piece)
+            regions_json["frames"].append({"index": i, "time": round(t, 4), "duration": round(duration, 4),
+                                           "sprite": sprite.name, "pieces": pieces})
+        path = os.path.join(folder, stem + "_regions.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(regions_json, f, indent=1)
+        written.append(path)
+
+        try:
+            code_title, code = session.animation_code(asset)
+        except Exception as e:
+            log.warning("Code behind %s: %s", asset.name, e)
+            code_title, code = "", ""
+        try:
+            about = session.text(asset)
+        except Exception:
+            about = ""
+        about = about if isinstance(about, str) else ""
+        if code or about:
+            path = os.path.join(folder, stem + "_code.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                if about:
+                    f.write(about.rstrip() + "\n\n")
+                if code:
+                    f.write((code_title + "\n" + "=" * len(code_title) + "\n" if code_title else "") + code + "\n")
+            written.append(path)
+    return written
+
+
 def write_animated_glb(session, model, clip, path):
     """`model` with its skeleton and `clip` as a GLB. Returns (files written, rig)."""
     with session.lock:

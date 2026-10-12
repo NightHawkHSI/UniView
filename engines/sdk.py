@@ -93,6 +93,7 @@ class AssetStats(TypedDict, total=False):
     verts: int
     w: int
     h: int
+    dim: str  # animations: "2d" (flipbook) / "3d", when animation_dim() couldn't tell without reading the clip
 
 
 class _PluginOptionRequired(TypedDict):
@@ -565,6 +566,19 @@ class GameSession:
 
     def sprite_rects(self, asset: Asset) -> list[tuple[float, float, float, float]]:
         """Sprites cut from a texture (sprite sheet): [(x, y, w, h)] in pixels, y measured from the BOTTOM."""
+        return []
+
+    def animation_dim(self, asset: Asset) -> str | None:
+        """Cheap guess for the asset list's 2D / 3D animation filter: "2d" (a flipbook: sprite frames), "3d" (moves
+        a model) or None = can't tell without reading the clip (stats() then gives "dim")."""
+        return "3d"
+
+    def sprite_regions(self, asset: Asset) -> list[tuple[Asset, tuple[float, float, float, float], Any]]:
+        """Where a sprite (or a flipbook frame) is cut from: [(sheet texture Asset, (x, y, w, h) on the sheet in
+        pixels, y from the BOTTOM, where it lands in image(asset): the 4 corners [(x, y)] in pixels, y from the TOP,
+        that the region's top-left, top-right, bottom-right and bottom-left (as seen on the sheet) end up at, or
+        None = it fills the whole image upright)] - several when a frame is built from pieces, back to front. Shown
+        while the animation plays (the sheet in the side bar, boxes over the frame, the 3D layer view)."""
         return []
 
     def animation_targets(self, asset: Asset) -> list[Asset]:

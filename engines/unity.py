@@ -3088,6 +3088,26 @@ class UnitySession(GameSession):
             return []
         return [rect for _a, rect in self._sprite_sheets().get(asset.key, [])]
 
+    def animation_dim(self, asset):
+        return None  # a clip can swap sprites or move bones: stats() reads it
+
+    def sprite_regions(self, asset):
+        if asset.kind != "sprite":
+            return []
+        with self.lock:
+            tree = asset.ref.read_typetree()
+            rd = tree["m_RD"]
+            tex = rd["texture"]
+            if not tex.get("m_PathID"):
+                return []
+            target = self.finder._file(asset.ref.assets_file, tex.get("m_FileID", 0))
+            texture = self.by_key.get(obj_key(target, tex["m_PathID"])) if target is not None else None
+        if texture is None:
+            return []
+        packed = int(rd.get("settingsRaw", 0)) & 1
+        r = rd.get("textureRect") if packed and rd.get("textureRect") else tree["m_Rect"]
+        return [(texture, (float(r["x"]), float(r["y"]), float(r["width"]), float(r["height"])), None)]
+
     def sprite_frames(self, asset):
         if asset.kind != "animation":
             return [], 0.0
@@ -3225,7 +3245,7 @@ class UnitySession(GameSession):
             tree = obj.read_typetree()
             muscle = tree.get("m_MuscleClip") or {}
             length = float(muscle.get("m_StopTime", 0) or 0) - float(muscle.get("m_StartTime", 0) or 0)
-            stats.update(info=f"{length:.2f} s", sort=length)
+            stats.update(info=f"{length:.2f} s", sort=length, dim="2d" if clip_swaps_sprites(tree) else "3d")
             return stats
         if asset.kind == "audio":
             clip = obj.read()
@@ -3516,6 +3536,15 @@ class UnitySession(GameSession):
             return (title, links,
                     "No models found that use this texture (UI images and sprites often aren't on models).")
         return "", [], ""
+
+
+def clip_swaps_sprites(tree):
+    """Whether an AnimationClip type tree swaps sprites (a 2D flipbook): an object curve on a SpriteRenderer (212)
+    or UI Image (114), or a legacy m_Sprite curve."""
+    bindings = (tree.get("m_ClipBindingConstant") or {}).get("genericBindings") or []
+    if any(b.get("isPPtrCurve") and b.get("typeID") in (212, 114) for b in bindings):
+        return True
+    return any(c.get("attribute") == "m_Sprite" for c in tree.get("m_PPtrCurves") or [])
 
 
 class UnityPlugin(EnginePlugin):

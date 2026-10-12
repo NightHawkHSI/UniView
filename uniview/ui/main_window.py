@@ -72,6 +72,7 @@ from uniview.export import (
     render_uv_layout,
     session_materials,
     write_animated_glb,
+    write_animation_bundle,
     write_asset,
 )
 from uniview.model_display import emitter_looks, is_place, model_info_rows, texture_groups, texture_loader
@@ -131,7 +132,7 @@ class MainWindow(QMainWindow):
     def __init__(self, log_handler=None):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
-        self.resize(1500, 900)
+        self._center_on_screen(1500, 900)
         self.settings = Settings.load()
         theme.apply(QApplication.instance(), self.settings.theme)
         self.session = None     # GameSession of the game being viewed
@@ -199,7 +200,11 @@ class MainWindow(QMainWindow):
         self.type_combo = QComboBox()
         self.type_combo.addItem("All types", "all")
         for kind in KINDS:
-            self.type_combo.addItem(KIND_LABELS[kind], kind)
+            if kind == "animation":  # split: flipbooks and clips that move models are different things
+                self.type_combo.addItem("2D animations", "anim2d")
+                self.type_combo.addItem("3D animations", "anim3d")
+            else:
+                self.type_combo.addItem(KIND_LABELS[kind], kind)
         self.type_combo.addItem("\u2605 Favorites", "fav")
         self.type_combo.currentIndexChanged.connect(lambda _: self.apply_filter())
         self.list_btn = theme.set_icon(QToolButton(text="List", checkable=True, checked=True), "list")
@@ -302,6 +307,10 @@ class MainWindow(QMainWindow):
         self.anim_view.flipbook_requested.connect(self.play_flipbook)
         self.flipbook_timer = QTimer(self, interval=15)
         self.flipbook_timer.timeout.connect(self._flipbook_tick)
+        self.image_view.sprite_boxes.toggled.connect(self._flipbook_boxes_toggled)
+        self.image_view.layers_3d.toggled.connect(self._flipbook_3d_toggled)
+        for slider in (self.image_view.turn, self.image_view.tilt, self.image_view.depth):
+            slider.valueChanged.connect(self._flipbook_boxes_toggled)
         self._flipbook = None
         self.audio_view = AudioView(self.settings)
         self.video_view = VideoView(self.settings)
@@ -931,6 +940,16 @@ class MainWindow(QMainWindow):
         item.setText(2, fmt_size(stats.get("size")))
         item.setData(2, SORT_ROLE, stats.get("size", -1))
 
+    def _animation_dim(self, asset, stats):
+        """"2d" / "3d" for the type filter, or None while unknown (the plugin needs the clip read: see stats)."""
+        if stats and stats.get("dim"):
+            return stats["dim"]
+        try:
+            found = self.session.animation_dim(asset) if self.session is not None else None
+        except Exception:
+            found = "3d"
+        return "3d" if found is None and stats else found  # measured, but the plugin couldn't tell
+
     def on_stats(self, batch, remaining):
         for key, stats in batch:
             self.stats[key] = stats
@@ -945,7 +964,8 @@ class MainWindow(QMainWindow):
         if self.tree.header().sortIndicatorSection() in (1, 2) and not self.resort_timer.isActive():
             self.resort_timer.start()
         unreadable = self.settings.option("hide_unreadable") and any(is_unreadable(st) for _k, st in batch)
-        if (unreadable or AssetFilter(self.search.text()).conditions) and not self.filter_timer.isActive():
+        by_dim = self.type_combo.currentData() in ("anim2d", "anim3d") and any("dim" in st for _k, st in batch)
+        if (unreadable or by_dim or AssetFilter(self.search.text()).conditions) and not self.filter_timer.isActive():
             self.filter_timer.start()
 
     def resort(self):
@@ -996,6 +1016,10 @@ class MainWindow(QMainWindow):
     def apply_filter(self):
         filt = AssetFilter(self.search.text())
         want = self.type_combo.currentData()
+        dim = {"anim2d": "2d", "anim3d": "3d"}.get(want)
+        if dim:
+            want = "animation"
+        unsorted = 0  # animations not known to be 2D or 3D yet
         hide_unreadable = self.settings.option("hide_unreadable")
         self.tree.setUpdatesEnabled(False)
         try:
@@ -1015,6 +1039,10 @@ class MainWindow(QMainWindow):
                             ok = False
                         if ok and want == "fav":
                             ok = asset.uid in self.favorites
+                        if ok and dim:
+                            found = self._animation_dim(asset, stats)
+                            unsorted += found is None
+                            ok = found == dim
                         if ok and asset.uid in self.hidden_copies:
                             ok = False
                         if child.hid == ok:  # only when it changes: setHidden() is slow on big trees
@@ -1022,6 +1050,8 @@ class MainWindow(QMainWindow):
                             child.setHidden(not ok)
                         shown += ok
                 count = top.childCount()
+                if dim and kind == "animation":
+                    label = f"{dim.upper()} animations"
                 top.setText(0, f"{label} ({shown:,})" if shown == count else f"{label} ({shown:,} of {count:,})")
                 searching = want == "fav" or bool(self.search.text().strip())
                 top.setHidden(not group_ok or (searching and not shown))
@@ -1029,7 +1059,10 @@ class MainWindow(QMainWindow):
                     top.setExpanded(True)
         finally:
             self.tree.setUpdatesEnabled(True)
-        if filt.conditions and self.stats_remaining:
+        if unsorted:
+            self.statusBar().showMessage(f"{unsorted:,} animations aren't sorted into 2D / 3D yet (still measuring)"
+                                         " - they'll appear when done", 4000)
+        elif filt.conditions and self.stats_remaining:
             self.statusBar().showMessage(
                 f"Still measuring {self.stats_remaining:,} assets - more results will appear", 4000)
         self.grid_dirty = True
@@ -1178,6 +1211,7 @@ class MainWindow(QMainWindow):
         self.audio_view.stop()
         self.video_view.stop()
         self.flipbook_timer.stop()
+        self._flipbook = None  # frames can be hundreds of MB: don't keep them while showing something else
         THROTTLE.user_active()  # thumbnails/stats wait, so the preview gets the session first
         if asset.kind == "scene" and asset.key != getattr(self, "_lod_scene", None):
             VIEW_LEVELS["lod_level"] = 0  # another scene starts at the most detailed level
@@ -1326,6 +1360,19 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
+    def _center_on_screen(self, width, height):
+        """Open at width x height (shrunk to fit small screens) in the middle of the screen under the mouse."""
+        from PySide6.QtGui import QCursor
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        if screen is None:
+            self.resize(width, height)
+            return
+        area = screen.availableGeometry()
+        self.resize(min(width, int(area.width() * 0.95)), min(height, int(area.height() * 0.92)))
+        frame = self.frameGeometry()
+        frame.moveCenter(area.center())
+        self.move(frame.topLeft())
+
     def show_tools(self, at_startup=False):
         ToolsDialog(self.settings, self, at_startup=at_startup).exec()
 
@@ -1347,6 +1394,8 @@ class MainWindow(QMainWindow):
         clip, session = self.current, self.session
         if clip is None or session is None:
             return
+        self.flipbook_timer.stop()
+        self._flipbook = None  # let the last animation's frames go before loading these
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             with session.lock:
@@ -1355,7 +1404,8 @@ class MainWindow(QMainWindow):
                 images = []
                 for t, sprite in frames:
                     if sprite.key not in cache:
-                        cache[sprite.key] = session.image(sprite)
+                        img = session.image(sprite)
+                        cache[sprite.key] = img if img.mode == "RGBA" else img.convert("RGBA")
                     images.append((t, cache[sprite.key]))
         except Exception as e:
             log.exception("Playing the sprite animation '%s' failed", clip.name)
@@ -1365,19 +1415,18 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
         if not images:
             return
-        # Frames have different sizes: pad them all to one canvas so the animation doesn't jump.
+        # Frames have different sizes: each is shown padded to one canvas (_flipbook_frame) so the animation
+        # doesn't jump. Only the shown frame is padded: a padded copy of every frame doubled the memory and big
+        # animations ran the machine out of it (a crash inside PIL).
         w = max(img.width for _t, img in images)
         h = max(img.height for _t, img in images)
-        padded = []
-        for t, img in images:
-            canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-            canvas.paste(img.convert("RGBA"), ((w - img.width) // 2, h - img.height))
-            padded.append((t, canvas))
-        step = length / len(padded) if length > 0 else 1 / 12
-        self._flipbook = {"frames": padded, "length": max(length, padded[-1][0] + step), "start": time.time(),
-                          "index": -1, "name": clip.name}
+        offsets = [(((w - img.width) // 2, h - img.height), img.size) for _t, img in images]  # for the boxes
+        step = length / len(images) if length > 0 else 1 / 12
+        self._flipbook = {"frames": images, "length": max(length, images[-1][0] + step), "start": time.time(),
+                          "index": -1, "name": clip.name, "offsets": offsets, "size": (w, h)}
         self.stack.setCurrentWidget(self.image_view)
-        self._flipbook_side(clip, session, len(padded))
+        self._flipbook_side(clip, session, len(images))
+        self._flipbook_sheet(session, [sprite for _t, sprite in frames])
         self._flipbook_tick()
         self.image_view.fit()
         self.flipbook_timer.start()
@@ -1398,6 +1447,106 @@ class MainWindow(QMainWindow):
         self._request_icons(sheets, self.image_view.set_link_icon)
         self.image_view.set_details(code_title, code)
 
+    def _flipbook_sheet(self, session, sprites):
+        """Show the sheet most frames are cut from in the right bar; _flipbook_tick highlights each frame's part."""
+        fb = self._flipbook
+        fb["regions"] = None
+        try:
+            with session.lock:
+                found = {}
+                for sprite in sprites:
+                    if sprite.key not in found:
+                        found[sprite.key] = session.sprite_regions(sprite)
+                per_frame = [found[sprite.key] for sprite in sprites]
+                counts = {}
+                sheets = {}
+                for regions in per_frame:
+                    for sheet, _rect, _corners in regions:
+                        counts[sheet.key] = counts.get(sheet.key, 0) + 1
+                        sheets[sheet.key] = sheet
+                if not counts:
+                    self.image_view.set_sheet_map(None)
+                    return
+                main = sheets[max(counts, key=counts.get)]
+                img = session.image(main)
+        except Exception:
+            log.exception("Finding where the frames of '%s' sit on their sprite sheet failed", fb["name"])
+            self.image_view.set_sheet_map(None)
+            return
+        on_main = [[r for sheet, r, _corners in regions if sheet.key == main.key] for regions in per_frame]
+        elsewhere = [len(regions) - len(rects) for regions, rects in zip(per_frame, on_main)]
+        everything = list(dict.fromkeys(r for rects in on_main for r in rects))
+        number = {r: i for i, r in enumerate(everything)}
+        boxes = []  # per frame: [(corners on the padded frame, colour number, label, sheet rect)]
+        for regions, ((dx, dy), (fw, fh)) in zip(per_frame, fb["offsets"]):
+            shapes = []
+            for sheet, r, corners in regions:
+                if corners is None:
+                    corners = [(0, 0), (fw, 0), (fw, fh), (0, fh)]
+                on_sheet = sheet.key == main.key
+                if len(regions) == 1:
+                    label = f"{r[0]:g},{r[1]:g} {r[2]:g}x{r[3]:g}"
+                else:
+                    label = str(number[r] + 1) if on_sheet else ""
+                shapes.append(([(x + dx, y + dy) for x, y in corners], number[r] if on_sheet else -1, label,
+                               r if on_sheet else None))
+            boxes.append(shapes)
+        fb["regions"] = {"on_main": on_main, "elsewhere": elsewhere, "all": everything, "boxes": boxes,
+                         "sheet": img, "pieces": {}}
+        self.image_view.set_sheet_map(img, f"On the sheet: {os.path.basename(main.name)} ({img.width}x{img.height})")
+        self.image_view.sprite_boxes.show()
+        self.image_view.layers_3d.show()
+        self.image_view.layer_controls.setVisible(self.image_view.layers_3d.isChecked())
+
+    def _flipbook_3d_toggled(self, _on):
+        self._flipbook_boxes_toggled()
+        if self._flipbook is not None and self.flipbook_timer.isActive():
+            self.image_view.fit()
+
+    def _flipbook_piece(self, rect):
+        """QPixmap of a region (x, y from bottom, w, h) of the animation's main sheet, cached."""
+        regions = self._flipbook["regions"]
+        piece = regions["pieces"].get(rect)
+        if piece is None:
+            sheet = regions["sheet"]
+            x, y, w, h = (int(round(v)) for v in rect)
+            top = sheet.height - y - h
+            piece = regions["pieces"][rect] = pil_to_pixmap(sheet.crop((x, top, x + max(w, 1), top + max(h, 1))))
+        return piece
+
+    def _flipbook_boxes_toggled(self, *_args):
+        """Sprite boxes / 3D / its sliders changed while a sprite animation plays: redraw the frame."""
+        fb = self._flipbook
+        if fb is not None and self.flipbook_timer.isActive():
+            fb["index"] = -1
+            self._flipbook_tick()
+
+    def _flipbook_regions(self, index):
+        regions = self._flipbook.get("regions")
+        if not regions:
+            return
+        rects = regions["on_main"][index]
+        if len(rects) == 1:
+            x, y, w, h = rects[0]
+            info = f"Frame {index + 1}: x {x:g}, y {y:g} (from the bottom), {w:g}x{h:g} px"
+        elif rects:
+            info = f"Frame {index + 1}: built from {len(rects)} pieces of this sheet"
+        else:
+            info = f"Frame {index + 1}: not on this sheet"
+        if regions["elsewhere"][index]:
+            info += f" (+{regions['elsewhere'][index]} from another sheet)"
+        self.image_view.set_regions(rects, regions["all"], info)
+
+    def _flipbook_frame(self, index):
+        """Frame `index` on the animation's canvas (padded like the others, standing on the bottom edge)."""
+        fb = self._flipbook
+        img = fb["frames"][index][1]
+        if img.size == fb["size"]:
+            return img
+        canvas = Image.new("RGBA", fb["size"], (0, 0, 0, 0))
+        canvas.paste(img, fb["offsets"][index][0])
+        return canvas
+
     def _flipbook_tick(self):
         fb = self._flipbook
         if fb is None or self.stack.currentWidget() is not self.image_view:
@@ -1410,8 +1559,19 @@ class MainWindow(QMainWindow):
                 index = i
         if index != fb["index"]:
             fb["index"] = index
-            self.image_view.show_image(fb["frames"][index][1],
-                                       f"{fb['name']}  frame {index + 1}/{len(fb['frames'])}", fit=False)
+            self._flipbook_regions(index)
+            label = f"{fb['name']}  frame {index + 1}/{len(fb['frames'])}"
+            regions = fb.get("regions")
+            boxes = self.image_view.sprite_boxes.isChecked()
+            if regions and self.image_view.layers_3d.isChecked():
+                frame_size = fb["size"]
+                layers = [(self._flipbook_piece(r), corners, number)
+                          for corners, number, _label, r in regions["boxes"][index] if r is not None]
+                self.image_view.show_layers(frame_size, layers, label, boxes)
+            else:
+                self.image_view.show_image(self._flipbook_frame(index), label, fit=False)
+                if regions and boxes:
+                    self.image_view.set_overlay([shape[:3] for shape in regions["boxes"][index]])
 
     def play_animation(self, model):
         """Show `model` and play the current animation clip on it."""
@@ -1901,6 +2061,8 @@ class MainWindow(QMainWindow):
                 menu.addAction("Remove replacement from mod", lambda: self.remove_replacement(data))
         menu.addSeparator()
         menu.addAction("Save...", lambda: self.export_item(data))
+        if data.kind == "animation" and self._flipbook_formats(data):
+            menu.addAction("Export with sheets and code...", lambda: self.export_animation_bundle(data))
         if len(selected) > 1:
             menu.addAction(f"Export {len(selected)} selected...", lambda: self.export_many(selected))
         menu.exec(widget.viewport().mapToGlobal(pos))
@@ -1953,8 +2115,14 @@ class MainWindow(QMainWindow):
 
     # ---- export
     def ask_save_path(self, default_name, filter_text):
-        path, chosen = QFileDialog.getSaveFileName(
-            self, "Save", os.path.join(self.last_dir, default_name), filter_text)
+        playing = self.flipbook_timer.isActive()
+        self.flipbook_timer.stop()  # don't repaint a sprite animation behind the dialog
+        try:
+            path, chosen = QFileDialog.getSaveFileName(
+                self, "Save", os.path.join(self.last_dir, default_name), filter_text)
+        finally:
+            if playing and self._flipbook is not None:
+                self.flipbook_timer.start()
         if path:
             self.last_dir = os.path.dirname(path)
             self.settings.last_dir = self.last_dir
@@ -2024,6 +2192,30 @@ class MainWindow(QMainWindow):
         except Exception as e:
             log.exception("Saving %s failed", asset.name)
             QMessageBox.warning(self, "Save failed", str(e))
+
+    def export_animation_bundle(self, asset):
+        """Save a sprite animation with its sprite sheets, dependency sheets, code and frame regions in one folder."""
+        # The save dialog, not getExistingDirectory: the Windows folder picker hung and crashed the app.
+        base = safe_filename(os.path.basename(asset.name)) or "animation"
+        path, _chosen = self.ask_save_path(base, "Folder for the animation, its sheets and code (*)")
+        if not path:
+            return
+        parent, name = os.path.dirname(path), os.path.splitext(os.path.basename(path))[0]
+        fmt = self.settings.anim_format if self.settings.anim_format in ANIM_FORMATS else "gif"
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            written = write_animation_bundle(self.session, asset, parent, fmt, name)
+        except Exception as e:
+            log.exception("Exporting %s with its sheets failed", asset.name)
+            QMessageBox.warning(self, "Export failed", str(e))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        folder = os.path.dirname(written[0]) if written else parent
+        for w in written:
+            log.info("Saved %s", w)
+        self.statusBar().showMessage(f"Exported {len(written)} files to {folder}")
+        open_path(folder)
 
     def _flipbook_formats(self, asset):
         """Save formats for a 2D (flipbook) animation, the last used first; [] for other assets."""
