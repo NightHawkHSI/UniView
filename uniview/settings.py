@@ -40,6 +40,7 @@ class Settings:
     home_group: str = "engine"
     home_sort: str = "recent"
     online_compat: bool = True
+    show_welcome: bool = True    # the welcome / plugin guide window at startup
     check_updates: bool = True   # look for a new UniView release on GitHub at startup
     skipped_update: str = ""     # a release version the user chose to skip (no reminder for it)
     blender_path: str = ""

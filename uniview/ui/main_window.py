@@ -617,6 +617,7 @@ class MainWindow(QMainWindow):
         online.setToolTip(f"Fetches compat.json from {REPO_URL} at startup")
         online.toggled.connect(self._set_online_compat)
         help_menu.addAction(online)
+        help_menu.addAction("Welcome and plugin guide...", lambda: self.show_welcome(at_startup=False))
         help_menu.addAction("Project page on GitHub", lambda: webbrowser.open(REPO_URL))
         help_menu.addSeparator()
         help_menu.addAction("Check for updates...", lambda: self.check_updates(quiet=False))
@@ -632,6 +633,18 @@ class MainWindow(QMainWindow):
         help_menu.addAction("Open log file", lambda: open_path(LOG_FILE))
         help_menu.addAction("Open crash log", lambda: open_path(CRASH_FILE))
         help_menu.addAction("Open app folder", lambda: os.startfile(APP_DIR))
+
+        # Highlighted button at the right end of the menu bar, so nobody misses where engines come from.
+        get_button = role(QPushButton("⬇  Get Engines / Plugins"), "primary")
+        get_button.setToolTip("Install engine plugins (Source, Unreal, Terraria ...): opens the Plugins tab")
+        get_button.setCursor(Qt.PointingHandCursor)
+        get_button.clicked.connect(lambda: self.show_plugin())
+        # Kept on self: PySide doesn't take ownership of a corner widget, so a local one would be deleted.
+        self.get_plugins_corner = QWidget()
+        corner_lay = QHBoxLayout(self.get_plugins_corner)
+        corner_lay.setContentsMargins(0, 2, 6, 2)
+        corner_lay.addWidget(get_button)
+        self.menuBar().setCornerWidget(self.get_plugins_corner, Qt.TopRightCorner)
 
     def set_theme(self, mode):
         self.settings.theme = mode
@@ -1413,6 +1426,22 @@ class MainWindow(QMainWindow):
     def _set_check_updates(self, on):
         self.settings.check_updates = on
         self.settings.save()
+
+    def startup_checks(self):
+        """After the window shows: the welcome window (unless turned off), then the optional-tools check."""
+        if self.show_welcome(at_startup=True):
+            return  # went to the Plugins tab; the tools check can wait for the next start
+        self.check_tools_at_startup()
+
+    def show_welcome(self, at_startup=True):
+        """Welcome + plugin guide. True if the user chose Get Engines / Plugins (the Plugins tab is then shown)."""
+        if at_startup and not self.settings.show_welcome:
+            return False
+        from uniview.ui.welcome_dialog import show_welcome
+        if show_welcome(self.settings, self):
+            self.show_plugin()
+            return True
+        return False
 
     def check_tools_at_startup(self):
         """Offer to install recommended helpers that are missing (unless turned off in the dialog)."""

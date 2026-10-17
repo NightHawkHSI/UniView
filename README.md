@@ -52,7 +52,9 @@ Unzip it and run `UniView.exe`. You don't need Python.
 > Windows SmartScreen may warn you the first time because the exe isn't code-signed. Click **More info → Run anyway**.
 
 UniView reads Unity games out of the box. For Source, Unreal, Terraria and the other engines, install their free
-plugins from the **Plugins** tab (see [Plugins](#plugins)).
+plugins with the blue **Get Engines / Plugins** button at the top right (see [Plugins](#plugins)). A welcome window
+explains this at startup; tick **Don't show this at startup** to turn it off (**Help → Welcome and plugin guide...**
+shows it again).
 
 **Updates:** UniView checks GitHub for a new release when it starts (turn it off under **Help → Check for updates
 at startup**; **Help → Check for updates...** checks now). **Update now** downloads the release zip, checks it against

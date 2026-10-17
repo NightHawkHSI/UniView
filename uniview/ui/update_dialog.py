@@ -6,8 +6,9 @@ import shutil
 import threading
 import webbrowser
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -194,6 +195,14 @@ class UpdateDialog(QDialog):
         super().reject()
 
 
+def show_when_free(show):
+    """Run show() once no other modal window (welcome, tools check) is open, so windows don't stack at startup."""
+    if QApplication.activeModalWidget() is not None:
+        QTimer.singleShot(1500, lambda: show_when_free(show))
+    else:
+        show()
+
+
 def check_for_updates(parent, settings, quit_app, quiet):
     """Look for a newer release; show the update window if there is one. quiet = at startup: say nothing when
     there's no update or GitHub can't be reached, and don't remind about a skipped version."""
@@ -215,7 +224,7 @@ def check_for_updates(parent, settings, quit_app, quiet):
             log.info("Update %s available (skipped by the user)", release.version)
             return
         log.info("Update available: %s", release.version)
-        UpdateDialog(release, settings, quit_app, parent).exec()
+        show_when_free(lambda: UpdateDialog(release, settings, quit_app, parent).exec())
 
     check.finished.connect(done, Qt.QueuedConnection)
     check.start()
