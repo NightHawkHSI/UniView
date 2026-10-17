@@ -376,7 +376,10 @@ class HomePage(QWidget):
             except Exception as e:
                 log.info("Couldn't download the compatibility list (%s) - using the saved one", e)
                 return
-            self._compat_fetched.emit(n)
+            try:
+                self._compat_fetched.emit(n)
+            except RuntimeError:  # the page was closed while downloading (e.g. --self-test)
+                pass
 
         threading.Thread(target=work, daemon=True, name="compat-fetch").start()
 

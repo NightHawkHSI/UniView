@@ -141,9 +141,13 @@ class PluginsPage(QWidget):
 
         def work():
             try:
-                self._fetched.emit(plugin_index.fetch_index(self.index_url), "")
+                index, error = plugin_index.fetch_index(self.index_url), ""
             except Exception as e:
-                self._fetched.emit(None, f"{type(e).__name__}: {e}")
+                index, error = None, f"{type(e).__name__}: {e}"
+            try:
+                self._fetched.emit(index, error)
+            except RuntimeError:  # the page was closed meanwhile
+                pass
 
         threading.Thread(target=work, daemon=True, name="plugin-index").start()
 

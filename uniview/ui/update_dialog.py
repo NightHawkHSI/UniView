@@ -30,9 +30,13 @@ class UpdateCheck(QObject):
     def start(self):
         def work():
             try:
-                self.finished.emit(updater.latest_release(), "")
+                release, error = updater.latest_release(), ""
             except Exception as e:
-                self.finished.emit(None, f"{type(e).__name__}: {e}")
+                release, error = None, f"{type(e).__name__}: {e}"
+            try:
+                self.finished.emit(release, error)
+            except RuntimeError:  # the window was closed meanwhile
+                pass
 
         threading.Thread(target=work, daemon=True, name="update-check").start()
 
