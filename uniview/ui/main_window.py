@@ -1429,8 +1429,7 @@ class MainWindow(QMainWindow):
 
     def startup_checks(self):
         """After the window shows: the welcome window (unless turned off), then the optional-tools check."""
-        if self.show_welcome(at_startup=True):
-            return  # went to the Plugins tab; the tools check can wait for the next start
+        self.show_welcome(at_startup=True)  # may switch to the Plugins tab; the tools check still follows
         self.check_tools_at_startup()
 
     def show_welcome(self, at_startup=True):
