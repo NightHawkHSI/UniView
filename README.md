@@ -21,7 +21,7 @@
 
 Unzip it and run `UniView.exe`. You don't need Python.
 
-[Download](#download) · [Screenshots](#screenshots) · [Engines](#supported-engines) · [Features](#features) · [Modding](#modding-unity-games) · [How to use](#how-to-use) · [Plugins](#engine-plugins) · [Compatibility](#game-compatibility-list) · [Build](#build) · [FAQ](#faq)
+[Download](#download) · [Screenshots](#screenshots) · [Engines](#supported-engines) · [Features](#features) · [Modding](#modding-unity-games) · [How to use](#how-to-use) · [Plugins](#plugins) · [Compatibility](#game-compatibility-list) · [Build](#build) · [FAQ](#faq)
 
 <img src="ScreenShots/unity-model-materials.png" alt="A Valheim dragon in UniView's 3D viewer with its material's color, normal, emission and metallic maps listed" width="900">
 
@@ -35,12 +35,12 @@ Unzip it and run `UniView.exe`. You don't need Python.
 
 | | |
 |---|---|
-| **What it opens** | Unity, Source, Source 2, Unreal, XNA/FNA, Clyde (Spiral Knights), Wakfu, Spore and Fallout 1/2 game folders; loose files and zip archives of any game; any engine that has a [plugin](#engine-plugins) |
+| **What it opens** | Unity games and loose files / zip archives of any game, built in. With a free [plugin](#plugins): Source, Source 2, Unreal, XNA/FNA (Terraria), Clyde (Spiral Knights), Wakfu, Spore, Fallout 1/2, Fallout Tactics, Risk of Rain, Serious Sam 2, or any engine someone writes a plugin for |
 | **What it shows** | Models and maps (3D), textures, sprites, sounds (built-in player), animations (played on their models), text files; everything else can be exported as-is |
 | **What it exports** | Models as `.obj` + `.mtl` + `.png` or a single `.glb` with their full PBR materials (color, normal, metallic, roughness, AO, emission, height), textures as `.png`, sounds as `.wav`/`.mp3`/`.ogg`, animations as JSON keyframes or a rigged, animated `.glb`, text as-is, or a whole Unity game as a **Unity project** |
 | **Modding** | Swap textures, sprites, text, data, fonts, sounds and models in Unity games with the [Mod Maker](#modding-unity-games) |
 | **Game files** | Only read. The one exception is **Mod Maker → Install into game**, which backs up the originals first and can restore them |
-| **Tested with** | Robocraft, Muck, Valheim (Unity) · Team Fortress 2, Portal (Source) · CS2, Deadlock (Source 2) · Satisfactory, Headliners, Dead as Disco (Unreal) · Terraria (XNA) · Spiral Knights (Clyde) · Wakfu · Spore · Fallout 1 & 2 · Project Zomboid, Serious Sam 2 (loose files) |
+| **Tested with** | Robocraft, Muck, Valheim (Unity) · Team Fortress 2, Portal (Source) · CS2, Deadlock (Source 2) · Satisfactory, Headliners, Dead as Disco (Unreal) · Terraria (XNA) · Spiral Knights (Clyde) · Wakfu · Spore · Fallout 1 & 2 · Fallout Tactics · Risk of Rain · Serious Sam 2 · Project Zomboid (loose files) |
 | **Built with** | [UnityPy](https://github.com/K0lb3/UnityPy) · [PySide6](https://doc.qt.io/qtforpython-6/) · [PyVista](https://pyvista.org/) |
 
 ## Download
@@ -50,6 +50,14 @@ Unzip it and run `UniView.exe`. You don't need Python.
 3. Unzip it anywhere and run **`UniView.exe`**.
 
 > Windows SmartScreen may warn you the first time because the exe isn't code-signed. Click **More info → Run anyway**.
+
+UniView reads Unity games out of the box. For Source, Unreal, Terraria and the other engines, install their free
+plugins from the **Plugins** tab (see [Plugins](#plugins)).
+
+**Updates:** UniView checks GitHub for a new release when it starts (turn it off under **Help → Check for updates
+at startup**; **Help → Check for updates...** checks now). **Update now** downloads the release zip, checks it against
+the SHA-256 GitHub publishes for it, and restarts into the new version. Your settings, games, plugins and mods are
+kept. If UniView sits in a folder it can't write to (like Program Files), download the new zip by hand instead.
 
 ## Screenshots
 
@@ -74,20 +82,23 @@ Unzip it and run `UniView.exe`. You don't need Python.
 
 ## Supported engines
 
-Each game is read by an **engine plugin**. UniView picks the plugin automatically. To choose one yourself, right-click a game and use **Read with engine**.
+UniView reads **Unity** games and **loose files** by itself. Every other engine is a free **plugin** from the separate [UniView-Plugins](https://github.com/NightHawkHSI/UniView-Plugins) repository: install it from the **Plugins** tab (see [Plugins](#plugins)). UniView picks the right engine automatically; to choose one yourself, right-click a game and use **Read with engine**.
 
 | Engine | Games (examples) | Models | Textures | Sound | Other |
 |---|---|---|---|---|---|
-| **Unity** | Valheim, Muck, Among Us, Robocraft, Megabonk | ✔ with materials and their colors; ✔ **scenes & prefabs** (every object placed); ✔ **terrains** | ✔ + sprites, sprite sheets, 2D animations | ✔ AudioClips | ✔ text; fonts (.ttf/.otf); videos; **scripts & data** (item stats, configs...); animations (generic and humanoid) play on their skinned models and export as animated GLB |
-| **Source** (plugin `plugins/source.py`) | TF2, HL2, Portal, CS:S, L4D2, GMod | ✔ `.mdl` with `.vmt` materials; ✔ **maps** (`.bsp`) with terrain and static props | ✔ `.vtf` | ✔ wav/mp3 | ✔ text |
-| **Source 2** (plugin `plugins/source2.py`) | CS2, Dota 2, Deadlock, HL: Alyx | ✔ `.vmdl_c` with materials | ✔ `.vtex_c` | ✔ `.vsnd_c` | ✔ text |
-| **Unreal 4/5** (plugin `plugins/unreal.py`) | Satisfactory, Dead as Disco, Headliners | ✔ static + skeletal meshes, textures found through their materials | ✔ incl. virtual textures | ✔ Ogg/WAV SoundWaves, Wwise `.wem`, FMOD `.bank`* (not Bink Audio yet) | ✔ ini/json/csv...; raw export of the rest |
-| **XNA / FNA** (plugin `plugins/terraria.py`) | Terraria | – | ✔ `.xnb` textures (LZX compressed too), sprite-font sheets | ✔ `.xnb` sound effects, XACT music banks (`.xwb`, MS-ADPCM / PCM) named by their cues | raw `.xnb` export of the rest (shaders, data) |
-| **Clyde** (plugin `plugins/spiralknights.py`) | Spiral Knights | ✔ static, rigged (bind pose), compound/derived models with textures | ✔ `.png`/`.jpg` | ✔ `.ogg` sounds & music | every other `.dat` config (animations, particles, UI) as a readable outline |
-| **Ankama (Wakfu)** (plugin `plugins/wakfu.py`) | Wakfu | – | ✔ UI/particle `.tga`/`.dds`, map element graphics (`.tgam`), animation atlases | ✔ `.pk` sound packs (Ogg) | ✔ **2D animations** (`.anm`, every animation as a flipbook / GIF, player classes with their parts); Lua scripts, texts, XML, fonts, videos |
-| **Spore** (plugin `plugins/spore.py`) | Spore | ✔ RenderWare 4 `.rw4` models with their textures (not yet the ones with blend shapes) | ✔ `.raster`, `.rw4`, `.png` (DXT1/3/5, 32-bit) | ✔ `.snr` (EA layer 3, via vgmstream*) | ✔ property lists (`.prop`) as readable text, locale texts, XML/CSS; raw export of the rest (animations, creature parts, effects, `.vp6` videos) |
-| **Fallout 1/2** (plugin `plugins/fallout.py`) | Fallout, Fallout 2 | – | ✔ FRM sprites (whole animation strip), RIX images | ✔ ACM* | ✔ MSG text |
-| **Loose files & archives** | any other game (Project Zomboid, Serious Sam 2...) | ✔ `.obj`, DirectX `.x` | ✔ png/jpg/tga/dds/bmp... | ✔ wav/mp3/ogg, plus anything vgmstream* plays | ✔ text; files inside `.zip`/`.gro`/`.pk3` archives |
+| **Unity** (built in) | Valheim, Muck, Among Us, Robocraft, Megabonk | ✔ with materials and their colors; ✔ **scenes & prefabs** (every object placed); ✔ **terrains** | ✔ + sprites, sprite sheets, 2D animations | ✔ AudioClips | ✔ text; fonts (.ttf/.otf); videos; **scripts & data** (item stats, configs...); animations (generic and humanoid) play on their skinned models and export as animated GLB |
+| **Source** (plugin `source.py`) | TF2, HL2, Portal, CS:S, L4D2, GMod | ✔ `.mdl` with `.vmt` materials; ✔ **maps** (`.bsp`) with terrain and static props | ✔ `.vtf` | ✔ wav/mp3 | ✔ text |
+| **Source 2** (plugin `source2.py`) | CS2, Dota 2, Deadlock, HL: Alyx | ✔ `.vmdl_c` with materials | ✔ `.vtex_c` | ✔ `.vsnd_c` | ✔ text |
+| **Unreal 4/5** (plugin `unreal.py`) | Satisfactory, Dead as Disco, Headliners | ✔ static + skeletal meshes, textures found through their materials | ✔ incl. virtual textures | ✔ Ogg/WAV SoundWaves, Wwise `.wem`, FMOD `.bank`* (not Bink Audio yet) | ✔ ini/json/csv...; raw export of the rest |
+| **XNA / FNA** (plugin `terraria.py`) | Terraria | – | ✔ `.xnb` textures (LZX compressed too), sprite-font sheets | ✔ `.xnb` sound effects, XACT music banks (`.xwb`, MS-ADPCM / PCM) named by their cues | raw `.xnb` export of the rest (shaders, data) |
+| **Clyde** (plugin `spiralknights.py`) | Spiral Knights | ✔ static, rigged (bind pose), compound/derived models with textures | ✔ `.png`/`.jpg` | ✔ `.ogg` sounds & music | every other `.dat` config (animations, particles, UI) as a readable outline |
+| **Ankama (Wakfu)** (plugin `wakfu.py`) | Wakfu | – | ✔ UI/particle `.tga`/`.dds`, map element graphics (`.tgam`), animation atlases | ✔ `.pk` sound packs (Ogg) | ✔ **2D animations** (`.anm`, every animation as a flipbook / GIF, player classes with their parts); Lua scripts, texts, XML, fonts, videos |
+| **Spore** (plugin `spore.py`) | Spore | ✔ RenderWare 4 `.rw4` models with their textures (not yet the ones with blend shapes) | ✔ `.raster`, `.rw4`, `.png` (DXT1/3/5, 32-bit) | ✔ `.snr` (EA layer 3, via vgmstream*) | ✔ property lists (`.prop`) as readable text, locale texts, XML/CSS; raw export of the rest (animations, creature parts, effects, `.vp6` videos) |
+| **Fallout 1/2** (plugin `fallout.py`) | Fallout, Fallout 2 | – | ✔ FRM sprites (whole animation strip), RIX images | ✔ ACM* | ✔ MSG text |
+| **Fallout Tactics** (plugin `FalloutTac.py`) | Fallout Tactics | – | ✔ `.zar` / `.til` images from the `.bos` archives, `.spr` sprites (raw frames in grayscale) | – | ✔ texts, entity files as text; Bink movies listed |
+| **GameMaker 1.x** (plugin `Ror.py`) | Risk of Rain (2013) | – | ✔ texture pages, sprites (animated), backgrounds | ✔ embedded OGG/WAV | – |
+| **Serious Engine 2** (plugin `SeriousSam2.py`) | Serious Sam 2 | listed, not shown yet | ✔ `.tex` (DXT, BGRA) from the `.gro` archives | listed | ✔ text |
+| **Loose files & archives** (built in) | any other game (Project Zomboid...) | ✔ `.obj`, DirectX `.x` | ✔ png/jpg/tga/dds/bmp... | ✔ wav/mp3/ogg, plus anything vgmstream* plays | ✔ text; files inside `.zip`/`.gro`/`.pk3` archives |
 
 \* Needs the free **vgmstream** decoder: **Help → Optional tools...** downloads it once (from its official GitHub releases) into `tools/` next to UniView. UniView offers this at startup when it's missing.
 
@@ -175,17 +186,51 @@ Unreal notes:
 5. Search, sort and star assets (Ctrl+D). Switch to the grid (Ctrl+2) to flip through thumbnails. Right-click assets for more options. Use **File → Export …** for bulk export.
 6. **← Projects** takes you back. Right-click a game's box to rename it, unload it from memory, or remove it.
 
-## Engine plugins
+## Plugins
 
-Is there a game UniView can't read? You can teach it a new engine without touching UniView's code:
+UniView reads Unity games and loose files by itself. Everything else comes from a **plugin**: a small Python file
+that teaches UniView one engine or game. Plugins live in their own repository,
+[**UniView-Plugins**](https://github.com/NightHawkHSI/UniView-Plugins), and are **not affiliated with any game developer or publisher**.
 
-1. Copy `plugins/_template.py` (next to `UniView.exe`) to `plugins/my_engine.py`.
-2. Fill in how to recognize the game's folder and how to read its models and textures.
-3. Restart UniView. **Options → Plugin manager** shows what loaded.
+**Install a plugin**
 
-**Options → Plugin manager** lists every engine plugin with a switch to turn it off, installs a plugin someone sent you (a `.py`, or a `.zip` with its files; or drop it on the window), and removes plugins (they're moved to `plugins/_removed/`, so you can put them back). Changes apply after a restart, which the window offers. A plugin that fails to load never stops UniView from starting; it shows up there in red instead.
+- **From the Plugins tab (easiest):** on the start page, open the **Plugins** tab (or **Options → Get plugins...**),
+  pick a plugin and click **Install**. UniView shows a short notice first (plugins are third-party code that runs on
+  your computer), downloads the plugin from the UniView-Plugins repository, checks every file against the list's
+  SHA-256, and asks you to restart. The tab shows which plugins you have and which are available, with their
+  version numbers, and offers **Update** when a newer version is out.
+- **By hand:** download the plugin's `.py` file (and the helper folder it needs, such as `valve_formats/` for Source)
+  from [UniView-Plugins](https://github.com/NightHawkHSI/UniView-Plugins) and put it in the `plugins` folder next to `UniView.exe`. Restart UniView.
+  You can also drop a `.py` or `.zip` on the **Options → Plugin manager** window.
 
-The template is already a working "loose files" plugin (images, text and `.obj` models), so you can start from something that runs. [**PLUGINS.md**](PLUGINS.md) explains the API: assets, mesh conventions, materials and the helpers for Valve VPK and Unreal pak archives. Source, Source 2 and Unreal are plugins too (in `plugins/`), so they're full examples, and you can switch any of them off in the plugin manager. A plugin with the same id as a built-in one (Unity, loose files) replaces it. Pull requests for new engines are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+When you add a game that needs a plugin you don't have, UniView says so (**Plugin available**) and takes you to it.
+It knows which games have a plugin from the [compatibility list](#game-compatibility-list).
+
+**Which games have plugins**
+
+| Plugin | Games |
+|---|---|
+| Source (`source.py`) | Team Fortress 2, Half-Life 2, Portal, Counter-Strike: Source, Left 4 Dead 2, Garry's Mod |
+| Source 2 (`source2.py`) | Counter-Strike 2, Dota 2, Deadlock, Half-Life: Alyx |
+| Unreal Engine 4/5 (`unreal.py`) | Satisfactory, Headliners, Dead as Disco and other UE4/5 games |
+| XNA / FNA (`terraria.py`) | Terraria (also Stardew Valley, Celeste) |
+| Clyde (`spiralknights.py`) | Spiral Knights |
+| Wakfu (`wakfu.py`) | Wakfu |
+| Spore (`spore.py`) | Spore |
+| Fallout 1/2 (`fallout.py`) | Fallout, Fallout 2 |
+| Fallout Tactics (`FalloutTac.py`) | Fallout Tactics: Brotherhood of Steel |
+| GameMaker 1.x (`Ror.py`) | Risk of Rain (2013) |
+| Serious Engine 2 (`SeriousSam2.py`) | Serious Sam 2 |
+
+**Manage plugins:** **Options → Plugin manager** lists every plugin with a switch to turn it off, installs one from a
+`.py` / `.zip` file, and removes plugins (they're moved to `plugins/_removed/`, so you can put them back). A plugin
+that fails to load never stops UniView from starting; it shows up there in red. UniView works with no plugins at all.
+
+**Write your own:** copy `plugins/_template.py` (next to `UniView.exe`; a working "loose files" plugin) to
+`plugins/my_engine.py`, fill in how to recognize the game's folder and read its files, and restart.
+[**PLUGINS.md**](PLUGINS.md) explains the API, and the plugins in [UniView-Plugins](https://github.com/NightHawkHSI/UniView-Plugins) are full examples.
+A plugin with the same id as a built-in one (Unity, loose files) replaces it. New plugins are welcome as pull
+requests to UniView-Plugins; see its README for the rules (read-only, no game files or keys in the repo).
 
 ## Run from source
 
@@ -222,6 +267,10 @@ Not every model can be traced back to a material. Right-click any texture in the
 **A model looks see-through or odd.**
 Leave **Texture alpha** off. Materials the game marks as cutout (leaves, grass, fences) or transparent (glass, smoke) already use their alpha; the button forces it on every texture, and many games store other data in the alpha channel. If the texture is upside down, try **Flip texture V**.
 
+**A plugin shows "Failed to load" after updating.**
+Plugins made for UniView 2.18 or older used readers that now live in the plugins repository. Open the **Plugins**
+tab, select the plugin and click **Reinstall**.
+
 **Something crashed or didn't load.**
 Check the **Console**, or open `crash.log` / `viewer.log` next to `UniView.exe`. Please attach them when you [open an issue](https://github.com/NightHawkHSI/UniView/issues).
 
@@ -236,7 +285,7 @@ Yes. The 3D view renders on the GPU. On laptops with two GPUs, Windows normally 
 
 ## Game compatibility list
 
-[`compat.json`](compat.json) is a community list of how well UniView works with each game (**works**, **partial** or **broken**, plus notes and the Unity version it was built with). UniView downloads the latest version at startup and shows it on each game's box. You can turn this off under **Help**.
+[`compat.json`](compat.json) is a community list of how well UniView works with each game (**works**, **partial** or **broken**, plus notes and the Unity version it was built with). For games that need a plugin it also names the engine and the plugin, which is how UniView knows a plugin is available when you add the game. UniView downloads the latest version at startup and shows it on each game's box. You can turn this off under **Help**.
 
 To add or update a game, right-click it in UniView → **Report compatibility...**. That opens a GitHub issue already filled in with the game's details. You can also send a pull request that edits `compat.json`. The key is the game's install folder name (e.g. `steamapps/common/Robocraft` → `"Robocraft"`).
 
@@ -245,6 +294,8 @@ To add or update a game, right-click it in UniView → **Report compatibility...
 UniView has no telemetry, accounts or ads. It only goes online for:
 
 - the compatibility list (`compat.json` from this GitHub repository) at startup - turn it off under **Help**;
+- the update check (the latest release from GitHub's API) at startup - turn it off under **Help → Check for updates at startup**; the release zip only downloads when you click **Update now**;
+- the **Plugins** tab: the plugin list (`plugins.json`) when you open the tab, and a plugin's files when you install it, both from the [UniView-Plugins](https://github.com/NightHawkHSI/UniView-Plugins) repository;
 - optional tools you choose to install: vgmstream and Cpp2IL from their GitHub releases, ILSpy (`ilspycmd`) from NuGet and, if needed, the .NET runtime from Microsoft;
 - Unity packages (e.g. glTFast) from Unity's package registry when you export a Unity project;
 - **Report compatibility...**, which opens a *public* GitHub issue in your browser with the game's name, install folder name (not the full path), engine, file counts and your UniView version. Nothing is sent until you submit it.
@@ -255,16 +306,17 @@ UniView has no telemetry, accounts or ads. It only goes online for:
 - **No warranty.** UniView is provided "as is", without warranty of any kind (see sections 15 and 16 of the GPL). You use it at your own risk.
 - **Game content belongs to its owners.** UniView contains no game assets, code or keys. Everything it shows comes from games you have installed yourself, and that content stays the property of its creators. Extract and use assets only for personal, educational, research or interoperability purposes, or with the rights holder's permission. Don't redistribute them, and don't publish Unity projects exported from a game: they contain the game's assets and code.
 - **Game licenses and online games.** Extracting, decompiling or modding a game may be against its End User License Agreement or Terms of Service. Check them first. **Don't use Mod Maker on online or multiplayer games**: anti-cheat systems can detect changed files and ban accounts. Mod Maker keeps a backup when it installs a mod; you can also use your launcher's "verify game files" option to restore the original files.
-- **Encryption.** UniView does not include, find or crack encryption keys and does not remove copy protection. Encrypted Unreal games only open with an AES key you supply, and you are responsible for having the right to use it. The laws on decrypting and decompiling software (for example the DMCA in the U.S. and the EU Software Directive) differ between countries; make sure your use is allowed where you live.
+- **Plugins.** Plugins other than Unity and loose files come from the separate [UniView-Plugins](https://github.com/NightHawkHSI/UniView-Plugins) repository. They're third-party code that runs on your computer, and they are not made by, sponsored by or affiliated with any game developer or publisher. UniView shows a notice before installing one.
+- **Encryption.** UniView does not include, find or crack encryption keys and does not remove copy protection. Encrypted Unreal games (Unreal plugin) only open with an AES key you supply, and you are responsible for having the right to use it. The laws on decrypting and decompiling software (for example the DMCA in the U.S. and the EU Software Directive) differ between countries; make sure your use is allowed where you live.
 - **Decompiling.** The optional decompilers (ILSpy, Cpp2IL) are there so you can understand how game data is used, for interoperability and research. What you do with decompiled code is your responsibility.
 - **Screenshots** in this README show game assets © their respective owners, for illustration only.
 - **Rights holders:** if you believe UniView or something in this repository infringes your rights, [open an issue](https://github.com/NightHawkHSI/UniView/issues) and it will be looked at promptly.
-- UniView is not sponsored by or affiliated with Unity Technologies, Epic Games, Valve Corporation, ZeniMax Media / Bethesda Softworks, Three Rings Design / Grey Havens, Ankama, Epic Games Tools (RAD Game Tools), or any game developer or publisher, or their affiliates.
+- UniView is not sponsored by or affiliated with Unity Technologies, Epic Games, Valve Corporation, ZeniMax Media / Bethesda Softworks, Three Rings Design / Grey Havens, Ankama, Electronic Arts / Maxis, Interplay, Micro Forté, Hopoo Games / Gearbox, Croteam / Devolver Digital, Re-Logic, Epic Games Tools (RAD Game Tools), or any game developer or publisher, or their affiliates.
 - "Unity" is a registered trademark of Unity Technologies or its affiliates in the U.S. and elsewhere.
 - "Unreal" and "Unreal Engine" are trademarks or registered trademarks of Epic Games, Inc. in the U.S. and elsewhere.
 - "Source", "Steam" and "Valve" are trademarks or registered trademarks of Valve Corporation.
 - "Terraria" is a trademark of Re-Logic. "XNA" is a trademark of Microsoft Corporation.
-- "Fallout" is a trademark or registered trademark of ZeniMax Media Inc.
+- "Fallout" is a trademark or registered trademark of ZeniMax Media Inc. "Risk of Rain" is a trademark of its owner (Gearbox). "Serious Sam" is a trademark of Croteam.
 - "Spiral Knights" is a trademark of Three Rings Design / Grey Havens. "Wakfu" is a trademark of Ankama.
 - "Spore" and "RenderWare" are trademarks of Electronic Arts Inc.
 - "Oodle" is a trademark of Epic Games Tools LLC.

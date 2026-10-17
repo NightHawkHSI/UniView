@@ -41,14 +41,15 @@ PySide6, Shiboken6 and the Qt libraries are used under the GNU Lesser General Pu
 
 | Project | What | License |
 |---|---|---|
-| [ValveResourceFormat](https://github.com/ValveResourceFormat/ValveResourceFormat) | Source 2 KeyValues3 reader (`engines/kv3.py`) and mesh decoder port | MIT |
-| [meshoptimizer](https://github.com/zeux/meshoptimizer) (c) Arseny Kapoulkine | Vertex/index buffer decoding (`engines/meshopt.py`) | MIT |
+| [ValveResourceFormat](https://github.com/ValveResourceFormat/ValveResourceFormat) | Source 2 KeyValues3 reader (`valve_formats/kv3.py` in UniView-Plugins) and mesh decoder port | MIT |
+| [meshoptimizer](https://github.com/zeux/meshoptimizer) (c) Arseny Kapoulkine | Vertex/index buffer decoding (`valve_formats/meshopt.py` in UniView-Plugins) | MIT |
 | [UnityPy](https://github.com/K0lb3/UnityPy) (c) K0lb3 | A patched copy of UnityPy 1.25's `SerializedFile.__init__` and adjusted bundle reading, for compact object tables in very large games (`engines/unity_lazy.py`) | MIT |
-| [Clyde](https://github.com/threerings/clyde) (c) Three Rings Design | Binary export reader for Spiral Knights `.dat` files (`plugins/spiralknights.py`, a port of `BinaryImporter`) | BSD |
+| [Clyde](https://github.com/threerings/clyde) (c) Three Rings Design | Binary export reader for Spiral Knights `.dat` files (`spiralknights.py` in UniView-Plugins, a port of `BinaryImporter`) | BSD |
+| [MonoGame](https://github.com/MonoGame/MonoGame) `LzxDecoder` (c) Ali Scissons, from libmspack (c) Stuart Caie | LZX decompression of XNA `.xnb` files (`terraria.py` in UniView-Plugins) | LGPL 2.1 / Ms-PL |
 
-The Wakfu plugin (`plugins/wakfu.py`) reads Ankama's file formats from notes written while studying the game client, for interoperability. No Ankama code or assets are included.
+The Wakfu plugin (`wakfu.py` in UniView-Plugins) reads Ankama's file formats (worked out from the game's files), for interoperability. It doesn't decode the game's obfuscated data files. No Ankama code or assets are included.
 
-The Spore plugin (`plugins/spore.py`) reads Maxis / Electronic Arts formats (DBPF packages, RefPack compression, RenderWare 4 models and rasters, property lists) worked out from the game's own files, with format knowledge shared by the Spore modding community around [SporeModder FX](https://github.com/emd4600/SporeModder-FX) (emd4600). No code from it and no EA code or assets are included.
+The Spore plugin (`spore.py` in UniView-Plugins) reads Maxis / Electronic Arts formats (DBPF packages, RefPack compression, RenderWare 4 models and rasters, property lists) worked out from the game's own files, with format knowledge shared by the Spore modding community around [SporeModder FX](https://github.com/emd4600/SporeModder-FX) (emd4600). No code from it and no EA code or assets are included.
 
 ## Inspiration
 

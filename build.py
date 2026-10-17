@@ -3,6 +3,10 @@
     py build.py            -> both outputs
     py build.py github     -> Builds/GitHub   : clean copy of the source, ready to push to a repo
     py build.py release    -> Builds/Release  : standalone .exe folder + .zip (no Python needed)
+    py build.py plugins    -> tests the plugins/ repo (UniView-Plugins) and updates its plugins.json
+
+Game plugins are not part of UniView: plugins/ is its own git repo (NightHawkHSI/UniView-Plugins) and users install
+them from the Plugins tab. UniView ships an empty plugins/ folder with only the template (_template.py) in it.
 
 Add a game folder to also self-test the packaged exe against a real game:
     py build.py release --test-game "D:/SteamLibrary/steamapps/common/Robocraft"
@@ -34,11 +38,18 @@ UNITYPY_PACKAGES = [
     "zstandard",  # Source 2 / Unreal data compressed with zstd
 ]
 
-# Files that make up the project (what goes in the GitHub folder).
+# Modules installed plugins may import (see the --hidden-import note in build_release).
+PLUGIN_STDLIB = [
+    "lzma", "bz2", "gzip", "zlib", "mmap", "ctypes", "ctypes.wintypes", "hashlib", "base64", "ast", "glob",
+    "itertools", "importlib.util", "wave", "csv", "configparser", "plistlib", "xml.etree.ElementTree", "html",
+    "difflib", "fnmatch", "heapq", "bisect", "array", "dataclasses", "enum", "functools", "lz4.block",
+]
+
+# Files that make up the project (what goes in the GitHub folder). plugins/ is its own repo: only the template ships.
 SOURCE_FILES = [
     "unity_viewer.py", "uniview", "requirements.txt", "run.bat", "build.bat", "build.py",
     "Icon.png", "README.md", "LICENSE", "CREDITS.md", ".gitignore", "ScreenShots", "compat.json",
-    "engines", "plugins", "PLUGINS.md", "tests", "third_party_licenses",
+    "engines", "PLUGINS.md", "tests", "third_party_licenses",
     ".github", "ruff.toml", "requirements-dev.txt", "Sounds", "CONTRIBUTING.md",
 ]
 
@@ -74,9 +85,9 @@ def run_checks():
     missing = [m for m in ("ruff", "mypy", "pytest") if importlib.util.find_spec(m) is None]
     if missing:
         sys.exit(f"Missing {', '.join(missing)}. Install the dev tools: py -m pip install -r requirements-dev.txt")
-    # mypy: the plugin SDK and plugins/ (the contract third-party plugins are written against).
+    # mypy: the plugin SDK and the template (the contract third-party plugins are written against).
     mypy = ["mypy", "--ignore-missing-imports", "--follow-imports=silent",
-            "--check-untyped-defs", "engines/sdk.py", "plugins"]
+            "--check-untyped-defs", "engines/sdk.py", TEMPLATE]
     for cmd in (["ruff", "check", "."], mypy, ["pytest", "tests", "-q"]):
         if subprocess.run([sys.executable, "-m", *cmd], cwd=ROOT).returncode != 0:
             sys.exit(f"{cmd[0]} failed - fix the problems above (or build with --skip-checks).")
@@ -96,7 +107,41 @@ def build_github():
             print(f"  copied {name}")
         else:
             print(f"  (missing, skipped) {name}")
+    copy_plugins_folder(os.path.join(dest, "plugins"))
+    print("  copied plugins/ (template only)")
     print(f"-> {dest}")
+
+
+TEMPLATE = os.path.join("plugins", "_template.py")
+PLUGINS_README = """Engine plugins go in this folder.
+
+Install them from UniView's Plugins tab, or download a plugin's .py (and the helper folder it needs) from
+https://github.com/NightHawkHSI/UniView-Plugins and put it here, then restart UniView.
+Plugins are third-party code that runs on your computer: only install plugins you trust.
+
+_template.py is a working example to start your own plugin from (files starting with "_" are not loaded).
+See PLUGINS.md for the plugin API.
+"""
+
+
+def copy_plugins_folder(dest):
+    """The plugins/ folder UniView ships: the template and a README, no plugins."""
+    os.makedirs(dest, exist_ok=True)
+    shutil.copy2(os.path.join(ROOT, TEMPLATE), os.path.join(dest, "_template.py"))
+    with open(os.path.join(dest, "README.txt"), "w", encoding="utf-8") as f:
+        f.write(PLUGINS_README)
+
+
+def build_plugins():
+    """plugins/ is the UniView-Plugins repo: run its tests and refresh plugins.json (commit + push it yourself)."""
+    step("Plugins repo (plugins/)")
+    plugins_dir = os.path.join(ROOT, "plugins")
+    env = dict(os.environ, UNIVIEW_ROOT=ROOT)
+    if subprocess.run([sys.executable, "-m", "pytest", "tests", "-q", "-p", "no:cacheprovider"],
+                      cwd=plugins_dir, env=env).returncode != 0:
+        sys.exit("Plugin tests failed - fix them before publishing plugins.json.")
+    subprocess.check_call([sys.executable, "_make_index.py"], cwd=plugins_dir, env=env)
+    subprocess.call(["git", "status", "--short"], cwd=plugins_dir)
 
 
 def make_ico(png_path, ico_path):
@@ -245,6 +290,9 @@ def build_release(version, test_game=None):
         "--collect-submodules", "vtkmodules",
         # Built-in engine plugins are imported by name at runtime, so list them explicitly.
         "--paths", ROOT, "--collect-submodules", "engines", "--collect-submodules", "uniview",
+        # Standard-library modules plugins use that UniView itself may not import (plugins aren't bundled, so
+        # PyInstaller can't see them): without these an installed plugin fails with ModuleNotFoundError.
+        *[arg for mod in PLUGIN_STDLIB for arg in ("--hidden-import", mod)],
         # Non-Python files inside the package: the loading screen's QML (uniview/ui/loading_screen.qml).
         "--collect-data", "uniview",
         # The app uses PySide6; other Qt bindings on the machine would break the build.
@@ -272,9 +320,8 @@ def build_release(version, test_game=None):
     step("Collecting third-party licences")
     made = collect_licenses(out_dir, os.path.join(WORK, "build", APP_NAME, "PYZ-00.toc"))
     print(f"  {len(made)} packages -> licenses/")
-    # Plugins live next to the exe (Source, Source 2, Unreal, the game plugins and the template), plus the guide.
-    shutil.copytree(os.path.join(ROOT, "plugins"), os.path.join(out_dir, "plugins"), dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "_removed"))
+    # No plugins ship with the exe (users install them from the Plugins tab): only the template, plus the guide.
+    copy_plugins_folder(os.path.join(out_dir, "plugins"))
     shutil.copy2(os.path.join(ROOT, "PLUGINS.md"), os.path.join(out_dir, "PLUGINS.md"))
 
     step("Self-testing the packaged exe")
@@ -296,7 +343,7 @@ def build_release(version, test_game=None):
         os.remove(log_path)  # don't ship the test log
     # Per-user files the test run wrote (settings.json holds this PC's folders, e.g. C:\Users\<name>):
     # never ship them - the app creates its own on first run.
-    for leftover in ("crash.log", "projects.json", "settings.json", "compat_cache.json"):
+    for leftover in ("crash.log", "projects.json", "settings.json", "compat_cache.json", "plugin_index_cache.json"):
         path = os.path.join(out_dir, leftover)
         if os.path.isfile(path):
             os.remove(path)
@@ -331,9 +378,12 @@ def main():
     skip_checks = "--skip-checks" in args
     args = [a for a in args if a != "--skip-checks"]
     targets = set(a.lower() for a in args) or {"github", "release"}
-    unknown = targets - {"github", "release"}
+    unknown = targets - {"github", "release", "plugins"}
     if unknown:
-        sys.exit(f"Unknown target(s): {', '.join(unknown)}. Use 'github' and/or 'release'.")
+        sys.exit(f"Unknown target(s): {', '.join(unknown)}. Use 'github', 'release' and/or 'plugins'.")
+    if targets == {"plugins"}:
+        build_plugins()
+        return
 
     version = read_version()
     os.makedirs(BUILDS, exist_ok=True)
@@ -346,6 +396,8 @@ def main():
         build_github()
     if "release" in targets:
         build_release(version, test_game)
+    if "plugins" in targets:
+        build_plugins()
     step("Done")
 
 

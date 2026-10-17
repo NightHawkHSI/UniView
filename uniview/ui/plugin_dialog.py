@@ -60,7 +60,8 @@ class PluginManagerDialog(QDialog):
         header.setSectionResizeMode(3, QHeaderView.Stretch)
 
         info = QLabel(
-            "Each game is read by an engine plugin. Untick one to switch it off, or install another from a "
+            "Each game is read by an engine plugin. Get published plugins from the <b>Plugins</b> tab on the start "
+            "page. Here, untick one to switch it off, or install another from a "
             "<code>.py</code> / <code>.zip</code> file (you can also drop it on this window). To write your own, "
             "start from <code>plugins/_template.py</code> and see "
             f"<a href='{REPO_URL}/blob/main/PLUGINS.md'>PLUGINS.md</a>. A plugin with the same id as a built-in "

@@ -1,11 +1,12 @@
 # Writing an engine plugin for UniView
 
 UniView reads every game through an **engine plugin**. Unity and the loose-files reader are built
-into [`engines/`](engines); every other engine is a plugin in [`plugins/`](plugins) (Source, Source 2
-and Unreal are full examples there), and the format readers they use (VPK, BSP, KeyValues3, Unreal
-pak/IoStore/packages) stay in `engines/` for any plugin to use. If your game uses another engine, or a
-format the existing plugins don't handle, you can write your own plugin as a single `.py` file.
-You don't need to change UniView itself.
+into [`engines/`](engines); every other engine is a plugin in the separate
+[UniView-Plugins](https://github.com/NightHawkHSI/UniView-Plugins) repository (Source, Source 2, Unreal, Terraria and more - all full examples),
+together with the format readers they share (`valve_formats/`: VPK, BSP, KeyValues3, meshoptimizer;
+`unreal_formats/`: pak, IoStore, packages, AES). Users install them from UniView's **Plugins** tab.
+If your game uses another engine, or a format the existing plugins don't handle, you can write your
+own plugin as a single `.py` file. You don't need to change UniView itself.
 
 ## Quick start
 
@@ -17,15 +18,16 @@ You don't need to change UniView itself.
 4. Add the game. If detection picks a different engine, right-click the game and choose
    **Read with engine → your plugin**.
 
-To install someone else's plugin, use **Options → Plugin manager → Install plugin...** (a `.py` file, or
-a `.zip` with the plugin's files in it) or drop the file on that window. The same window switches
+Published plugins install from the **Plugins** tab. To install someone else's plugin from a file, use
+**Options → Plugin manager → Install plugin...** (a `.py` file, or a `.zip` with the plugin's files in it)
+or drop the file on that window. The same window switches
 plugins off and removes them; changes apply after a restart.
 
 As shipped, the template is a working "loose files" engine that shows images, text files and
 `.obj` models found in a folder, so you can try it before changing anything.
 
-For a complete real-world example, read [`plugins/terraria.py`](plugins/terraria.py): the Terraria
-(XNA / FNA) plugin that ships with UniView. It's one self-contained file - its own binary formats
+For a complete real-world example, read [`terraria.py`](https://github.com/NightHawkHSI/UniView-Plugins/blob/main/terraria.py): the Terraria
+(XNA / FNA) plugin from UniView-Plugins. It's one self-contained file - its own binary formats
 (LZX decompression, `.xnb` textures and sounds, XACT music banks) using only numpy and Pillow -
 with detection, game info, stats, info rows, images and sounds. Delete it and Terraria opens only as
 loose files again; that's all there is to a plugin.
@@ -159,10 +161,12 @@ materials whose albedo alpha is a cutout or transparency; the 3D view then draws
 * `kind_for_extension(ext)` gives a sensible default kind for loose files, and
   `pil_image_from_bytes(data)` opens png, jpg, tga, dds and more.
 * `walk_files(root, exts)` and `listdir_lower(path)` help inside `detect()`.
-* `engines.vpk.VPK` / `VirtualFS` read Valve VPK archives and merge several of them with loose folders.
-* `engines.ue_pak.Pak` and `engines.iostore.IoStore` read Unreal `.pak` and `.utoc`/`.ucas` files, including Oodle via a game-shipped `oo2core_*.dll`.
-* `engines.ue_package` reads Unreal package headers (Zen and legacy), textures, virtual textures and meshes.
-* `engines.aes.AES` decrypts AES-256 ECB with numpy, no crypto package needed.
+In the [UniView-Plugins](https://github.com/NightHawkHSI/UniView-Plugins) repository (ship the folder with your plugin, or depend on it in the
+plugin list):
+* `valve_formats.vpk.VPK` / `VirtualFS` read Valve VPK archives and merge several of them with loose folders.
+* `unreal_formats.ue_pak.Pak` and `unreal_formats.iostore.IoStore` read Unreal `.pak` and `.utoc`/`.ucas` files, including Oodle via a game-shipped `oo2core_*.dll`.
+* `unreal_formats.ue_package` reads Unreal package headers (Zen and legacy), textures, virtual textures and meshes.
+* `unreal_formats.aes.AES` decrypts AES-256 ECB with numpy, no crypto package needed.
 * `engines.sdk.cache_dir()` is a folder for caching slow indexing results between runs.
 * `engines.extdecode.to_wav(data, ext)` decodes game sound formats with vgmstream when it's installed (the default `audio()` already uses it for known extensions).
 * For block-compressed textures, Pillow decodes BC1–BC7 with `Image.frombytes(mode, size, data, "bcn", n)`.
@@ -171,20 +175,20 @@ materials whose albedo alpha is a cutout or transparency; the 3D view then draws
 Only the standard library, **numpy**, **Pillow** and what UniView already ships (UnityPy, lz4,
 texture2ddecoder, brotli) are guaranteed to be available in the packaged exe.
 
-## What the shipped plugins can and can't do yet
+## What the published plugins can and can't do yet
 
 | Engine | Handles | Missing (good first plugin) |
 |---|---|---|
 | Unity | models with materials, textures, sprites, text, AudioClips, AnimationClips (generic and humanoid clips play on skinned models; rigged/animated GLB export) | IK goals and twist distribution for humanoid clips |
-| Source (`plugins/source.py`) | .mdl models, .bsp maps with props, .vtf textures, .vmt materials, sounds, text | model animations, map entities/lighting |
-| Source 2 (`plugins/source2.py`) | .vmdl_c models + materials, .vtex_c textures, .vsnd_c sounds, text | animations, maps (.vmap_c / world nodes) |
-| Terraria / XNA / FNA (`plugins/terraria.py`) | Content/*.xnb (LZX), Texture2D, SoundEffect, sprite-font sheets, XACT .xwb music (PCM / MS-ADPCM) named from .xsb cues | XMA/xWMA banks, compact wave banks, Stardew-style data (.xnb dictionaries) as text, tModLoader .tmod |
-| Fallout 1/2 (`plugins/fallout.py`) | .dat archives (DAT1 LZSS / DAT2 zlib), FRM sprites, RIX images, ACM sounds, MSG text | maps, critter art sets as animations |
-| Spiral Knights / Clyde (`plugins/spiralknights.py`) | rsrc bundle jars, Clyde binary `.dat` configs, static/rigged/compound models, textures, Ogg sounds | animations on models, particles, scenes |
-| Spore (`plugins/spore.py`) | DBPF `.package` archives (RefPack), RenderWare 4 `.rw4` models + textures, `.raster`/`.png` textures, binary `.prop` as text, locale texts, `.snr` sounds; names from hashes found in `SporeApp.exe` or name lists in `plugins/spore_names/*.txt` | blend-shape models (section `0x200af`), `.gmdl` creature parts, animations, effects, most real file names |
-| Wakfu (`plugins/wakfu.py`) | jars, `.anm` 2D animations (player classes with parts), `.tgam` map graphics, `.pk` Ogg sound packs, bdata monster names | maps, `.xps` particles, sound names, equipment on players, skin colors |
+| Source (`source.py`) | .mdl models, .bsp maps with props, .vtf textures, .vmt materials, sounds, text | model animations, map entities/lighting |
+| Source 2 (`source2.py`) | .vmdl_c models + materials, .vtex_c textures, .vsnd_c sounds, text | animations, maps (.vmap_c / world nodes) |
+| Terraria / XNA / FNA (`terraria.py`) | Content/*.xnb (LZX), Texture2D, SoundEffect, sprite-font sheets, XACT .xwb music (PCM / MS-ADPCM) named from .xsb cues | XMA/xWMA banks, compact wave banks, Stardew-style data (.xnb dictionaries) as text, tModLoader .tmod |
+| Fallout 1/2 (`fallout.py`) | .dat archives (DAT1 LZSS / DAT2 zlib), FRM sprites, RIX images, ACM sounds, MSG text | maps, critter art sets as animations |
+| Spiral Knights / Clyde (`spiralknights.py`) | rsrc bundle jars, Clyde binary `.dat` configs, static/rigged/compound models, textures, Ogg sounds | animations on models, particles, scenes |
+| Spore (`spore.py`) | DBPF `.package` archives (RefPack), RenderWare 4 `.rw4` models + textures, `.raster`/`.png` textures, binary `.prop` as text, locale texts, `.snr` sounds; names from hashes found in `SporeApp.exe` or name lists in `plugins/spore_names/*.txt` | blend-shape models (section `0x200af`), `.gmdl` creature parts, animations, effects, most real file names |
+| Wakfu (`wakfu.py`) | jars, `.anm` 2D animations (player classes with parts), `.tgam` map graphics, `.pk` Ogg sound packs | maps, game data (bdata), `.xps` particles, sound names, equipment on players, skin colors |
 | Loose files & archives | any folder or zip-style archive: images, sounds, text, .obj/.x models | more archive types (e.g. id .pak, GoldSrc .wad) |
-| Unreal (`plugins/unreal.py`) | .pak (v3-12) and IoStore with AES keys; textures incl. virtual textures, static and skeletal meshes, Ogg/WAV sounds | Bink Audio and Wwise sounds, animations, DataTables (need property mappings), UE3 .upk |
+| Unreal (`unreal.py`) | .pak (v3-12) and IoStore with AES keys; textures incl. virtual textures, static and skeletal meshes, Ogg/WAV sounds | Bink Audio and Wwise sounds, animations, DataTables (need property mappings), UE3 .upk |
 
 If you add support for one of these, please send a pull request. Improving an existing plugin is
 welcome as well as adding new ones.

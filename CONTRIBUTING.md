@@ -16,18 +16,20 @@ Please don't attach game files. UniView reads games you own; their files belong 
 
 ## Adding support for a new engine
 
-You don't need to change UniView itself: an engine is a single `.py` file in `plugins/`.
+You don't need to change UniView itself: an engine is a single `.py` file in `plugins/`. Published plugins
+live in their own repository, [UniView-Plugins](https://github.com/NightHawkHSI/UniView-Plugins), not in this one.
 
 1. Copy [`plugins/_template.py`](plugins/_template.py) to `plugins/my_engine.py`. The template is a working
    "loose files" plugin (images, text, `.obj` models), so you start from something that runs.
 2. Read [PLUGINS.md](PLUGINS.md) for the API: assets, mesh conventions, materials, progress reporting and the
    helpers for Valve VPK and Unreal pak archives.
-3. For a full real-world example see [`plugins/terraria.py`](plugins/terraria.py) (XNA/FNA: compressed `.xnb`
+3. For a full real-world example see [`terraria.py`](https://github.com/NightHawkHSI/UniView-Plugins/blob/main/terraria.py) (XNA/FNA: compressed `.xnb`
    textures, sounds, wave banks, names read from the game's own exe).
 
-A plugin can be shared as just that file. If you want it to ship with UniView, open a pull request that adds it
-to `plugins/` with a test in `tests/` (tests that need the real game should skip when it isn't installed; see
-`tests/test_xnb.py`).
+A plugin can be shared as just that file. To get it into UniView's **Plugins** tab, open a pull request on
+[UniView-Plugins](https://github.com/NightHawkHSI/UniView-Plugins) that adds it with a test in `tests/` (tests that need the real game should skip when it
+isn't installed; see `tests/test_xnb.py` there) and run `py _make_index.py` to add it to `plugins.json`. Plugins
+there only read game files: no network, no subprocess, no game assets or keys in the repository.
 
 ## Working on UniView itself
 

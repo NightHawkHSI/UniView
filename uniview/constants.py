@@ -25,6 +25,12 @@ REPO_URL = "https://github.com/NightHawkHSI/UniView"
 
 COMPAT_URL = "https://raw.githubusercontent.com/NightHawkHSI/UniView/main/compat.json"
 
+PLUGINS_REPO_URL = "https://github.com/NightHawkHSI/UniView-Plugins"  # engine plugins live in their own repo
+
+PLUGINS_INDEX_URL = "https://raw.githubusercontent.com/NightHawkHSI/UniView-Plugins/main/plugins.json"
+
+RELEASES_API_URL = "https://api.github.com/repos/NightHawkHSI/UniView/releases/latest"
+
 SORT_ROLE = Qt.UserRole + 10   # value used when sorting a tree column
 
 TYPE_ROLE = Qt.UserRole + 11   # asset kind stored on group rows
@@ -51,6 +57,8 @@ COMPAT_BUNDLED = os.path.join(RESOURCE_DIR, "compat.json")
 CRASH_FILE = os.path.join(APP_DIR, "crash.log")
 
 PLUGINS_DIR = os.path.join(APP_DIR, "plugins")
+
+PLUGIN_INDEX_CACHE = os.path.join(APP_DIR, "plugin_index_cache.json")  # last plugins.json downloaded
 
 log = logging.getLogger("viewer")
 

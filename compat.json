@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "about": "Community compatibility list for UniView. Key = the game's install folder name (e.g. steamapps/common/<this>). status: works | partial | broken. Add or update a game with a pull request, or right-click a game in UniView -> 'Report compatibility...' to open an issue.",
+  "about": "Community compatibility list for UniView. Key = the game's install folder name (e.g. steamapps/common/<this>). status: works | partial | broken (missing = not rated yet). engine: the engine name for non-Unity games. plugin: the id of the UniView-Plugins plugin that reads the game (https://github.com/NightHawkHSI/UniView-Plugins); UniView offers to install it when someone adds the game. Add or update a game with a pull request, or right-click a game in UniView -> 'Report compatibility...' to open an issue.",
   "games": {
     "Among Us": {
       "status": "works",
@@ -47,6 +47,59 @@
         "auto_textured": "30/40 sampled models"
       }
     },
+    "Celeste": {
+      "engine": "FNA",
+      "plugin": "xna"
+    },
+    "Counter-Strike Global Offensive": {
+      "engine": "Source 2",
+      "plugin": "source2",
+      "status": "works",
+      "uniview": "2.19.0",
+      "notes": "Counter-Strike 2 (Steam still names the folder after CS:GO): .vmdl_c models with materials, .vtex_c textures, .vsnd_c sounds."
+    },
+    "Counter-Strike Source": {
+      "engine": "Source",
+      "plugin": "source"
+    },
+    "Dead as Disco Demo": {
+      "engine": "Unreal Engine",
+      "plugin": "unreal",
+      "status": "works",
+      "uniview": "2.19.0"
+    },
+    "Dead by Daylight": {
+      "engine": "Unreal Engine",
+      "plugin": "unreal",
+      "status": "partial",
+      "uniview": "2.19.0",
+      "notes": "Encrypted paks: only opens with the game's AES key, which UniView doesn't supply."
+    },
+    "Deadlock": {
+      "engine": "Source 2",
+      "plugin": "source2",
+      "status": "works",
+      "uniview": "2.19.0",
+      "notes": "Models with materials, textures and sounds."
+    },
+    "dota 2 beta": {
+      "engine": "Source 2",
+      "plugin": "source2"
+    },
+    "Fallout": {
+      "engine": "Fallout (Interplay)",
+      "plugin": "fallout",
+      "status": "works",
+      "uniview": "2.19.0",
+      "notes": "FRM sprites, RIX images, ACM sounds (vgmstream), MSG texts."
+    },
+    "Fallout 2": {
+      "engine": "Fallout (Interplay)",
+      "plugin": "fallout",
+      "status": "works",
+      "uniview": "2.19.0",
+      "notes": "FRM sprites, RIX images, ACM sounds (vgmstream), MSG texts."
+    },
     "Fallout Shelter": {
       "status": "works",
       "notes": "Most models find their textures automatically. A few meshes are stripped (no vertex data).",
@@ -61,6 +114,36 @@
         "load_seconds": 9.3,
         "auto_textured": "33/40 sampled models"
       }
+    },
+    "Fallout Tactics": {
+      "engine": "Fallout Tactics (Micro Forte)",
+      "plugin": "fallout_tactics",
+      "status": "partial",
+      "uniview": "2.19.0",
+      "notes": "Images from the .bos archives and texts; raw .spr sprite frames come out grayscale (their palette isn't in the file)."
+    },
+    "GarrysMod": {
+      "engine": "Source",
+      "plugin": "source"
+    },
+    "Half-Life 2": {
+      "engine": "Source",
+      "plugin": "source"
+    },
+    "Half-Life Alyx": {
+      "engine": "Source 2",
+      "plugin": "source2"
+    },
+    "Headliners": {
+      "engine": "Unreal Engine",
+      "plugin": "unreal",
+      "status": "works",
+      "uniview": "2.19.0",
+      "notes": "Oodle-compressed .pak: needs an oo2core_*_win64.dll (UniView finds one in other installed games)."
+    },
+    "Left 4 Dead 2": {
+      "engine": "Source",
+      "plugin": "source"
     },
     "Mage Arena": {
       "status": "works",
@@ -137,6 +220,13 @@
         "auto_textured": "0/13 sampled models"
       }
     },
+    "Portal": {
+      "engine": "Source",
+      "plugin": "source",
+      "status": "works",
+      "uniview": "2.19.0",
+      "notes": "Models, maps, textures and sounds from the VPKs."
+    },
     "Probably Stolen Playtest": {
       "status": "works",
       "notes": "Mostly 2D: about 2k sprites and 870 textures load fine.",
@@ -151,6 +241,19 @@
         "load_seconds": 3.2,
         "auto_textured": "0/13 sampled models"
       }
+    },
+    "ProjectZomboid": {
+      "engine": "Loose files (built in)",
+      "status": "works",
+      "uniview": "2.19.0",
+      "notes": "No plugin needed: loose images, sounds and text, read by the built-in loose-files engine."
+    },
+    "Risk of Rain": {
+      "engine": "GameMaker: Studio",
+      "plugin": "ror",
+      "status": "works",
+      "uniview": "2.19.0",
+      "notes": "Texture pages, sprites (animated as GIF), backgrounds and the embedded sounds from data.win."
     },
     "Robocraft": {
       "status": "works",
@@ -167,6 +270,13 @@
         "auto_textured": "24/40 sampled models"
       }
     },
+    "Satisfactory": {
+      "engine": "Unreal Engine",
+      "plugin": "unreal",
+      "status": "works",
+      "uniview": "2.19.0",
+      "notes": "IoStore containers: static and skeletal meshes, textures (incl. virtual textures), sounds."
+    },
     "Schedule I": {
       "status": "works",
       "notes": "Loads fully. About 40% of models find their texture automatically.",
@@ -181,6 +291,45 @@
         "load_seconds": 13.2,
         "auto_textured": "16/40 sampled models"
       }
+    },
+    "Serious Sam 2": {
+      "engine": "Serious Engine 2",
+      "plugin": "serious",
+      "status": "partial",
+      "uniview": "2.19.0",
+      "notes": ".tex textures from the .gro archives and loose files; .mdl models are listed but not shown yet."
+    },
+    "Spiral Knights": {
+      "engine": "Clyde",
+      "plugin": "spiralknights",
+      "status": "works",
+      "uniview": "2.19.0",
+      "notes": "Static, rigged and compound models with textures, sounds, music, every .dat config as an outline."
+    },
+    "Spore": {
+      "engine": "Maxis / RenderWare 4",
+      "plugin": "spore",
+      "status": "partial",
+      "uniview": "2.19.0",
+      "notes": "Models without blend shapes, textures, property lists, texts, .snr sounds (vgmstream). Creature parts and animations export as-is."
+    },
+    "Stardew Valley": {
+      "engine": "XNA",
+      "plugin": "xna"
+    },
+    "Team Fortress 2": {
+      "engine": "Source",
+      "plugin": "source",
+      "status": "works",
+      "uniview": "2.19.0",
+      "notes": "Models with .vmt materials, maps (.bsp) with terrain and static props, .vtf textures, sounds."
+    },
+    "Terraria": {
+      "engine": "XNA",
+      "plugin": "xna",
+      "status": "works",
+      "uniview": "2.19.0",
+      "notes": "Textures and sprite sheets named by item / NPC, animations, music banks, sounds, worlds and players."
     },
     "Trailmakers": {
       "status": "works",
@@ -226,6 +375,13 @@
         "load_seconds": 50.3,
         "auto_textured": "36/40 sampled models"
       }
+    },
+    "Wakfu": {
+      "engine": "Ankama (Java)",
+      "plugin": "wakfu",
+      "status": "works",
+      "uniview": "2.19.0",
+      "notes": "2D animations (flipbook / GIF / sprite sheet), map graphics, UI images, sound packs, texts. NPCs are listed by gfx id."
     }
   }
 }

@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 
 import engines
 from uniview.catalog import UNKNOWN_ENGINE, UNTAGGED, compat_entry, group_projects, project_shown
+from uniview.plugin_index import missing_plugin
 from uniview.constants import log
 from uniview.projects import detect_project_engine, engine_info_text, find_steam_games, game_exe
 from uniview.settings import COMPAT_STATUS, compat_report_url, fetch_compat, load_compat
@@ -70,6 +71,7 @@ class CardDelegate(QStyledItemDelegate):
     NOTES_ROLE = Qt.UserRole + 4
     TAGS_ROLE = Qt.UserRole + 5
     COMPAT_ROLE = Qt.UserRole + 6
+    PLUGIN_ROLE = Qt.UserRole + 7  # plugin id when the compatibility list names a plugin that isn't installed
     PILLS = {"loaded": ("Loaded", "SUCCESS"), "missing": ("Folder missing", "DANGER")}  # text, theme token
     COMPAT_COLORS = {"works": "SUCCESS", "partial": "WARNING", "broken": "DANGER"}
     SIZE = QSize(184, 222)
@@ -160,6 +162,8 @@ class CardDelegate(QStyledItemDelegate):
         compat = index.data(self.COMPAT_ROLE)
         if compat in COMPAT_STATUS:
             line(COMPAT_STATUS[compat], getattr(theme, self.COMPAT_COLORS.get(compat, "MUTED")))
+        if index.data(self.PLUGIN_ROLE):
+            line(f"⬇ Plugin available: {index.data(self.PLUGIN_ROLE)}", theme.ACCENT_HOVER)
         if tags:
             # Tags sit on the bottom line of the box, cut short with "..." if they don't fit.
             painter.setPen(QColor(theme.ACCENT_HOVER))
@@ -240,6 +244,7 @@ class HomePage(QWidget):
     unload_requested = Signal(str)
     export_unity_requested = Signal(str)  # project path
     decompile_requested = Signal(str)  # project path
+    plugin_requested = Signal(str)  # plugin id (from the compatibility list): show it on the Plugins tab
     _counted = Signal(str, int)
     _scanned = Signal(str, bool, object, object)  # path, folder exists, exe, icon QImage
     _detected = Signal(str, object)
@@ -382,6 +387,26 @@ class HomePage(QWidget):
 
     def compat_entry(self, path):
         return compat_entry(self.compat, path)
+
+    def needed_plugin(self, path):
+        """Plugin id the compatibility list says reads this game, if that plugin isn't installed (else None)."""
+        return missing_plugin(self.compat_entry(path), (p.id for p in engines.plugins()))
+
+    def offer_plugin(self, path, plugin_id, adding=False):
+        """Ask to install the plugin a game needs. True = the user went to the Plugins tab."""
+        name = os.path.basename(os.path.normpath(path))
+        engine = (self.compat_entry(path) or {}).get("engine")
+        text = (f"There's a plugin for {name}" + (f" ({engine})" if engine else "") + f": {plugin_id}.\n\n"
+                "UniView reads Unity games by itself; other engines need a plugin. Show it on the Plugins tab "
+                "to install it? (Plugins are third-party code that runs on your computer.)")
+        box = QMessageBox(QMessageBox.Question, "Plugin available", text, parent=self)
+        go = box.addButton("Show plugin", QMessageBox.AcceptRole)
+        box.addButton("Add anyway" if adding else "Open anyway", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is go:
+            self.plugin_requested.emit(plugin_id)
+            return True
+        return False
 
     # ---- drag and drop
     @staticmethod
@@ -526,6 +551,11 @@ class HomePage(QWidget):
                      engine or ("detecting engine..." if "engine" not in project else "Unknown engine")]
         if engine:
             tip.append(engine)
+        needed = self.needed_plugin(path)
+        if needed:
+            item.setData(CardDelegate.PLUGIN_ROLE, needed)
+            tip.append(f"A plugin for this game is available ({needed}): click the game, or install it from the "
+                       "Plugins tab.")
         if compat and compat.get("status") in COMPAT_STATUS:
             item.setData(CardDelegate.COMPAT_ROLE, compat["status"])
             if compat.get("notes"):
@@ -664,6 +694,10 @@ class HomePage(QWidget):
                 self.refresh()
                 QMessageBox.warning(self, "Missing", f"Folder not found:\n{project['path']}")
                 return
+            needed = self.needed_plugin(project["path"])
+            if needed and project.get("engine") in (None, "", "generic") and self.offer_plugin(project["path"],
+                                                                                                needed):
+                return
             self.store.touch(project)
             self.open_requested.emit(project["path"])
 
@@ -682,11 +716,15 @@ class HomePage(QWidget):
                     QMessageBox.information(self, "Add game", "That game is already added.")
                 continue
             plugin, _score = engines.detect(path)
+            needed = self.needed_plugin(path)
+            if needed and (plugin is None or plugin.id == "generic") and len(paths) == 1:
+                if self.offer_plugin(path, needed, adding=plugin is not None):
+                    continue
             if plugin is None:
                 names = ", ".join(p.name for p in engines.plugins())
                 QMessageBox.warning(self, "Add game", f"None of the engine plugins ({names}) recognize:\n{path}\n\n"
-                                    "Pick the game's install folder, or add a plugin for its engine "
-                                    "(Options \u2192 Plugin manager).")
+                                    "Pick the game's install folder, or install a plugin for its engine "
+                                    "from the Plugins tab.")
                 continue
             name = os.path.basename(path)
             if len(paths) == 1:
@@ -771,6 +809,9 @@ class HomePage(QWidget):
             return
         menu = QMenu(self)
         menu.addAction("Open", lambda: self.on_activate(item))
+        needed = self.needed_plugin(path)
+        if needed:
+            menu.addAction(f"Install plugin ({needed})...", lambda: self.plugin_requested.emit(needed))
         if self.is_loaded(path):
             menu.addAction("Unload from memory", lambda: self.unload_requested.emit(path))
         if project.get("engine") == "unity":

@@ -40,6 +40,8 @@ class Settings:
     home_group: str = "engine"
     home_sort: str = "recent"
     online_compat: bool = True
+    check_updates: bool = True   # look for a new UniView release on GitHub at startup
+    skipped_update: str = ""     # a release version the user chose to skip (no reminder for it)
     blender_path: str = ""
     check_tools: bool = True  # startup check for missing optional tools
     fast_gpu: bool = True     # ask Windows for the high-performance GPU on two-GPU laptops (uniview/gpu.py)

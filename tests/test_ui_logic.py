@@ -3,7 +3,6 @@
 import logging
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 from PIL import Image
 
@@ -156,4 +155,4 @@ def test_group_projects_by_engine_unknown_last():
     groups = catalog.group_projects([game("u"), game("s", engine="source"), game("n", engine="unity")],
                                     "engine", {}, lambda p: False)
     assert [t for t, _ in groups][-1] == "Unknown engine"
-    assert np.all([ps for _t, ps in groups])
+    assert all(ps for _t, ps in groups)

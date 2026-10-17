@@ -11,9 +11,13 @@ level. Keep helper modules in a subfolder (a package next to your plugin) or sta
 
 As written it's a working "loose files" engine: it shows .png/.jpg/.tga/.dds images, text files and
 Wavefront .obj models found anywhere under a folder. That makes it a handy starting point for a game
-that keeps some of its files unpacked. Read engines/sdk.py for the full API and plugins/source.py,
-plugins/unreal.py or plugins/spore.py for real examples (archives, compression, binary formats, materials).
-Shared readers for other plugins to use live in engines/ (vpk.py, ue_pak.py, iostore.py, ue_package.py, aes.py).
+that keeps some of its files unpacked. Read engines/sdk.py (in UniView) for the full API and source.py,
+unreal.py or spore.py in the UniView-Plugins repo (https://github.com/NightHawkHSI/UniView-Plugins) for real
+examples (archives, compression, binary formats, materials). Shared readers other plugins can use live there too:
+valve_formats/ (vpk, bsp, kv3, meshopt) and unreal_formats/ (ue_pak, iostore, ue_package, aes).
+
+Plugins published in UniView-Plugins only read game files and write nothing but caches (engines.sdk.cache_dir());
+no network, no subprocess, no eval/exec. Users run plugins as local code, so keep yours the same.
 
 Only the standard library, numpy and Pillow (PIL) are guaranteed to be available, also in the
 packaged UniView.exe. Anything else you import has to be installed next to it yourself.

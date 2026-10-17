@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QStyle,
+    QTabWidget,
     QToolButton,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -345,9 +346,21 @@ class MainWindow(QMainWindow):
         self.home.unload_requested.connect(self.unload_game)
         self.home.export_unity_requested.connect(self.export_unity_project)
         self.home.decompile_requested.connect(self.decompile_code)
+        self.home.plugin_requested.connect(self.show_plugin)
+
+        # The start page: the games, and the Plugins tab (install / update engine plugins).
+        from uniview.ui.plugins_page import PluginsPage
+        self.plugins_page = PluginsPage(self.settings)
+        self.plugins_page.restart_requested.connect(self.restart_app)
+        self.plugins_page.manager_requested.connect(self.show_plugin_manager)
+        self.home_tabs = QTabWidget()
+        self.home_tabs.setDocumentMode(True)
+        self.home_tabs.addTab(self.home, "Games")
+        self.home_tabs.addTab(self.plugins_page, "Plugins")
+        self.home_tabs.currentChanged.connect(self._home_tab_changed)
 
         self.pages = QStackedWidget()
-        self.pages.addWidget(self.home)
+        self.pages.addWidget(self.home_tabs)
         self.pages.addWidget(self.viewer)
         self.pages.addWidget(self.loading_screen)
         self.setCentralWidget(self.pages)
@@ -413,12 +426,14 @@ class MainWindow(QMainWindow):
 
     def show_home(self):
         self.home.refresh()
-        self.pages.setCurrentWidget(self.home)
+        self.pages.setCurrentWidget(self.home_tabs)
         self.setWindowTitle(APP_TITLE)
         self.engine_label.clear()
 
     def focus_search(self):
-        search = self.home.search if self.pages.currentWidget() is self.home else self.search
+        if self.pages.currentWidget() is self.home_tabs:
+            self.home_tabs.setCurrentWidget(self.home)
+        search = self.home.search if self.pages.currentWidget() is self.home_tabs else self.search
         search.setFocus()
         search.selectAll()
 
@@ -603,6 +618,13 @@ class MainWindow(QMainWindow):
         online.toggled.connect(self._set_online_compat)
         help_menu.addAction(online)
         help_menu.addAction("Project page on GitHub", lambda: webbrowser.open(REPO_URL))
+        help_menu.addSeparator()
+        help_menu.addAction("Check for updates...", lambda: self.check_updates(quiet=False))
+        auto_update = QAction("Check for updates at startup", self, checkable=True)
+        auto_update.setChecked(self.settings.check_updates)
+        auto_update.setToolTip("Asks GitHub for the latest UniView release when UniView starts")
+        auto_update.toggled.connect(self._set_check_updates)
+        help_menu.addAction(auto_update)
         help_menu.addSeparator()
         help_menu.addAction("Optional tools (audio decoder, script decompiler...)...", self.show_tools)
         help_menu.addAction("Open plugins folder", open_plugins_folder)
@@ -1375,6 +1397,22 @@ class MainWindow(QMainWindow):
 
     def show_tools(self, at_startup=False):
         ToolsDialog(self.settings, self, at_startup=at_startup).exec()
+
+    def check_updates(self, quiet=True):
+        """Help -> Check for updates (quiet=False), or the startup check (quiet: only speaks up for an update)."""
+        if quiet and not self.settings.check_updates:
+            return
+        from uniview.ui.update_dialog import check_for_updates
+        self._update_check = check_for_updates(self, self.settings, self.quit_for_update, quiet)
+
+    def quit_for_update(self):
+        """Close like any close (saving settings), then quit so the update script can replace the files."""
+        if self.close():
+            QApplication.instance().quit()
+
+    def _set_check_updates(self, on):
+        self.settings.check_updates = on
+        self.settings.save()
 
     def check_tools_at_startup(self):
         """Offer to install recommended helpers that are missing (unless turned off in the dialog)."""
@@ -2385,6 +2423,20 @@ class MainWindow(QMainWindow):
         box.setModal(False)
         box.setAttribute(Qt.WA_DeleteOnClose)
         box.show()
+
+    def show_plugin(self, plugin_id=None):
+        """The Plugins tab, with the plugin a game needs selected."""
+        self.show_home()
+        self.home_tabs.setCurrentWidget(self.plugins_page)
+        if plugin_id:
+            self.plugins_page.show_plugin(plugin_id)
+
+    def _home_tab_changed(self, index):
+        page = self.home_tabs.widget(index)
+        if page is self.plugins_page and not self.plugins_page.available:
+            self.plugins_page.fetch()  # first visit: get the plugin list
+        elif page is self.home:
+            self.home.refresh()
 
     def show_plugin_manager(self):
         from uniview.ui.plugin_dialog import PluginManagerDialog

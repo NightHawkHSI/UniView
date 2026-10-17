@@ -73,6 +73,7 @@ def main():
     win.show()
     close_splash()
     QTimer.singleShot(800, win.check_tools_at_startup)
+    QTimer.singleShot(3000, win.check_updates)
     QTimer.singleShot(1500, win.log_renderer)
     if len(sys.argv) > 1:
         win.load(sys.argv[1])

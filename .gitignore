@@ -15,8 +15,14 @@ viewer.log.*
 crash.log
 settings.json
 compat_cache.json
+plugin_index_cache.json
 cache/
 mods/
+
+# Installed engine plugins (they come from the UniView-Plugins repo); only the template is part of UniView
+plugins/*
+!plugins/_template.py
+!plugins/README.txt
 
 # Personal notes
 Bugs.txt
