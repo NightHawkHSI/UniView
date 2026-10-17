@@ -40,6 +40,8 @@ PALETTES = {
         "SUCCESS": "#3fb950",
         "WARNING": "#d29922",
         "DANGER": "#f85149",
+        "SUCCESS_SOFT": "rgba(63, 185, 80, 0.20)",   # tinted fills (start page tabs)
+        "DANGER_SOFT": "rgba(248, 81, 73, 0.13)",
         "VIEWPORT_TOP": "#2a2c32",    # 3D view background gradient
         "VIEWPORT_BOTTOM": "#17181b",
     },
@@ -61,6 +63,8 @@ PALETTES = {
         "SUCCESS": "#1a7f37",
         "WARNING": "#9a6700",
         "DANGER": "#cf222e",
+        "SUCCESS_SOFT": "rgba(26, 127, 55, 0.14)",
+        "DANGER_SOFT": "rgba(207, 34, 46, 0.09)",
         "VIEWPORT_TOP": "#eef0f4",
         "VIEWPORT_BOTTOM": "#c8cdd6",
     },
@@ -68,7 +72,7 @@ PALETTES = {
 
 # The current tokens, as module attributes (theme.SURFACE ...). apply() swaps them.
 BG = SURFACE = RAISED = HOVER = PRESSED = BORDER = BORDER_STRONG = TEXT = MUTED = FAINT = ""
-ACCENT = ACCENT_HOVER = ACCENT_SOFT = SELECTION = SUCCESS = WARNING = DANGER = ""
+ACCENT = ACCENT_HOVER = ACCENT_SOFT = SELECTION = SUCCESS = WARNING = DANGER = SUCCESS_SOFT = DANGER_SOFT = ""
 VIEWPORT_TOP = VIEWPORT_BOTTOM = ""
 globals().update(PALETTES["dark"])
 GOLD = "#f4c542"
@@ -190,12 +194,13 @@ QTabWidget::pane {{ border: 1px solid {BORDER}; border-radius: {RADIUS}px; top: 
 QTabBar::tab {{ background: transparent; color: {MUTED}; padding: 7px 14px; border-bottom: 2px solid transparent; }}
 QTabBar::tab:hover {{ color: {TEXT}; }}
 QTabBar::tab:selected {{ color: {TEXT}; border-bottom-color: {ACCENT}; }}
-/* Start page Games | Plugins tabs: big; the open one green, the other red */
+/* Start page Games | Plugins tabs: big; the open one green, the other red, as tints that sit in the theme */
 QTabWidget#homeTabs > QTabBar::tab {{ font-size: 16px; font-weight: 700; padding: 10px 34px; min-width: 110px;
-    margin: 8px 6px 0 0; border: 2px solid {DANGER}; border-bottom: none; border-radius: 8px 8px 0 0;
-    background: {DANGER}; color: white; }}
-QTabWidget#homeTabs > QTabBar::tab:hover:!selected {{ border-color: {TEXT}; }}
-QTabWidget#homeTabs > QTabBar::tab:selected {{ background: {SUCCESS}; border-color: {SUCCESS}; color: white; }}
+    margin: 8px 6px 0 0; border: 1px solid {DANGER}; border-bottom: none; border-radius: 8px 8px 0 0;
+    background: {DANGER_SOFT}; color: {DANGER}; }}
+QTabWidget#homeTabs > QTabBar::tab:hover:!selected {{ background: {HOVER}; color: {TEXT}; }}
+QTabWidget#homeTabs > QTabBar::tab:selected {{ background: {SUCCESS_SOFT}; border: 1px solid {SUCCESS};
+    border-bottom: 3px solid {SUCCESS}; color: {SUCCESS}; }}
 QTabWidget#homeTabs::tab-bar {{ left: 20px; }}
 QGroupBox {{ border: 1px solid {BORDER}; border-radius: {RADIUS}px; margin-top: 14px; padding-top: 6px; }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {MUTED}; }}
