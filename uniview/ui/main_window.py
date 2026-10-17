@@ -354,6 +354,7 @@ class MainWindow(QMainWindow):
         self.plugins_page.restart_requested.connect(self.restart_app)
         self.plugins_page.manager_requested.connect(self.show_plugin_manager)
         self.home_tabs = QTabWidget()
+        self.home_tabs.setObjectName("homeTabs")  # styled in theme.py: big tabs, open one green
         self.home_tabs.setDocumentMode(True)
         self.home_tabs.addTab(self.home, "Games")
         self.home_tabs.addTab(self.plugins_page, "Plugins")

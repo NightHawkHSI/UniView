@@ -190,6 +190,13 @@ QTabWidget::pane {{ border: 1px solid {BORDER}; border-radius: {RADIUS}px; top: 
 QTabBar::tab {{ background: transparent; color: {MUTED}; padding: 7px 14px; border-bottom: 2px solid transparent; }}
 QTabBar::tab:hover {{ color: {TEXT}; }}
 QTabBar::tab:selected {{ color: {TEXT}; border-bottom-color: {ACCENT}; }}
+/* Start page Games | Plugins tabs: big; the open one green, the other red */
+QTabWidget#homeTabs > QTabBar::tab {{ font-size: 16px; font-weight: 700; padding: 10px 34px; min-width: 110px;
+    margin: 8px 6px 0 0; border: 2px solid {DANGER}; border-bottom: none; border-radius: 8px 8px 0 0;
+    background: {DANGER}; color: white; }}
+QTabWidget#homeTabs > QTabBar::tab:hover:!selected {{ border-color: {TEXT}; }}
+QTabWidget#homeTabs > QTabBar::tab:selected {{ background: {SUCCESS}; border-color: {SUCCESS}; color: white; }}
+QTabWidget#homeTabs::tab-bar {{ left: 20px; }}
 QGroupBox {{ border: 1px solid {BORDER}; border-radius: {RADIUS}px; margin-top: 14px; padding-top: 6px; }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {MUTED}; }}
 
